@@ -2,7 +2,6 @@
 #define DAWN_LOGGER_H
 
 #include <android/log.h>
-#include "Obfuscate.h"
 
 enum daLogType {
     daDEBUG = 3,
