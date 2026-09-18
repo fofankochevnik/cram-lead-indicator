@@ -2,6 +2,7 @@
 #define DAWN_LOGGER_H
 
 #include <android/log.h>
+#include "Obfuscate.h"
 
 enum daLogType {
     daDEBUG = 3,
@@ -10,7 +11,7 @@ enum daLogType {
     daWARN = 5
 };
 
-#define TAG OBFUSCATE("ModMenu")
+#define TAG "ModMenu"
 
 #define LOGD(...) ((void)__android_log_print(daDEBUG, TAG, __VA_ARGS__))
 #define LOGE(...) ((void)__android_log_print(daERROR, TAG, __VA_ARGS__))
