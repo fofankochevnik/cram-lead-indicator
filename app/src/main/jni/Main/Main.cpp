@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <vector>
 #include <atomic>
+#include <link.h>
+#include <dlfcn.h>
 
 #include "../Include/KittyMemory/MemoryPatch.h"
 #include "../Include/ImGui.h"
@@ -161,6 +163,11 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         return;
     }
     g_HUDActive = true;
+    static bool loggedHUD = false;
+    if (!loggedHUD) {
+        LOGI("GeneralHUD.LateUpdate hook actively running! self=%p", self);
+        loggedHUD = true;
+    }
 
     // 1. Get Camera
     void* cam = *(void**)((uintptr_t)self + OFFSET_HUD_MAINCAMERA);
@@ -315,11 +322,13 @@ void DrawMenu() {
     ImDrawList* draw = ImGui::GetBackgroundDrawList();
     if (!draw) return;
 
-    // Subtle corner status watermark
+    // Informative corner status watermark
     if (g_HUDActive) {
-        draw->AddText(ImVec2(35.0f, 25.0f), IM_COL32(50, 255, 120, 220), "C-RAM Lead Mod: ACTIVE");
+        draw->AddText(ImVec2(35.0f, 25.0f), IM_COL32(50, 255, 120, 230), "C-RAM Lead Mod: ACTIVE");
+    } else if (orig_GeneralHUD_LateUpdate != nullptr) {
+        draw->AddText(ImVec2(35.0f, 25.0f), IM_COL32(255, 210, 50, 220), "C-RAM Lead Mod: READY (Waiting for Battle...)");
     } else {
-        draw->AddText(ImVec2(35.0f, 25.0f), IM_COL32(255, 200, 50, 180), "C-RAM Lead Mod: Waiting for HUD...");
+        draw->AddText(ImVec2(35.0f, 25.0f), IM_COL32(255, 120, 50, 200), "C-RAM Lead Mod: Loading IL2CPP...");
     }
 
     // Read thread-safe targets from active buffer
@@ -359,6 +368,76 @@ void DrawMenu() {
 }
 
 // -----------------------------------------------------------------------------
+// Helper to locate libil2cpp.so across all Android 16 linking modes
+// -----------------------------------------------------------------------------
+struct Il2CppSearch {
+    uintptr_t base;
+    char foundPath[512];
+};
+
+static int phdr_callback(struct dl_phdr_info* info, size_t size, void* data) {
+    Il2CppSearch* s = (Il2CppSearch*)data;
+    if (info->dlpi_name && (strstr(info->dlpi_name, "libil2cpp.so") || strstr(info->dlpi_name, "il2cpp"))) {
+        s->base = (uintptr_t)info->dlpi_addr;
+        strncpy(s->foundPath, info->dlpi_name, sizeof(s->foundPath) - 1);
+        return 1;
+    }
+    return 0;
+}
+
+static uintptr_t getIl2CppBaseAddress() {
+    // Strategy 1: dl_iterate_phdr (Kernel & Bionic linker table)
+    Il2CppSearch s = {0, {0}};
+    dl_iterate_phdr(phdr_callback, &s);
+    if (s.base != 0) {
+        LOGI("Found libil2cpp via dl_iterate_phdr: %p (%s)", (void*)s.base, s.foundPath);
+        return s.base;
+    }
+
+    // Strategy 2: dlsym RTLD_DEFAULT + dladdr on known exported symbols
+    const char* testSyms[] = {"il2cpp_init", "il2cpp_domain_get", "il2cpp_thread_attach", "il2cpp_runtime_invoke"};
+    for (const char* symName : testSyms) {
+        void* sym = dlsym(RTLD_DEFAULT, symName);
+        if (sym) {
+            Dl_info info;
+            if (dladdr(sym, &info) && info.dli_fbase) {
+                LOGI("Found libil2cpp via RTLD_DEFAULT dlsym(%s)+dladdr: %p (%s)",
+                     symName, info.dli_fbase, info.dli_fname ? info.dli_fname : "");
+                return (uintptr_t)info.dli_fbase;
+            }
+        }
+    }
+
+    // Strategy 3: dlopen + dlsym + dladdr
+    void* h = dlopen("libil2cpp.so", RTLD_NOLOAD);
+    if (!h) {
+        h = dlopen("libil2cpp.so", RTLD_LAZY);
+    }
+    if (h) {
+        for (const char* symName : testSyms) {
+            void* sym = dlsym(h, symName);
+            if (sym) {
+                Dl_info info;
+                if (dladdr(sym, &info) && info.dli_fbase) {
+                    LOGI("Found libil2cpp via dlopen dlsym(%s)+dladdr: %p (%s)",
+                         symName, info.dli_fbase, info.dli_fname ? info.dli_fname : "");
+                    return (uintptr_t)info.dli_fbase;
+                }
+            }
+        }
+    }
+
+    // Strategy 4: Fallback to /proc/self/maps
+    uintptr_t mapsBase = getBaseAddress("libil2cpp.so");
+    if (mapsBase != 0) {
+        LOGI("Found libil2cpp via /proc/self/maps: %p", (void*)mapsBase);
+        return mapsBase;
+    }
+
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
 // Hook Initialization Thread
 // -----------------------------------------------------------------------------
 void* thread(void*) {
@@ -368,15 +447,20 @@ void* thread(void*) {
     initModMenu((void*)DrawMenu);
 
     // Wait until libil2cpp.so is loaded into memory
+    int waitCounter = 0;
     while (!g_Il2CppBase) {
-        g_Il2CppBase = getBaseAddress("libil2cpp.so");
+        g_Il2CppBase = getIl2CppBaseAddress();
         if (!g_Il2CppBase) {
+            if (waitCounter % 10 == 0) {
+                LOGI("Waiting for libil2cpp.so... (%d attempts)", waitCounter);
+            }
+            waitCounter++;
             usleep(200000); // 200ms
         }
     }
 
     LOGI("libil2cpp.so found at: %p", (void*)g_Il2CppBase);
-    sleep(2); // Give game time to initialize IL2CPP runtime
+    sleep(1); // Give game time to initialize IL2CPP runtime
 
     // Resolve function addresses
     Camera_get_main = (t_Camera_get_main)(g_Il2CppBase + RVA_CAMERA_MAIN);
@@ -388,7 +472,8 @@ void* thread(void*) {
 
     // Hook GeneralHUD.LateUpdate to capture HUD and enemies list safely on UnityMain
     void* targetHUDMethod = (void*)(g_Il2CppBase + RVA_HUD_LATEUPDATE);
-    DobbyHook(targetHUDMethod, (void*)hook_GeneralHUD_LateUpdate, (void**)&orig_GeneralHUD_LateUpdate);
+    int hookRes = DobbyHook(targetHUDMethod, (void*)hook_GeneralHUD_LateUpdate, (void**)&orig_GeneralHUD_LateUpdate);
+    LOGI("DobbyHook GeneralHUD.LateUpdate (%p) returned: %d, orig=%p", targetHUDMethod, hookRes, orig_GeneralHUD_LateUpdate);
 
     LOGI("C-RAM Lead Mod Hooks Successfully Installed!");
     pthread_exit(nullptr);
