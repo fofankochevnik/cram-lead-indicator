@@ -14,6 +14,7 @@
 
 #include "Utils.h"
 #include "Dobby/dobby.h"
+#include "Obfuscate.h"
 #include "Logger.h"
 
 void (*menuAddress)() = nullptr;
