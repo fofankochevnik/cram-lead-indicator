@@ -84,19 +84,17 @@ DWORD findLibrary(const char *library) {
 
 uintptr_t getBaseAddress(const char *name) {
     uintptr_t base = 0;
-    char line[512];
+    char line[1024];
 
     FILE *f = fopen("/proc/self/maps", "r");
-
     if (!f) {
         return 0;
     }
 
-    while (fgets(line, sizeof line, f)) {
-        uintptr_t tmpBase;
-        char tmpName[256];
-        if (sscanf(line, "%" PRIXPTR "-%*" PRIXPTR " %*s %*s %*s %*s %s", &tmpBase, tmpName) > 0) {
-            if (!strcmp(basename(tmpName), name)) {
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, name)) {
+            uintptr_t tmpBase = 0;
+            if (sscanf(line, "%" PRIXPTR "-", &tmpBase) == 1) {
                 base = tmpBase;
                 break;
             }
@@ -115,14 +113,13 @@ uintptr_t getAbsoluteAddress(const char *libraryName, uintptr_t relativeAddr) {
 }
 
 bool isLibraryLoaded(const char *libraryName) {
-    //isGameLibLoaded = true;
-    char line[512] = {0};
+    char line[1024] = {0};
 
     FILE *fp = fopen("/proc/self/maps", "rt");
     if (fp != NULL) {
         while (fgets(line, sizeof(line), fp)) {
-            std::string a = line;
             if (strstr(line, libraryName)) {
+                fclose(fp);
                 isGameLibLoaded = true;
                 return true;
             }
