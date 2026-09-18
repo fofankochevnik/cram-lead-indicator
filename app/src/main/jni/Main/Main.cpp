@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <vector>
+#include <atomic>
 
 #include "../Include/KittyMemory/MemoryPatch.h"
 #include "../Include/ImGui.h"
@@ -15,35 +16,35 @@
 #include "../Include/Logger.h"
 
 // -----------------------------------------------------------------------------
-// RVAs from dump.cs (Relative to libil2cpp.so base)
+// RVAs from script.json & dump.cs (Relative to libil2cpp.so base)
 // -----------------------------------------------------------------------------
 #define RVA_CAMERA_MAIN        0x82D7D50
 #define RVA_CAMERA_W2S         0x82D72A4
 #define RVA_COMP_TRANSFORM     0x834A0F4
-#define RVA_TRANS_POS          0x8365D9C
+#define RVA_TRANS_POS          0x83601AC // UnityEngine.Transform.get_position
 #define RVA_UNIT_TYPE          0x3F54748
 #define RVA_PHYS_VEL           0x3EACAA4
 #define RVA_HUD_LATEUPDATE     0x3F16414
 
 // -----------------------------------------------------------------------------
-// Field Offsets from dump.cs
+// Field Offsets from dump.cs & il2cpp.h
 // -----------------------------------------------------------------------------
-#define OFFSET_HUD_PARENTSEAT   0x20
-#define OFFSET_HUD_MAINCAMERA   0xE8
-#define OFFSET_HUD_ALLENEMIES   0x140
+#define OFFSET_HUD_PARENTSEAT    0x20
+#define OFFSET_HUD_MAINCAMERA    0xE8
+#define OFFSET_HUD_ALLENEMIES    0x140
 
-#define OFFSET_SEAT_AWS         0x28
+#define OFFSET_SEAT_AWS          0x28
 
-#define OFFSET_AWS_ALWAYSREADY  0x28
-#define OFFSET_AWS_SELECTABLE   0x80
+#define OFFSET_AWS_ALWAYSREADY   0x28
+#define OFFSET_AWS_SELECTABLE    0x80
 
-#define OFFSET_TURRET_MUZZLE    0xD8
+#define OFFSET_TURRET_MUZZLE     0xD8
 #define OFFSET_TURRET_AMMOCONFIG 0xC0
-#define OFFSET_TURRET_NOGRAVITY 0xFC
+#define OFFSET_TURRET_NOGRAVITY  0xFC
 
-#define OFFSET_AMMO_SPEED       0x24
+#define OFFSET_AMMO_SPEED        0x24
 
-#define OFFSET_UNIT_ISALIVE     0xC4
+#define OFFSET_UNIT_ISALIVE      0xC4
 
 // -----------------------------------------------------------------------------
 // Function Pointer Types
@@ -65,33 +66,29 @@ static t_PhysicsObject_get_Velocity PhysicsObject_get_Velocity = nullptr;
 static t_GeneralHUD_LateUpdate orig_GeneralHUD_LateUpdate = nullptr;
 
 // -----------------------------------------------------------------------------
-// Global State & Settings
+// Global State & Thread-Safe Screen Coordinates Buffer
 // -----------------------------------------------------------------------------
-static void* g_GeneralHUD = nullptr;
 static uintptr_t g_Il2CppBase = 0;
+static bool g_HUDActive = false;
 
-static bool g_LeadIndicatorEnabled = true;
-static bool g_DrawLines = true;
-static bool g_DrawDistanceText = true;
-static float g_LeadCircleRadius = 14.0f;
-static float g_ManualSpeedOverride = 0.0f; // 0.0f = auto-detect from turret
+struct ScreenLeadTarget {
+    float leadX, leadY;
+    float targetX, targetY;
+    float distance;
+    float flightTime;
+    bool hasTargetLine;
+};
 
-// Check if pointer looks like valid userspace memory
+#define MAX_TARGETS 128
+static ScreenLeadTarget g_TargetsBuffer[2][MAX_TARGETS];
+static int g_TargetsCount[2] = {0, 0};
+static std::atomic<int> g_ActiveBufferIdx(0);
+
+// Check if pointer looks like valid userspace memory on 64-bit Android (Scudo / PAC)
 inline bool IsValidPtr(const void* ptr) {
-    uintptr_t p = (uintptr_t)ptr;
-    return p > 0x100000 && p < 0x7fffffffff;
-}
-
-// -----------------------------------------------------------------------------
-// GeneralHUD.LateUpdate Hook
-// -----------------------------------------------------------------------------
-void hook_GeneralHUD_LateUpdate(void* self) {
-    if (self) {
-        g_GeneralHUD = self;
-    }
-    if (orig_GeneralHUD_LateUpdate) {
-        orig_GeneralHUD_LateUpdate(self);
-    }
+    if (!ptr) return false;
+    uintptr_t p = (uintptr_t)ptr & 0x00FFFFFFFFFFFFFFULL;
+    return p >= 0x100000ULL && p <= 0x00007FFFFFFFFFFFULL;
 }
 
 // -----------------------------------------------------------------------------
@@ -153,33 +150,20 @@ static bool CalculateLead(
 }
 
 // -----------------------------------------------------------------------------
-// ImGui Drawing Loop (Called on every frame)
+// GeneralHUD.LateUpdate Hook (Runs on Unity Main Thread)
 // -----------------------------------------------------------------------------
-void DrawMenu() {
-    // 1. Mod Menu Control Window
-    ImGui::SetNextWindowSize(ImVec2(320, 240), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("C-RAM Lead Mod", nullptr, ImGuiWindowFlags_NoCollapse)) {
-        ImGui::Checkbox("Enable Lead Indicator", &g_LeadIndicatorEnabled);
-        ImGui::Checkbox("Draw Target Lines", &g_DrawLines);
-        ImGui::Checkbox("Show Distance & Time", &g_DrawDistanceText);
-        ImGui::SliderFloat("Circle Radius", &g_LeadCircleRadius, 8.0f, 26.0f);
-        ImGui::SliderFloat("Speed Override (0=Auto)", &g_ManualSpeedOverride, 0.0f, 2000.0f, "%.0f m/s");
-
-        if (g_GeneralHUD) {
-            ImGui::TextColored(ImVec4(0, 1, 0, 1), "Status: HUD Active");
-        } else {
-            ImGui::TextColored(ImVec4(1, 1, 0, 1), "Status: Waiting for game...");
-        }
+void hook_GeneralHUD_LateUpdate(void* self) {
+    if (orig_GeneralHUD_LateUpdate) {
+        orig_GeneralHUD_LateUpdate(self);
     }
-    ImGui::End();
 
-    // 2. Render Lead Circles if enabled
-    if (!g_LeadIndicatorEnabled || !g_GeneralHUD || !IsValidPtr(g_GeneralHUD)) {
+    if (!IsValidPtr(self)) {
         return;
     }
+    g_HUDActive = true;
 
-    // Get Camera
-    void* cam = *(void**)((uintptr_t)g_GeneralHUD + OFFSET_HUD_MAINCAMERA);
+    // 1. Get Camera
+    void* cam = *(void**)((uintptr_t)self + OFFSET_HUD_MAINCAMERA);
     if (!IsValidPtr(cam) && Camera_get_main) {
         cam = Camera_get_main();
     }
@@ -187,13 +171,13 @@ void DrawMenu() {
         return;
     }
 
-    // Determine Gun Position & Bullet Speed
+    // 2. Determine Gun Position, Bullet Speed, Gravity
     Vector3 gunPos(0, 0, 0);
-    float bulletSpeed = 1000.0f; // Default 1000 m/s fallback
+    float bulletSpeed = 1000.0f; // Default 1000 m/s
     bool noGravity = false;
     bool foundTurret = false;
 
-    void* parentSeat = *(void**)((uintptr_t)g_GeneralHUD + OFFSET_HUD_PARENTSEAT);
+    void* parentSeat = *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT);
     if (IsValidPtr(parentSeat)) {
         void* aws = *(void**)((uintptr_t)parentSeat + OFFSET_SEAT_AWS);
         if (IsValidPtr(aws)) {
@@ -232,12 +216,7 @@ void DrawMenu() {
         }
     }
 
-    // Manual override if set
-    if (g_ManualSpeedOverride > 50.0f) {
-        bulletSpeed = g_ManualSpeedOverride;
-    }
-
-    // If turret muzzle wasn't resolved, use camera position as gun origin
+    // Fallback: camera origin
     if (!foundTurret && Component_get_transform && Transform_get_position) {
         void* camTr = Component_get_transform(cam);
         if (IsValidPtr(camTr)) {
@@ -245,8 +224,8 @@ void DrawMenu() {
         }
     }
 
-    // Get enemy units list
-    auto enemyList = *(monoList<void*>**)((uintptr_t)g_GeneralHUD + OFFSET_HUD_ALLENEMIES);
+    // 3. Read enemy units list
+    auto enemyList = *(monoList<void*>**)((uintptr_t)self + OFFSET_HUD_ALLENEMIES);
     if (!IsValidPtr(enemyList) || !IsValidPtr(enemyList->items)) {
         return;
     }
@@ -256,28 +235,29 @@ void DrawMenu() {
         return;
     }
 
-    float screenHeight = ImGui::GetIO().DisplaySize.y;
-    ImDrawList* draw = ImGui::GetBackgroundDrawList();
-    if (!draw) return;
+    // Prepare double-buffer write index
+    int writeIdx = 1 - g_ActiveBufferIdx.load();
+    int count = 0;
+    float screenHeight = (glHeight > 0) ? (float)glHeight : 1080.0f;
 
-    // Iterate through ALL air targets (1, 7, 20, etc.)
-    for (int i = 0; i < totalEnemies; i++) {
+    // 4. Calculate lead points for all airborne targets
+    for (int i = 0; i < totalEnemies && count < MAX_TARGETS; i++) {
         void* target = ((void**)enemyList->items->vector)[i];
         if (!IsValidPtr(target)) continue;
 
-        // Check if target is alive
+        // Check if alive
         bool isAlive = *(bool*)((uintptr_t)target + OFFSET_UNIT_ISALIVE);
         if (!isAlive) continue;
 
-        // Filter: UnitType.Air = 3, UnitType.Heli = 6
+        // Filter airborne threats: Air (3), Heli (6), FPVDrone (7), MissileProjectile (5)
         if (IUnit_GetUnitType) {
             int unitType = IUnit_GetUnitType(target);
-            if (unitType != 3 && unitType != 6) {
+            if (unitType != 3 && unitType != 6 && unitType != 7 && unitType != 5) {
                 continue;
             }
         }
 
-        // Get target position
+        // Get target world position
         void* tr = Component_get_transform ? Component_get_transform(target) : nullptr;
         if (!IsValidPtr(tr) || !Transform_get_position) continue;
         Vector3 targetPos = Transform_get_position(tr);
@@ -306,32 +286,75 @@ void DrawMenu() {
         // Project target position to screen for connecting line
         Vector3 targetScreen = Camera_WorldToScreenPoint(cam, targetPos);
 
-        ImVec2 leadPoint(leadScreen.X, screenHeight - leadScreen.Y);
-        ImU32 circleColor = IM_COL32(255, 50, 50, 230);
-        ImU32 centerColor = IM_COL32(255, 255, 255, 255);
-        ImU32 lineColor = IM_COL32(255, 200, 50, 150);
+        ScreenLeadTarget& entry = g_TargetsBuffer[writeIdx][count];
+        entry.leadX = leadScreen.X;
+        entry.leadY = screenHeight - leadScreen.Y; // Flip Y for ImGui top-left origin
+        entry.distance = distance;
+        entry.flightTime = flightTime;
 
-        // 1. Lead Circle
-        draw->AddCircle(leadPoint, g_LeadCircleRadius, circleColor, 24, 2.5f);
+        if (targetScreen.Z > 0.0f) {
+            entry.hasTargetLine = true;
+            entry.targetX = targetScreen.X;
+            entry.targetY = screenHeight - targetScreen.Y;
+        } else {
+            entry.hasTargetLine = false;
+        }
+
+        count++;
+    }
+
+    // Publish new targets to render thread
+    g_TargetsCount[writeIdx] = count;
+    g_ActiveBufferIdx.store(writeIdx);
+}
+
+// -----------------------------------------------------------------------------
+// ImGui Drawing Loop (Called inside swapbuffers_hook on render thread)
+// -----------------------------------------------------------------------------
+void DrawMenu() {
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+    if (!draw) return;
+
+    // Subtle corner status watermark
+    if (g_HUDActive) {
+        draw->AddText(ImVec2(35.0f, 25.0f), IM_COL32(50, 255, 120, 220), "C-RAM Lead Mod: ACTIVE");
+    } else {
+        draw->AddText(ImVec2(35.0f, 25.0f), IM_COL32(255, 200, 50, 180), "C-RAM Lead Mod: Waiting for HUD...");
+    }
+
+    // Read thread-safe targets from active buffer
+    int readIdx = g_ActiveBufferIdx.load();
+    int count = g_TargetsCount[readIdx];
+    if (count <= 0) return;
+
+    const float leadCircleRadius = 14.0f;
+    const ImU32 circleColor = IM_COL32(255, 45, 45, 240);
+    const ImU32 centerColor = IM_COL32(255, 255, 255, 255);
+    const ImU32 lineColor = IM_COL32(255, 210, 50, 170);
+    const ImU32 textColor = IM_COL32(255, 255, 255, 240);
+
+    for (int i = 0; i < count; i++) {
+        const ScreenLeadTarget& tgt = g_TargetsBuffer[readIdx][i];
+        ImVec2 leadPoint(tgt.leadX, tgt.leadY);
+
+        // 1. Lead Circle & Center Dot
+        draw->AddCircle(leadPoint, leadCircleRadius, circleColor, 24, 2.5f);
         draw->AddCircleFilled(leadPoint, 2.5f, centerColor);
 
-        // Crosshair reticle
-        float crossSize = g_LeadCircleRadius * 0.5f;
-        draw->AddLine(ImVec2(leadPoint.x - crossSize, leadPoint.y), ImVec2(leadPoint.x + crossSize, leadPoint.y), circleColor, 1.5f);
-        draw->AddLine(ImVec2(leadPoint.x, leadPoint.y - crossSize), ImVec2(leadPoint.x, leadPoint.y + crossSize), circleColor, 1.5f);
+        // Crosshairs
+        float cross = leadCircleRadius * 0.5f;
+        draw->AddLine(ImVec2(leadPoint.x - cross, leadPoint.y), ImVec2(leadPoint.x + cross, leadPoint.y), circleColor, 1.5f);
+        draw->AddLine(ImVec2(leadPoint.x, leadPoint.y - cross), ImVec2(leadPoint.x, leadPoint.y + cross), circleColor, 1.5f);
 
-        // 2. Connecting Line from Aircraft to Lead Circle
-        if (g_DrawLines && targetScreen.Z > 0.0f) {
-            ImVec2 targetPoint(targetScreen.X, screenHeight - targetScreen.Y);
-            draw->AddLine(targetPoint, leadPoint, lineColor, 1.5f);
+        // 2. Connecting Line from Aircraft to Lead Point
+        if (tgt.hasTargetLine) {
+            draw->AddLine(ImVec2(tgt.targetX, tgt.targetY), leadPoint, lineColor, 1.5f);
         }
 
         // 3. Distance & Flight Time Text
-        if (g_DrawDistanceText) {
-            char textBuf[64];
-            snprintf(textBuf, sizeof(textBuf), "%.0fm (%.1fs)", distance, flightTime);
-            draw->AddText(ImVec2(leadPoint.x + g_LeadCircleRadius + 4, leadPoint.y - 7), IM_COL32(255, 255, 255, 230), textBuf);
-        }
+        char textBuf[64];
+        snprintf(textBuf, sizeof(textBuf), "%.0fm (%.1fs)", tgt.distance, tgt.flightTime);
+        draw->AddText(ImVec2(leadPoint.x + leadCircleRadius + 5, leadPoint.y - 8), textColor, textBuf);
     }
 }
 
@@ -348,7 +371,7 @@ void* thread(void*) {
     while (!g_Il2CppBase) {
         g_Il2CppBase = getBaseAddress("libil2cpp.so");
         if (!g_Il2CppBase) {
-            usleep(250000); // 250ms
+            usleep(200000); // 200ms
         }
     }
 
@@ -363,7 +386,7 @@ void* thread(void*) {
     IUnit_GetUnitType = (t_IUnit_GetUnitType)(g_Il2CppBase + RVA_UNIT_TYPE);
     PhysicsObject_get_Velocity = (t_PhysicsObject_get_Velocity)(g_Il2CppBase + RVA_PHYS_VEL);
 
-    // Hook GeneralHUD.LateUpdate to capture HUD and enemies list
+    // Hook GeneralHUD.LateUpdate to capture HUD and enemies list safely on UnityMain
     void* targetHUDMethod = (void*)(g_Il2CppBase + RVA_HUD_LATEUPDATE);
     DobbyHook(targetHUDMethod, (void*)hook_GeneralHUD_LateUpdate, (void**)&orig_GeneralHUD_LateUpdate);
 
