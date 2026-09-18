@@ -57,7 +57,7 @@ LOCAL_CPPFLAGS += -Wno-error=c++11-narrowing -fms-extensions -fno-rtti -fexcepti
 LOCAL_LDFLAGS += -Wl,--gc-sections,--strip-all, -llog
 LOCAL_ARM_MODE := arm
 
-LOCAL_SRC_FILES := ../Loader/Loader.cpp \
+LOCAL_SRC_FILES := ../Loader/Loader.cpp
 LOCAL_LDLIBS := -llog -landroid
 
 include $(BUILD_SHARED_LIBRARY)
