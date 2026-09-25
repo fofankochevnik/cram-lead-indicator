@@ -1,5 +1,5 @@
 //
-// C-RAM Air Target Lead Indicator & Multiplayer Menu Mod (v2.5 - Stable)
+// C-RAM Air Target Lead Indicator & Diamond Icon Multiplayer Mod (v3.0 - Direct Hook)
 //
 
 #include <pthread.h>
@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <vector>
 #include <atomic>
+#include <ctime>
 #include <link.h>
 #include <dlfcn.h>
 
@@ -29,14 +30,11 @@
 #define RVA_PHYS_VEL             0x3EACAA4
 #define RVA_HUD_LATEUPDATE       0x3F16414 // GeneralHUD.LateUpdate
 
-// Multiplayer & UI RVAs
-#define RVA_EVENTSYSTEM_UPDATE   0x86BE318 // UnityEngine.EventSystems.EventSystem.Update
+// Multiplayer & Diamond Button RVAs
+#define RVA_ICONS_SHOWSTORE      0x4267774 // CBS.UI.IconsPanel.ShowStore (Diamond donate icon)
+#define RVA_STORE_ONENABLE       0x427D1EC // CBS.UI.StoreWindow.OnEnable
 #define RVA_MP_BOOTSTRAP         0x3E30D94 // MultiplayerService.Bootstrap
 #define RVA_MP_ENTRY_CLICKED     0x3E2A764 // MultiplayerEntryButton.OnClicked
-
-// Input System UI hooks for touch
-#define RVA_UI_POINTER_BUTTON    0x7E7B410 // InputSystemUIInputModule.ProcessPointerButton
-#define RVA_UI_POINTER_MOVE      0x7E7C2C0 // InputSystemUIInputModule.ProcessPointerMovement
 
 // -----------------------------------------------------------------------------
 // Field Offsets from dump.cs & il2cpp.h
@@ -69,12 +67,10 @@ typedef int (*t_IUnit_GetUnitType)(void* unit);
 typedef Vector3 (*t_PhysicsObject_get_Velocity)(void* physicsObject);
 typedef void (*t_GeneralHUD_LateUpdate)(void* self);
 
-typedef void (*t_EventSystem_Update)(void* self);
+typedef void (*t_IconsPanel_ShowStore)(void* self);
+typedef void (*t_StoreWindow_OnEnable)(void* self);
 typedef void (*t_MpBootstrap)();
 typedef void (*t_MpEntry_OnClicked)(void* self);
-
-typedef void (*t_ProcessPointerButton)(void* self, void* button, void* eventData, void* method);
-typedef void (*t_ProcessPointerMovement)(void* self, void* eventData, void* target, void* method);
 
 static t_Camera_WorldToScreenPoint Camera_WorldToScreenPoint = nullptr;
 static t_Camera_get_main Camera_get_main = nullptr;
@@ -84,26 +80,16 @@ static t_IUnit_GetUnitType IUnit_GetUnitType = nullptr;
 static t_PhysicsObject_get_Velocity PhysicsObject_get_Velocity = nullptr;
 static t_GeneralHUD_LateUpdate orig_GeneralHUD_LateUpdate = nullptr;
 
-static t_EventSystem_Update orig_EventSystem_Update = nullptr;
+static t_IconsPanel_ShowStore orig_IconsPanel_ShowStore = nullptr;
+static t_StoreWindow_OnEnable orig_StoreWindow_OnEnable = nullptr;
 static t_MpBootstrap MpBootstrap = nullptr;
 static t_MpEntry_OnClicked MpEntry_OnClicked = nullptr;
 
-static t_ProcessPointerButton orig_ProcessPointerButton = nullptr;
-static t_ProcessPointerMovement orig_ProcessPointerMovement = nullptr;
-
 // -----------------------------------------------------------------------------
-// Global State & Thread-Safe Buffers
+// Global State & Buffers
 // -----------------------------------------------------------------------------
 static uintptr_t g_Il2CppBase = 0;
-static bool g_HUDActive = false;
-
-// Touch & UI State
-static std::atomic<float> g_TouchX(100.0f);
-static std::atomic<float> g_TouchY(100.0f);
-static std::atomic<bool> g_TouchDown(false);
-static std::atomic<bool> g_OpenMultiplayerRequested(false);
-static bool g_MultiplayerOpened = false;
-static bool g_MenuCollapsed = false; // Open by default! Can be collapsed by user!
+static uint64_t g_LastTriggerTime = 0;
 
 struct ScreenLeadTarget {
     float leadX, leadY;
@@ -125,92 +111,57 @@ inline bool IsValidPtr(const void* ptr) {
     return p >= 0x100000ULL && p <= 0x00007FFFFFFFFFFFULL;
 }
 
-// -----------------------------------------------------------------------------
-// Pre-Frame Callback: updates ImGuiIO right before ImGui::NewFrame()
-// -----------------------------------------------------------------------------
-void OnPreFrame() {
-    ImGuiIO& io = ImGui::GetIO();
-    float tx = g_TouchX.load();
-    float ty = g_TouchY.load();
-    if (tx >= 0.0f && ty >= 0.0f) {
-        io.MousePos = ImVec2(tx, ty);
-    }
-    io.MouseDown[0] = g_TouchDown.load();
+static inline uint64_t getNowMs() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 // -----------------------------------------------------------------------------
-// InputSystemUIInputModule Hooks: Captures Exact Touch Coordinates & State
+// Multiplayer Trigger via Diamond Icon Click
 // -----------------------------------------------------------------------------
-void hook_ProcessPointerButton(void* self, void* button, void* eventData, void* method) {
-    if (orig_ProcessPointerButton) {
-        orig_ProcessPointerButton(self, button, eventData, method);
+void TriggerMultiplayer() {
+    uint64_t now = getNowMs();
+    if (now - g_LastTriggerTime < 600) {
+        LOGI("[C-RAM-MOD] TriggerMultiplayer debounced");
+        return;
     }
+    g_LastTriggerTime = now;
+
+    LOGI("[C-RAM-MOD] Launching Hidden Multiplayer via Diamond Icon!");
     try {
-        if (IsValidPtr(eventData)) {
-            float px = *(float*)((uintptr_t)eventData + 0x144);
-            float py = *(float*)((uintptr_t)eventData + 0x148);
-            if (px >= 0.0f && py >= 0.0f) {
-                g_TouchX.store(px);
-                float sH = (glHeight > 0) ? (float)glHeight : 1080.0f;
-                g_TouchY.store(sH - py);
-            }
+        if (MpBootstrap) {
+            LOGI("[C-RAM-MOD] Calling MultiplayerService::Bootstrap()...");
+            MpBootstrap();
         }
-        if (IsValidPtr(button)) {
-            bool isPressed = *(bool*)((uintptr_t)button + 0x0);
-            g_TouchDown.store(isPressed);
+        if (MpEntry_OnClicked) {
+            LOGI("[C-RAM-MOD] Calling MultiplayerEntryButton::OnClicked()...");
+            MpEntry_OnClicked(nullptr);
+            LOGI("[C-RAM-MOD] Multiplayer Screen Launched Successfully!");
+        } else {
+            LOGE("[C-RAM-MOD] MpEntry_OnClicked is null!");
         }
-    } catch (...) {}
-}
-
-void hook_ProcessPointerMovement(void* self, void* eventData, void* target, void* method) {
-    if (orig_ProcessPointerMovement) {
-        orig_ProcessPointerMovement(self, eventData, target, method);
-    }
-    try {
-        if (IsValidPtr(eventData)) {
-            float px = *(float*)((uintptr_t)eventData + 0x144);
-            float py = *(float*)((uintptr_t)eventData + 0x148);
-            if (px >= 0.0f && py >= 0.0f) {
-                g_TouchX.store(px);
-                float sH = (glHeight > 0) ? (float)glHeight : 1080.0f;
-                g_TouchY.store(sH - py);
-            }
-        }
-    } catch (...) {}
-}
-
-// -----------------------------------------------------------------------------
-// EventSystem.Update Hook: Executes Multiplayer Launch on Unity Main Thread
-// -----------------------------------------------------------------------------
-void hook_EventSystem_Update(void* self) {
-    if (orig_EventSystem_Update) {
-        orig_EventSystem_Update(self);
-    }
-
-    if (g_OpenMultiplayerRequested.load()) {
-        g_OpenMultiplayerRequested.store(false);
-        LOGI("User clicked [ OPEN MULTIPLAYER ] - triggering on Unity Main Thread!");
-        try {
-            if (MpBootstrap) {
-                LOGI("Executing MultiplayerService::Bootstrap()...");
-                MpBootstrap();
-            }
-            if (MpEntry_OnClicked) {
-                LOGI("Executing MultiplayerEntryButton::OnClicked()...");
-                MpEntry_OnClicked(nullptr);
-                g_MultiplayerOpened = true;
-                LOGI("Multiplayer launched successfully!");
-            } else {
-                LOGE("MpEntry_OnClicked function pointer is null!");
-            }
-        } catch (...) {
-            LOGE("Exception caught while triggering Multiplayer!");
-        }
+    } catch (...) {
+        LOGE("[C-RAM-MOD] Exception during Multiplayer launch!");
     }
 }
 
+// Hook on CBS.UI.IconsPanel.ShowStore (Diamond donate button)
+void hook_IconsPanel_ShowStore(void* self) {
+    LOGI("[C-RAM-MOD] CBS.UI.IconsPanel::ShowStore tapped (Diamond Icon)!");
+    TriggerMultiplayer();
+    // Do not call orig_IconsPanel_ShowStore so store window doesn't open
+}
+
+// Hook on CBS.UI.StoreWindow.OnEnable (Fallback if store opens through any other path)
+void hook_StoreWindow_OnEnable(void* self) {
+    LOGI("[C-RAM-MOD] CBS.UI.StoreWindow::OnEnable intercepted!");
+    TriggerMultiplayer();
+    // Do not call orig_StoreWindow_OnEnable
+}
+
 // -----------------------------------------------------------------------------
-// Lead Math Solver (Exact Original)
+// Lead Math Solver (Air Target Ballistic Intercept)
 // -----------------------------------------------------------------------------
 static bool CalculateLead(
     const Vector3& targetPos,
@@ -266,7 +217,7 @@ static bool CalculateLead(
 }
 
 // -----------------------------------------------------------------------------
-// GeneralHUD.LateUpdate Hook (Runs on Unity Main Thread during Battle) - EXACT ORIGINAL
+// GeneralHUD.LateUpdate Hook (Runs on Unity Main Thread during Battle)
 // -----------------------------------------------------------------------------
 void hook_GeneralHUD_LateUpdate(void* self) {
     if (orig_GeneralHUD_LateUpdate) {
@@ -276,7 +227,6 @@ void hook_GeneralHUD_LateUpdate(void* self) {
     if (!IsValidPtr(self)) {
         return;
     }
-    g_HUDActive = true;
 
     // 1. Resolve camera
     void* cam = *(void**)((uintptr_t)self + OFFSET_HUD_MAINCAMERA);
@@ -330,7 +280,7 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         }
     }
 
-    // Fallback: camera origin (ALWAYS get Transform via Component_get_transform!)
+    // Fallback: camera origin
     if (!foundTurret && Component_get_transform && Transform_get_position) {
         void* camTr = Component_get_transform(cam);
         if (IsValidPtr(camTr)) {
@@ -415,68 +365,11 @@ void hook_GeneralHUD_LateUpdate(void* self) {
 }
 
 // -----------------------------------------------------------------------------
-// ImGui Drawing Loop (Called inside swapbuffers_hook on render thread)
+// ESP Drawing Loop (Render Thread inside eglSwapBuffers)
 // -----------------------------------------------------------------------------
 void DrawMenu() {
-    // 1. Pass captured touch coordinates into ImGui
-    ImGuiIO& io = ImGui::GetIO();
-    io.MousePos = ImVec2(g_TouchX.load(), g_TouchY.load());
-    io.MouseDown[0] = g_TouchDown.load();
-
-    // 2. Interactive Mod Menu Window (Open by default, collapsible)
-    if (g_MenuCollapsed) {
-        // Collapsed mode: Small floating pill [ + MOD ] in top-left
-        ImGui::SetNextWindowPos(ImVec2(30.0f, 30.0f), ImGuiCond_FirstUseEver);
-        ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoScrollbar;
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.08f, 0.12f, 0.20f, 0.85f));
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.50f, 0.90f, 0.90f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.60f, 1.0f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.05f, 0.40f, 0.80f, 1.0f));
-
-        if (ImGui::Begin("##ModPill", nullptr, flags)) {
-            if (ImGui::Button("[ + MOD ]", ImVec2(110.0f, 42.0f))) {
-                g_MenuCollapsed = false;
-            }
-        }
-        ImGui::End();
-        ImGui::PopStyleColor(4);
-    } else {
-        // Expanded mode: Compact mod window with [ - Свернуть ] button
-        ImGui::SetNextWindowPos(ImVec2(40.0f, 40.0f), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(300.0f, 0.0f), ImGuiCond_Always);
-
-        if (ImGui::Begin("C-RAM MOD MENU", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "C-RAM Mod v2.5");
-            ImGui::SameLine(180.0f);
-            if (ImGui::SmallButton(" [ - Свернуть ] ")) {
-                g_MenuCollapsed = true;
-            }
-            ImGui::Separator();
-
-            // USER REQUESTED BUTTON: [ OPEN MULTIPLAYER ]
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.52f, 0.92f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.62f, 1.0f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.05f, 0.40f, 0.80f, 1.0f));
-
-            if (ImGui::Button("[ OPEN MULTIPLAYER ]", ImVec2(-1.0f, 44.0f))) {
-                LOGI("USER PRESSED [ OPEN MULTIPLAYER ] BUTTON!");
-                g_OpenMultiplayerRequested.store(true);
-            }
-            ImGui::PopStyleColor(3);
-
-            if (g_MultiplayerOpened) {
-                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.3f, 1.0f), "Multiplayer Screen Launched!");
-            } else {
-                ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.3f, 1.0f), "Status: Ready");
-            }
-
-            ImGui::Separator();
-            ImGui::Text("Lead Indicator: %s", g_HUDActive ? "ACTIVE" : "STANDBY");
-        }
-        ImGui::End();
-    }
-
-    // 3. Lead Indicator ESP Overlay (in battle) - EXACT ORIGINAL CODE
+    // Only draw the Lead Indicator ESP overlay in battle.
+    // Absolutely NO window is drawn in hangar/menu!
     ImDrawList* draw = ImGui::GetBackgroundDrawList();
     if (!draw) return;
 
@@ -581,10 +474,9 @@ static uintptr_t getIl2CppBaseAddress() {
 // Hook Initialization Thread
 // -----------------------------------------------------------------------------
 void* thread(void*) {
-    LOGI("C-RAM Mod Thread Started (v2.5)");
+    LOGI("C-RAM Mod Thread Started (v3.0 - Diamond Hook)");
 
     initModMenu((void*)DrawMenu);
-    setPreFrameCallback(OnPreFrame);
 
     int waitCounter = 0;
     while (!g_Il2CppBase) {
@@ -618,21 +510,17 @@ void* thread(void*) {
     int hudHookRes = DobbyHook(targetHUDMethod, (void*)hook_GeneralHUD_LateUpdate, (void**)&orig_GeneralHUD_LateUpdate);
     LOGI("DobbyHook GeneralHUD.LateUpdate (%p) returned: %d, orig=%p", targetHUDMethod, hudHookRes, orig_GeneralHUD_LateUpdate);
 
-    // 2. Hook InputSystemUIInputModule for Native Touch & Drag
-    void* targetButtonMethod = (void*)(g_Il2CppBase + RVA_UI_POINTER_BUTTON);
-    int btnHookRes = DobbyHook(targetButtonMethod, (void*)hook_ProcessPointerButton, (void**)&orig_ProcessPointerButton);
-    LOGI("DobbyHook ProcessPointerButton (%p) returned: %d, orig=%p", targetButtonMethod, btnHookRes, orig_ProcessPointerButton);
+    // 2. Hook CBS.UI.IconsPanel.ShowStore (Diamond donate button in hangar header)
+    void* targetShowStore = (void*)(g_Il2CppBase + RVA_ICONS_SHOWSTORE);
+    int storeHookRes = DobbyHook(targetShowStore, (void*)hook_IconsPanel_ShowStore, (void**)&orig_IconsPanel_ShowStore);
+    LOGI("DobbyHook IconsPanel.ShowStore (%p) returned: %d, orig=%p", targetShowStore, storeHookRes, orig_IconsPanel_ShowStore);
 
-    void* targetMoveMethod = (void*)(g_Il2CppBase + RVA_UI_POINTER_MOVE);
-    int moveHookRes = DobbyHook(targetMoveMethod, (void*)hook_ProcessPointerMovement, (void**)&orig_ProcessPointerMovement);
-    LOGI("DobbyHook ProcessPointerMovement (%p) returned: %d, orig=%p", targetMoveMethod, moveHookRes, orig_ProcessPointerMovement);
+    // 3. Hook CBS.UI.StoreWindow.OnEnable (Fallback interceptor for store opening)
+    void* targetStoreOnEnable = (void*)(g_Il2CppBase + RVA_STORE_ONENABLE);
+    int storeEnableRes = DobbyHook(targetStoreOnEnable, (void*)hook_StoreWindow_OnEnable, (void**)&orig_StoreWindow_OnEnable);
+    LOGI("DobbyHook StoreWindow.OnEnable (%p) returned: %d, orig=%p", targetStoreOnEnable, storeEnableRes, orig_StoreWindow_OnEnable);
 
-    // 3. Hook EventSystem.Update for Main Thread UI actions
-    void* targetEventSystemMethod = (void*)(g_Il2CppBase + RVA_EVENTSYSTEM_UPDATE);
-    int esHookRes = DobbyHook(targetEventSystemMethod, (void*)hook_EventSystem_Update, (void**)&orig_EventSystem_Update);
-    LOGI("DobbyHook EventSystem.Update (%p) returned: %d, orig=%p", targetEventSystemMethod, esHookRes, orig_EventSystem_Update);
-
-    LOGI("C-RAM Lead & Multiplayer Mod Hooks Installed Successfully (v2.5)!");
+    LOGI("C-RAM v3.0 Hooks Installed Successfully: Lead ESP + Diamond Multiplayer Trigger!");
     pthread_exit(nullptr);
 }
 
