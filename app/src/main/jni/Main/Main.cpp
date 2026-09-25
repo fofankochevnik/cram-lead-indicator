@@ -1,5 +1,5 @@
 //
-// C-RAM Air Target Lead Indicator & Multiplayer Menu Mod (Input System v2.2)
+// C-RAM Air Target Lead Indicator & Multiplayer Menu Mod (Input System v2.3 - EventData Hook)
 //
 
 #include <pthread.h>
@@ -28,20 +28,11 @@
 #define RVA_UNIT_TYPE            0x3F54748
 #define RVA_PHYS_VEL             0x3EACAA4
 #define RVA_HUD_LATEUPDATE       0x3F16414 // GeneralHUD.LateUpdate
-#define RVA_SCREEN_GET_HEIGHT    0x82EA798 // UnityEngine.Screen.get_height
 
-// Unity New Input System RVAs
-#define RVA_INPUTSYSTEM_UPDATE   0x7DA85A4 // UnityEngine.InputSystem.InputSystem.Update
-#define RVA_EVENTSYSTEM_UPDATE   0x86BE318 // UnityEngine.EventSystems.EventSystem.Update
-#define RVA_TOUCHSCREEN_GET_CURR 0x7E4C0D8 // UnityEngine.InputSystem.Touchscreen.get_current
-#define RVA_TOUCHSCREEN_PRIMARY  0x7E4C018 // UnityEngine.InputSystem.Touchscreen.get_primaryTouch
-#define RVA_TOUCH_INPROGRESS     0x7DDD084 // UnityEngine.InputSystem.Controls.TouchControl.get_isInProgress
-#define RVA_TOUCH_GET_POS        0x7DDCF94 // UnityEngine.InputSystem.Controls.TouchControl.get_position
-#define RVA_POINTER_GET_CURRENT  0x7E4102C // UnityEngine.InputSystem.Pointer.get_current
-#define RVA_POINTER_GET_POS      0x7E40F9C // UnityEngine.InputSystem.Pointer.get_position
-#define RVA_V2CONTROL_READVAL    0x562D80C // UnityEngine.InputSystem.InputControl<Vector2>.ReadValue
-#define RVA_POINTER_GET_PRESS    0x7E40FFC // UnityEngine.InputSystem.Pointer.get_press
-#define RVA_BTNCONTROL_ISPRESSED 0x7DDAC88 // UnityEngine.InputSystem.Controls.ButtonControl.get_isPressed
+// Unity UI InputModule & EventSystem Hooks (Rock-Solid Native Touch)
+#define RVA_UI_POINTER_BUTTON    0x7E7B410 // InputSystemUIInputModule.ProcessPointerButton
+#define RVA_UI_POINTER_MOVE      0x7E7C2C0 // InputSystemUIInputModule.ProcessPointerMovement
+#define RVA_EVENTSYSTEM_UPDATE   0x86BE318 // EventSystem.Update
 
 // Multiplayer RVAs
 #define RVA_MP_BOOTSTRAP         0x3E30D94 // MultiplayerService.Bootstrap
@@ -77,19 +68,10 @@ typedef Vector3 (*t_Transform_get_position)(void* transform);
 typedef int (*t_IUnit_GetUnitType)(void* unit);
 typedef Vector3 (*t_PhysicsObject_get_Velocity)(void* physicsObject);
 typedef void (*t_GeneralHUD_LateUpdate)(void* self);
-typedef int (*t_Screen_get_height)();
 
-typedef void (*t_InputSystem_Update)();
+typedef void (*t_ProcessPointerButton)(void* self, void* button, void* eventData, void* method);
+typedef void (*t_ProcessPointerMovement)(void* self, void* eventData, void* target, void* method);
 typedef void (*t_EventSystem_Update)(void* self);
-typedef void* (*t_Touchscreen_get_current)();
-typedef void* (*t_Touchscreen_get_primaryTouch)(void* ts);
-typedef bool (*t_TouchControl_get_isInProgress)(void* tc);
-typedef void* (*t_TouchControl_get_position)(void* tc);
-typedef void* (*t_Pointer_get_current)();
-typedef void* (*t_Pointer_get_position)(void* pointer);
-typedef Vector2 (*t_Vector2Control_ReadValue)(void* v2ctrl);
-typedef void* (*t_Pointer_get_press)(void* pointer);
-typedef bool (*t_ButtonControl_get_isPressed)(void* btnctrl);
 
 typedef void (*t_MpBootstrap)();
 typedef void (*t_MpEntry_OnClicked)(void* self);
@@ -101,19 +83,10 @@ static t_Transform_get_position Transform_get_position = nullptr;
 static t_IUnit_GetUnitType IUnit_GetUnitType = nullptr;
 static t_PhysicsObject_get_Velocity PhysicsObject_get_Velocity = nullptr;
 static t_GeneralHUD_LateUpdate orig_GeneralHUD_LateUpdate = nullptr;
-static t_Screen_get_height Screen_get_height = nullptr;
 
-static t_InputSystem_Update orig_InputSystem_Update = nullptr;
+static t_ProcessPointerButton orig_ProcessPointerButton = nullptr;
+static t_ProcessPointerMovement orig_ProcessPointerMovement = nullptr;
 static t_EventSystem_Update orig_EventSystem_Update = nullptr;
-static t_Touchscreen_get_current Touchscreen_get_current = nullptr;
-static t_Touchscreen_get_primaryTouch Touchscreen_get_primaryTouch = nullptr;
-static t_TouchControl_get_isInProgress TouchControl_get_isInProgress = nullptr;
-static t_TouchControl_get_position TouchControl_get_position = nullptr;
-static t_Pointer_get_current Pointer_get_current = nullptr;
-static t_Pointer_get_position Pointer_get_position = nullptr;
-static t_Vector2Control_ReadValue Vector2Control_ReadValue = nullptr;
-static t_Pointer_get_press Pointer_get_press = nullptr;
-static t_ButtonControl_get_isPressed ButtonControl_get_isPressed = nullptr;
 
 static t_MpBootstrap MpBootstrap = nullptr;
 static t_MpEntry_OnClicked MpEntry_OnClicked = nullptr;
@@ -124,7 +97,7 @@ static t_MpEntry_OnClicked MpEntry_OnClicked = nullptr;
 static uintptr_t g_Il2CppBase = 0;
 static bool g_HUDActive = false;
 
-// Touch & UI State (Coordinates initialized to -1000 to prevent false early hover)
+// Touch & UI State
 static std::atomic<float> g_TouchX(-1000.0f);
 static std::atomic<float> g_TouchY(-1000.0f);
 static std::atomic<bool> g_TouchDown(false);
@@ -153,96 +126,6 @@ inline bool IsValidPtr(const void* ptr) {
 }
 
 // -----------------------------------------------------------------------------
-// Touch & Multiplayer Processing (Runs on Unity Main Thread, New Input System)
-// -----------------------------------------------------------------------------
-static void ProcessTouchAndMultiplayer() {
-    try {
-        float sH = (glHeight > 0) ? (float)glHeight : 1080.0f;
-        if (Screen_get_height) {
-            int shVal = Screen_get_height();
-            if (shVal > 0) {
-                sH = (float)shVal;
-            }
-        }
-
-        bool touchHandled = false;
-
-        // Primary Strategy: Touchscreen.current -> primaryTouch
-        if (Touchscreen_get_current) {
-            void* ts = Touchscreen_get_current();
-            if (IsValidPtr(ts) && Touchscreen_get_primaryTouch) {
-                void* pt = Touchscreen_get_primaryTouch(ts);
-                if (IsValidPtr(pt)) {
-                    if (TouchControl_get_isInProgress) {
-                        bool down = TouchControl_get_isInProgress(pt);
-                        g_TouchDown.store(down);
-                    }
-                    if (TouchControl_get_position && Vector2Control_ReadValue) {
-                        void* posCtrl = TouchControl_get_position(pt);
-                        if (IsValidPtr(posCtrl)) {
-                            Vector2 pos = Vector2Control_ReadValue(posCtrl);
-                            if (pos.X > 0.0f || pos.Y > 0.0f) {
-                                g_TouchX.store(pos.X);
-                                g_TouchY.store(sH - pos.Y);
-                            }
-                        }
-                    }
-                    touchHandled = true;
-                }
-            }
-        }
-
-        // Secondary Fallback: Pointer.current
-        if (!touchHandled && Pointer_get_current) {
-            void* ptr = Pointer_get_current();
-            if (IsValidPtr(ptr)) {
-                if (Pointer_get_press && ButtonControl_get_isPressed) {
-                    void* pressCtrl = Pointer_get_press(ptr);
-                    if (IsValidPtr(pressCtrl)) {
-                        bool pressed = ButtonControl_get_isPressed(pressCtrl);
-                        g_TouchDown.store(pressed);
-                    }
-                }
-                if (Pointer_get_position && Vector2Control_ReadValue) {
-                    void* posCtrl = Pointer_get_position(ptr);
-                    if (IsValidPtr(posCtrl)) {
-                        Vector2 pos = Vector2Control_ReadValue(posCtrl);
-                        if (pos.X > 0.0f || pos.Y > 0.0f) {
-                            g_TouchX.store(pos.X);
-                            g_TouchY.store(sH - pos.Y);
-                        }
-                    }
-                }
-            }
-        }
-    } catch (...) {
-        // Safe catch-all
-    }
-
-    // Multiplayer Screen Launcher
-    if (g_OpenMultiplayerRequested.load()) {
-        g_OpenMultiplayerRequested.store(false);
-        LOGI("Triggering Multiplayer on Unity Main Thread!");
-        try {
-            if (MpBootstrap) {
-                LOGI("Calling MultiplayerService::Bootstrap()...");
-                MpBootstrap();
-            }
-            if (MpEntry_OnClicked) {
-                LOGI("Calling MultiplayerEntryButton::OnClicked()...");
-                MpEntry_OnClicked(nullptr);
-                g_MultiplayerOpened = true;
-                LOGI("Multiplayer launched successfully!");
-            } else {
-                LOGE("MpEntry_OnClicked function pointer is null!");
-            }
-        } catch (...) {
-            LOGE("Exception caught while executing Multiplayer trigger!");
-        }
-    }
-}
-
-// -----------------------------------------------------------------------------
 // Pre-Frame Callback: updates ImGuiIO right before ImGui::NewFrame()
 // -----------------------------------------------------------------------------
 void OnPreFrame() {
@@ -256,20 +139,72 @@ void OnPreFrame() {
 }
 
 // -----------------------------------------------------------------------------
-// Hooks on Unity Main Thread
+// InputSystemUIInputModule Hooks: Captures Exact Touch Coordinates & Press
 // -----------------------------------------------------------------------------
-void hook_InputSystem_Update() {
-    if (orig_InputSystem_Update) {
-        orig_InputSystem_Update();
+void hook_ProcessPointerButton(void* self, void* button, void* eventData, void* method) {
+    if (orig_ProcessPointerButton) {
+        orig_ProcessPointerButton(self, button, eventData, method);
     }
-    ProcessTouchAndMultiplayer();
+    try {
+        if (IsValidPtr(button) && IsValidPtr(eventData)) {
+            bool isPressed = *(bool*)((uintptr_t)button + 0x0);
+            float px = *(float*)((uintptr_t)eventData + 0x144);
+            float py = *(float*)((uintptr_t)eventData + 0x148);
+            if (px >= 0.0f && py >= 0.0f) {
+                g_TouchX.store(px);
+                float sH = (glHeight > 0) ? (float)glHeight : 1080.0f;
+                g_TouchY.store(sH - py);
+            }
+            g_TouchDown.store(isPressed);
+        }
+    } catch (...) {}
 }
 
+void hook_ProcessPointerMovement(void* self, void* eventData, void* target, void* method) {
+    if (orig_ProcessPointerMovement) {
+        orig_ProcessPointerMovement(self, eventData, target, method);
+    }
+    try {
+        if (IsValidPtr(eventData)) {
+            float px = *(float*)((uintptr_t)eventData + 0x144);
+            float py = *(float*)((uintptr_t)eventData + 0x148);
+            if (px >= 0.0f && py >= 0.0f) {
+                g_TouchX.store(px);
+                float sH = (glHeight > 0) ? (float)glHeight : 1080.0f;
+                g_TouchY.store(sH - py);
+            }
+        }
+    } catch (...) {}
+}
+
+// -----------------------------------------------------------------------------
+// EventSystem.Update Hook: Executes Multiplayer Launch on Unity Main Thread
+// -----------------------------------------------------------------------------
 void hook_EventSystem_Update(void* self) {
     if (orig_EventSystem_Update) {
         orig_EventSystem_Update(self);
     }
-    ProcessTouchAndMultiplayer();
+
+    if (g_OpenMultiplayerRequested.load()) {
+        g_OpenMultiplayerRequested.store(false);
+        LOGI("User clicked [ OPEN MULTIPLAYER ] - triggering on Unity Main Thread!");
+        try {
+            if (MpBootstrap) {
+                LOGI("Executing MultiplayerService::Bootstrap()...");
+                MpBootstrap();
+            }
+            if (MpEntry_OnClicked) {
+                LOGI("Executing MultiplayerEntryButton::OnClicked()...");
+                MpEntry_OnClicked(nullptr);
+                g_MultiplayerOpened = true;
+                LOGI("Multiplayer launched successfully!");
+            } else {
+                LOGE("MpEntry_OnClicked function pointer is null!");
+            }
+        } catch (...) {
+            LOGE("Exception caught while triggering Multiplayer!");
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -335,8 +270,6 @@ void hook_GeneralHUD_LateUpdate(void* self) {
     if (orig_GeneralHUD_LateUpdate) {
         orig_GeneralHUD_LateUpdate(self);
     }
-
-    ProcessTouchAndMultiplayer();
 
     if (!IsValidPtr(self)) {
         return;
@@ -412,10 +345,6 @@ void hook_GeneralHUD_LateUpdate(void* self) {
     int count = 0;
 
     float screenH = (glHeight > 0) ? (float)glHeight : 1080.0f;
-    if (Screen_get_height) {
-        int shVal = Screen_get_height();
-        if (shVal > 0) screenH = (float)shVal;
-    }
 
     for (int i = 0; i < enemyCount && count < MAX_TARGETS; i++) {
         void* unit = ((void**)enemies->items->vector)[i];
@@ -640,7 +569,7 @@ static uintptr_t getIl2CppBaseAddress() {
 // Hook Initialization Thread
 // -----------------------------------------------------------------------------
 void* thread(void*) {
-    LOGI("C-RAM Mod Thread Started (v2.2)");
+    LOGI("C-RAM Mod Thread Started (v2.3)");
 
     initModMenu((void*)DrawMenu);
     setPreFrameCallback(OnPreFrame);
@@ -667,18 +596,6 @@ void* thread(void*) {
     Transform_get_position = (t_Transform_get_position)(g_Il2CppBase + RVA_TRANS_POS);
     IUnit_GetUnitType = (t_IUnit_GetUnitType)(g_Il2CppBase + RVA_UNIT_TYPE);
     PhysicsObject_get_Velocity = (t_PhysicsObject_get_Velocity)(g_Il2CppBase + RVA_PHYS_VEL);
-    Screen_get_height = (t_Screen_get_height)(g_Il2CppBase + RVA_SCREEN_GET_HEIGHT);
-
-    // Resolve New Input System pointers
-    Touchscreen_get_current = (t_Touchscreen_get_current)(g_Il2CppBase + RVA_TOUCHSCREEN_GET_CURR);
-    Touchscreen_get_primaryTouch = (t_Touchscreen_get_primaryTouch)(g_Il2CppBase + RVA_TOUCHSCREEN_PRIMARY);
-    TouchControl_get_isInProgress = (t_TouchControl_get_isInProgress)(g_Il2CppBase + RVA_TOUCH_INPROGRESS);
-    TouchControl_get_position = (t_TouchControl_get_position)(g_Il2CppBase + RVA_TOUCH_GET_POS);
-    Pointer_get_current = (t_Pointer_get_current)(g_Il2CppBase + RVA_POINTER_GET_CURRENT);
-    Pointer_get_position = (t_Pointer_get_position)(g_Il2CppBase + RVA_POINTER_GET_POS);
-    Vector2Control_ReadValue = (t_Vector2Control_ReadValue)(g_Il2CppBase + RVA_V2CONTROL_READVAL);
-    Pointer_get_press = (t_Pointer_get_press)(g_Il2CppBase + RVA_POINTER_GET_PRESS);
-    ButtonControl_get_isPressed = (t_ButtonControl_get_isPressed)(g_Il2CppBase + RVA_BTNCONTROL_ISPRESSED);
 
     // Resolve Multiplayer pointers
     MpBootstrap = (t_MpBootstrap)(g_Il2CppBase + RVA_MP_BOOTSTRAP);
@@ -689,17 +606,21 @@ void* thread(void*) {
     int hudHookRes = DobbyHook(targetHUDMethod, (void*)hook_GeneralHUD_LateUpdate, (void**)&orig_GeneralHUD_LateUpdate);
     LOGI("DobbyHook GeneralHUD.LateUpdate (%p) returned: %d, orig=%p", targetHUDMethod, hudHookRes, orig_GeneralHUD_LateUpdate);
 
-    // 2. Hook InputSystem.Update for global main-thread update
-    void* targetInputSystemMethod = (void*)(g_Il2CppBase + RVA_INPUTSYSTEM_UPDATE);
-    int isHookRes = DobbyHook(targetInputSystemMethod, (void*)hook_InputSystem_Update, (void**)&orig_InputSystem_Update);
-    LOGI("DobbyHook InputSystem.Update (%p) returned: %d, orig=%p", targetInputSystemMethod, isHookRes, orig_InputSystem_Update);
+    // 2. Hook InputSystemUIInputModule for Native Touch & Drag
+    void* targetButtonMethod = (void*)(g_Il2CppBase + RVA_UI_POINTER_BUTTON);
+    int btnHookRes = DobbyHook(targetButtonMethod, (void*)hook_ProcessPointerButton, (void**)&orig_ProcessPointerButton);
+    LOGI("DobbyHook ProcessPointerButton (%p) returned: %d, orig=%p", targetButtonMethod, btnHookRes, orig_ProcessPointerButton);
 
-    // 3. Hook EventSystem.Update for UI main-thread update
+    void* targetMoveMethod = (void*)(g_Il2CppBase + RVA_UI_POINTER_MOVE);
+    int moveHookRes = DobbyHook(targetMoveMethod, (void*)hook_ProcessPointerMovement, (void**)&orig_ProcessPointerMovement);
+    LOGI("DobbyHook ProcessPointerMovement (%p) returned: %d, orig=%p", targetMoveMethod, moveHookRes, orig_ProcessPointerMovement);
+
+    // 3. Hook EventSystem.Update for Main Thread UI actions
     void* targetEventSystemMethod = (void*)(g_Il2CppBase + RVA_EVENTSYSTEM_UPDATE);
     int esHookRes = DobbyHook(targetEventSystemMethod, (void*)hook_EventSystem_Update, (void**)&orig_EventSystem_Update);
     LOGI("DobbyHook EventSystem.Update (%p) returned: %d, orig=%p", targetEventSystemMethod, esHookRes, orig_EventSystem_Update);
 
-    LOGI("C-RAM Lead & Multiplayer Mod Hooks Installed Successfully (v2.2)!");
+    LOGI("C-RAM Lead & Multiplayer Mod Hooks Installed Successfully (v2.3)!");
     pthread_exit(nullptr);
 }
 
