@@ -1,5 +1,5 @@
 //
-// C-RAM Air Target Lead Indicator & Multiplayer Menu Mod (Input System v2.3 - EventData Hook)
+// C-RAM Air Target Lead Indicator & Multiplayer Menu Mod (v2.5 - Stable)
 //
 
 #include <pthread.h>
@@ -29,14 +29,14 @@
 #define RVA_PHYS_VEL             0x3EACAA4
 #define RVA_HUD_LATEUPDATE       0x3F16414 // GeneralHUD.LateUpdate
 
-// Unity UI InputModule & EventSystem Hooks (Rock-Solid Native Touch)
-#define RVA_UI_POINTER_BUTTON    0x7E7B410 // InputSystemUIInputModule.ProcessPointerButton
-#define RVA_UI_POINTER_MOVE      0x7E7C2C0 // InputSystemUIInputModule.ProcessPointerMovement
-#define RVA_EVENTSYSTEM_UPDATE   0x86BE318 // EventSystem.Update
-
-// Multiplayer RVAs
+// Multiplayer & UI RVAs
+#define RVA_EVENTSYSTEM_UPDATE   0x86BE318 // UnityEngine.EventSystems.EventSystem.Update
 #define RVA_MP_BOOTSTRAP         0x3E30D94 // MultiplayerService.Bootstrap
 #define RVA_MP_ENTRY_CLICKED     0x3E2A764 // MultiplayerEntryButton.OnClicked
+
+// Input System UI hooks for touch
+#define RVA_UI_POINTER_BUTTON    0x7E7B410 // InputSystemUIInputModule.ProcessPointerButton
+#define RVA_UI_POINTER_MOVE      0x7E7C2C0 // InputSystemUIInputModule.ProcessPointerMovement
 
 // -----------------------------------------------------------------------------
 // Field Offsets from dump.cs & il2cpp.h
@@ -69,12 +69,12 @@ typedef int (*t_IUnit_GetUnitType)(void* unit);
 typedef Vector3 (*t_PhysicsObject_get_Velocity)(void* physicsObject);
 typedef void (*t_GeneralHUD_LateUpdate)(void* self);
 
-typedef void (*t_ProcessPointerButton)(void* self, void* button, void* eventData, void* method);
-typedef void (*t_ProcessPointerMovement)(void* self, void* eventData, void* target, void* method);
 typedef void (*t_EventSystem_Update)(void* self);
-
 typedef void (*t_MpBootstrap)();
 typedef void (*t_MpEntry_OnClicked)(void* self);
+
+typedef void (*t_ProcessPointerButton)(void* self, void* button, void* eventData, void* method);
+typedef void (*t_ProcessPointerMovement)(void* self, void* eventData, void* target, void* method);
 
 static t_Camera_WorldToScreenPoint Camera_WorldToScreenPoint = nullptr;
 static t_Camera_get_main Camera_get_main = nullptr;
@@ -84,12 +84,12 @@ static t_IUnit_GetUnitType IUnit_GetUnitType = nullptr;
 static t_PhysicsObject_get_Velocity PhysicsObject_get_Velocity = nullptr;
 static t_GeneralHUD_LateUpdate orig_GeneralHUD_LateUpdate = nullptr;
 
-static t_ProcessPointerButton orig_ProcessPointerButton = nullptr;
-static t_ProcessPointerMovement orig_ProcessPointerMovement = nullptr;
 static t_EventSystem_Update orig_EventSystem_Update = nullptr;
-
 static t_MpBootstrap MpBootstrap = nullptr;
 static t_MpEntry_OnClicked MpEntry_OnClicked = nullptr;
+
+static t_ProcessPointerButton orig_ProcessPointerButton = nullptr;
+static t_ProcessPointerMovement orig_ProcessPointerMovement = nullptr;
 
 // -----------------------------------------------------------------------------
 // Global State & Thread-Safe Buffers
@@ -98,12 +98,12 @@ static uintptr_t g_Il2CppBase = 0;
 static bool g_HUDActive = false;
 
 // Touch & UI State
-static std::atomic<float> g_TouchX(-1000.0f);
-static std::atomic<float> g_TouchY(-1000.0f);
+static std::atomic<float> g_TouchX(100.0f);
+static std::atomic<float> g_TouchY(100.0f);
 static std::atomic<bool> g_TouchDown(false);
 static std::atomic<bool> g_OpenMultiplayerRequested(false);
 static bool g_MultiplayerOpened = false;
-static bool g_MenuOpen = false; // Collapsed by default into a sleek floating button
+static bool g_MenuCollapsed = false; // Open by default! Can be collapsed by user!
 
 struct ScreenLeadTarget {
     float leadX, leadY;
@@ -139,15 +139,14 @@ void OnPreFrame() {
 }
 
 // -----------------------------------------------------------------------------
-// InputSystemUIInputModule Hooks: Captures Exact Touch Coordinates & Press
+// InputSystemUIInputModule Hooks: Captures Exact Touch Coordinates & State
 // -----------------------------------------------------------------------------
 void hook_ProcessPointerButton(void* self, void* button, void* eventData, void* method) {
     if (orig_ProcessPointerButton) {
         orig_ProcessPointerButton(self, button, eventData, method);
     }
     try {
-        if (IsValidPtr(button) && IsValidPtr(eventData)) {
-            bool isPressed = *(bool*)((uintptr_t)button + 0x0);
+        if (IsValidPtr(eventData)) {
             float px = *(float*)((uintptr_t)eventData + 0x144);
             float py = *(float*)((uintptr_t)eventData + 0x148);
             if (px >= 0.0f && py >= 0.0f) {
@@ -155,6 +154,9 @@ void hook_ProcessPointerButton(void* self, void* button, void* eventData, void* 
                 float sH = (glHeight > 0) ? (float)glHeight : 1080.0f;
                 g_TouchY.store(sH - py);
             }
+        }
+        if (IsValidPtr(button)) {
+            bool isPressed = *(bool*)((uintptr_t)button + 0x0);
             g_TouchDown.store(isPressed);
         }
     } catch (...) {}
@@ -208,7 +210,7 @@ void hook_EventSystem_Update(void* self) {
 }
 
 // -----------------------------------------------------------------------------
-// Lead Math Solver
+// Lead Math Solver (Exact Original)
 // -----------------------------------------------------------------------------
 static bool CalculateLead(
     const Vector3& targetPos,
@@ -264,7 +266,7 @@ static bool CalculateLead(
 }
 
 // -----------------------------------------------------------------------------
-// GeneralHUD.LateUpdate Hook (Runs on Unity Main Thread during Battle)
+// GeneralHUD.LateUpdate Hook (Runs on Unity Main Thread during Battle) - EXACT ORIGINAL
 // -----------------------------------------------------------------------------
 void hook_GeneralHUD_LateUpdate(void* self) {
     if (orig_GeneralHUD_LateUpdate) {
@@ -276,6 +278,7 @@ void hook_GeneralHUD_LateUpdate(void* self) {
     }
     g_HUDActive = true;
 
+    // 1. Resolve camera
     void* cam = *(void**)((uintptr_t)self + OFFSET_HUD_MAINCAMERA);
     if (!IsValidPtr(cam) && Camera_get_main) {
         cam = Camera_get_main();
@@ -284,6 +287,7 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         return;
     }
 
+    // 2. Resolve active turret muzzle position and bullet speed
     Vector3 gunPos(0, 0, 0);
     float bulletSpeed = 1000.0f;
     bool noGravity = false;
@@ -321,55 +325,60 @@ void hook_GeneralHUD_LateUpdate(void* self) {
                         bulletSpeed = spd;
                     }
                 }
-
                 noGravity = *(bool*)((uintptr_t)activeTurret + OFFSET_TURRET_NOGRAVITY);
             }
         }
     }
 
-    if (!foundTurret && Transform_get_position) {
-        gunPos = Transform_get_position(cam);
+    // Fallback: camera origin (ALWAYS get Transform via Component_get_transform!)
+    if (!foundTurret && Component_get_transform && Transform_get_position) {
+        void* camTr = Component_get_transform(cam);
+        if (IsValidPtr(camTr)) {
+            gunPos = Transform_get_position(camTr);
+        }
     }
 
-    auto enemies = *(monoList<void*>**)((uintptr_t)self + OFFSET_HUD_ALLENEMIES);
-    if (!IsValidPtr(enemies) || !IsValidPtr(enemies->items)) {
+    // 3. Read enemy units list
+    auto enemyList = *(monoList<void*>**)((uintptr_t)self + OFFSET_HUD_ALLENEMIES);
+    if (!IsValidPtr(enemyList) || !IsValidPtr(enemyList->items)) {
         return;
     }
 
-    int enemyCount = enemies->getSize();
-    if (enemyCount <= 0 || enemyCount > 256) {
+    int totalEnemies = enemyList->getSize();
+    if (totalEnemies <= 0 || totalEnemies > 250) {
         return;
     }
 
     int writeIdx = 1 - g_ActiveBufferIdx.load();
     int count = 0;
+    float screenHeight = (glHeight > 0) ? (float)glHeight : 1080.0f;
 
-    float screenH = (glHeight > 0) ? (float)glHeight : 1080.0f;
+    // 4. Calculate lead points for all airborne targets (Type 3, 5, 6, 7)
+    for (int i = 0; i < totalEnemies && count < MAX_TARGETS; i++) {
+        void* target = ((void**)enemyList->items->vector)[i];
+        if (!IsValidPtr(target)) continue;
 
-    for (int i = 0; i < enemyCount && count < MAX_TARGETS; i++) {
-        void* unit = ((void**)enemies->items->vector)[i];
-        if (!IsValidPtr(unit)) continue;
-
-        if (IUnit_GetUnitType) {
-            int unitType = IUnit_GetUnitType(unit);
-            if (unitType != 0) continue; // 0 = Air
-        }
-
-        bool isAlive = *(bool*)((uintptr_t)unit + OFFSET_UNIT_ISALIVE);
+        bool isAlive = *(bool*)((uintptr_t)target + OFFSET_UNIT_ISALIVE);
         if (!isAlive) continue;
 
-        if (!Component_get_transform || !Transform_get_position) continue;
-        void* trans = Component_get_transform(unit);
-        if (!IsValidPtr(trans)) continue;
-
-        Vector3 targetPos = Transform_get_position(trans);
-        Vector3 targetVel(0, 0, 0);
-
-        if (PhysicsObject_get_Velocity) {
-            targetVel = PhysicsObject_get_Velocity(unit);
+        if (IUnit_GetUnitType) {
+            int unitType = IUnit_GetUnitType(target);
+            // 3 = Jet, 5 = Missile, 6 = Heli/Drone, 7 = Bomber
+            if (unitType != 3 && unitType != 6 && unitType != 7 && unitType != 5) {
+                continue;
+            }
         }
 
-        Vector3 leadPos;
+        void* tr = Component_get_transform ? Component_get_transform(target) : nullptr;
+        if (!IsValidPtr(tr) || !Transform_get_position) continue;
+        Vector3 targetPos = Transform_get_position(tr);
+
+        Vector3 targetVel(0, 0, 0);
+        if (PhysicsObject_get_Velocity) {
+            targetVel = PhysicsObject_get_Velocity(target);
+        }
+
+        Vector3 leadPos(0, 0, 0);
         float flightTime = 0.0f;
         float distance = 0.0f;
 
@@ -377,21 +386,25 @@ void hook_GeneralHUD_LateUpdate(void* self) {
             continue;
         }
 
-        Vector3 screenLead = Camera_WorldToScreenPoint(cam, leadPos);
-        if (screenLead.Z <= 1.0f) continue;
+        Vector3 leadScreen = Camera_WorldToScreenPoint(cam, leadPos);
+        if (leadScreen.Z <= 0.0f) {
+            continue;
+        }
 
-        ScreenLeadTarget& tgt = g_TargetsBuffer[writeIdx][count];
-        tgt.leadX = screenLead.X;
-        tgt.leadY = screenH - screenLead.Y;
-        tgt.distance = distance;
-        tgt.flightTime = flightTime;
-        tgt.hasTargetLine = false;
+        Vector3 targetScreen = Camera_WorldToScreenPoint(cam, targetPos);
 
-        Vector3 screenTarget = Camera_WorldToScreenPoint(cam, targetPos);
-        if (screenTarget.Z > 1.0f) {
-            tgt.targetX = screenTarget.X;
-            tgt.targetY = screenH - screenTarget.Y;
-            tgt.hasTargetLine = true;
+        ScreenLeadTarget& entry = g_TargetsBuffer[writeIdx][count];
+        entry.leadX = leadScreen.X;
+        entry.leadY = screenHeight - leadScreen.Y;
+        entry.distance = distance;
+        entry.flightTime = flightTime;
+
+        if (targetScreen.Z > 0.0f) {
+            entry.hasTargetLine = true;
+            entry.targetX = targetScreen.X;
+            entry.targetY = screenHeight - targetScreen.Y;
+        } else {
+            entry.hasTargetLine = false;
         }
 
         count++;
@@ -405,38 +418,38 @@ void hook_GeneralHUD_LateUpdate(void* self) {
 // ImGui Drawing Loop (Called inside swapbuffers_hook on render thread)
 // -----------------------------------------------------------------------------
 void DrawMenu() {
-    // 1. Mod Menu Window (Collapsible Floating Button <-> Expanded Menu)
-    if (!g_MenuOpen) {
-        // Sleek floating pill button [ MOD ] in top-left
+    // 1. Pass captured touch coordinates into ImGui
+    ImGuiIO& io = ImGui::GetIO();
+    io.MousePos = ImVec2(g_TouchX.load(), g_TouchY.load());
+    io.MouseDown[0] = g_TouchDown.load();
+
+    // 2. Interactive Mod Menu Window (Open by default, collapsible)
+    if (g_MenuCollapsed) {
+        // Collapsed mode: Small floating pill [ + MOD ] in top-left
         ImGui::SetNextWindowPos(ImVec2(30.0f, 30.0f), ImGuiCond_FirstUseEver);
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoScrollbar;
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 6.0f));
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.08f, 0.12f, 0.20f, 0.85f));
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.50f, 0.90f, 0.90f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.60f, 1.0f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.05f, 0.40f, 0.80f, 1.0f));
 
         if (ImGui::Begin("##ModPill", nullptr, flags)) {
-            if (ImGui::Button(" [ MOD ] ", ImVec2(90.0f, 40.0f))) {
-                g_MenuOpen = true;
+            if (ImGui::Button("[ + MOD ]", ImVec2(110.0f, 42.0f))) {
+                g_MenuCollapsed = false;
             }
         }
         ImGui::End();
         ImGui::PopStyleColor(4);
-        ImGui::PopStyleVar(2);
     } else {
-        // Expanded compact menu window
-        ImGui::SetNextWindowPos(ImVec2(30.0f, 30.0f), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(320.0f, 0.0f), ImGuiCond_Always);
-        ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize;
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
+        // Expanded mode: Compact mod window with [ - Свернуть ] button
+        ImGui::SetNextWindowPos(ImVec2(40.0f, 40.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(300.0f, 0.0f), ImGuiCond_Always);
 
-        if (ImGui::Begin("C-RAM MOD MENU", &g_MenuOpen, flags)) {
-            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "Multiplayer & ESP");
-            ImGui::SameLine(ImGui::GetWindowWidth() - 75.0f);
-            if (ImGui::SmallButton(" [ - ] ")) {
-                g_MenuOpen = false;
+        if (ImGui::Begin("C-RAM MOD MENU", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "C-RAM Mod v2.5");
+            ImGui::SameLine(180.0f);
+            if (ImGui::SmallButton(" [ - Свернуть ] ")) {
+                g_MenuCollapsed = true;
             }
             ImGui::Separator();
 
@@ -445,26 +458,25 @@ void DrawMenu() {
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.62f, 1.0f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.05f, 0.40f, 0.80f, 1.0f));
 
-            if (ImGui::Button("[ OPEN MULTIPLAYER ]", ImVec2(-1.0f, 48.0f))) {
+            if (ImGui::Button("[ OPEN MULTIPLAYER ]", ImVec2(-1.0f, 44.0f))) {
                 LOGI("USER PRESSED [ OPEN MULTIPLAYER ] BUTTON!");
                 g_OpenMultiplayerRequested.store(true);
             }
             ImGui::PopStyleColor(3);
 
             if (g_MultiplayerOpened) {
-                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.3f, 1.0f), "Status: Screen Launched!");
+                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.3f, 1.0f), "Multiplayer Screen Launched!");
             } else {
                 ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.3f, 1.0f), "Status: Ready");
             }
 
             ImGui::Separator();
-            ImGui::Text("Lead ESP: %s", g_HUDActive ? "ACTIVE" : "STANDBY");
+            ImGui::Text("Lead Indicator: %s", g_HUDActive ? "ACTIVE" : "STANDBY");
         }
         ImGui::End();
-        ImGui::PopStyleVar(1);
     }
 
-    // 2. Lead Indicator ESP Overlay (in battle)
+    // 3. Lead Indicator ESP Overlay (in battle) - EXACT ORIGINAL CODE
     ImDrawList* draw = ImGui::GetBackgroundDrawList();
     if (!draw) return;
 
@@ -569,7 +581,7 @@ static uintptr_t getIl2CppBaseAddress() {
 // Hook Initialization Thread
 // -----------------------------------------------------------------------------
 void* thread(void*) {
-    LOGI("C-RAM Mod Thread Started (v2.3)");
+    LOGI("C-RAM Mod Thread Started (v2.5)");
 
     initModMenu((void*)DrawMenu);
     setPreFrameCallback(OnPreFrame);
@@ -589,7 +601,7 @@ void* thread(void*) {
     LOGI("libil2cpp.so found at: %p", (void*)g_Il2CppBase);
     sleep(1);
 
-    // Resolve battle pointers
+    // Battle pointers
     Camera_get_main = (t_Camera_get_main)(g_Il2CppBase + RVA_CAMERA_MAIN);
     Camera_WorldToScreenPoint = (t_Camera_WorldToScreenPoint)(g_Il2CppBase + RVA_CAMERA_W2S);
     Component_get_transform = (t_Component_get_transform)(g_Il2CppBase + RVA_COMP_TRANSFORM);
@@ -597,11 +609,11 @@ void* thread(void*) {
     IUnit_GetUnitType = (t_IUnit_GetUnitType)(g_Il2CppBase + RVA_UNIT_TYPE);
     PhysicsObject_get_Velocity = (t_PhysicsObject_get_Velocity)(g_Il2CppBase + RVA_PHYS_VEL);
 
-    // Resolve Multiplayer pointers
+    // Multiplayer pointers
     MpBootstrap = (t_MpBootstrap)(g_Il2CppBase + RVA_MP_BOOTSTRAP);
     MpEntry_OnClicked = (t_MpEntry_OnClicked)(g_Il2CppBase + RVA_MP_ENTRY_CLICKED);
 
-    // 1. Hook GeneralHUD.LateUpdate for Battle ESP
+    // 1. Hook GeneralHUD.LateUpdate for Battle ESP (Lead Indicator)
     void* targetHUDMethod = (void*)(g_Il2CppBase + RVA_HUD_LATEUPDATE);
     int hudHookRes = DobbyHook(targetHUDMethod, (void*)hook_GeneralHUD_LateUpdate, (void**)&orig_GeneralHUD_LateUpdate);
     LOGI("DobbyHook GeneralHUD.LateUpdate (%p) returned: %d, orig=%p", targetHUDMethod, hudHookRes, orig_GeneralHUD_LateUpdate);
@@ -620,7 +632,7 @@ void* thread(void*) {
     int esHookRes = DobbyHook(targetEventSystemMethod, (void*)hook_EventSystem_Update, (void**)&orig_EventSystem_Update);
     LOGI("DobbyHook EventSystem.Update (%p) returned: %d, orig=%p", targetEventSystemMethod, esHookRes, orig_EventSystem_Update);
 
-    LOGI("C-RAM Lead & Multiplayer Mod Hooks Installed Successfully (v2.3)!");
+    LOGI("C-RAM Lead & Multiplayer Mod Hooks Installed Successfully (v2.5)!");
     pthread_exit(nullptr);
 }
 
