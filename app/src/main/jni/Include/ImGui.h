@@ -18,6 +18,11 @@
 #include "Logger.h"
 
 void (*menuAddress)() = nullptr;
+void (*preFrameCallback)() = nullptr;
+
+inline void setPreFrameCallback(void (*cb)()) {
+    preFrameCallback = cb;
+}
 
 using swapbuffers_orig = EGLBoolean (*)(EGLDisplay dpy, EGLSurface surf);
 EGLBoolean swapbuffers_hook(EGLDisplay dpy, EGLSurface surf);
@@ -89,6 +94,11 @@ void internalDrawMenu(int width, int height) {
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplAndroid_NewFrame(width, height);
+
+    if (preFrameCallback) {
+        preFrameCallback();
+    }
+
     ImGui::NewFrame();
 
     menuAddress();
