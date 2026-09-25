@@ -1,5 +1,5 @@
 //
-// C-RAM Air Target Lead Indicator & Multiplayer Menu Mod
+// C-RAM Air Target Lead Indicator & Multiplayer Menu Mod (Input System v2.2)
 //
 
 #include <pthread.h>
@@ -15,24 +15,37 @@
 #include "../Include/ImGui.h"
 #include "../Include/Drawing.h"
 #include "../Include/Unity.h"
+#include "../Include/Math/Vector2.hpp"
 #include "../Include/Logger.h"
 
 // -----------------------------------------------------------------------------
 // RVAs from script.json & dump.cs (Relative to libil2cpp.so base)
 // -----------------------------------------------------------------------------
-#define RVA_CAMERA_MAIN        0x82D7D50
-#define RVA_CAMERA_W2S         0x82D72A4
-#define RVA_COMP_TRANSFORM     0x834A0F4
-#define RVA_TRANS_POS          0x83601AC // UnityEngine.Transform.get_position
-#define RVA_UNIT_TYPE          0x3F54748
-#define RVA_PHYS_VEL           0x3EACAA4
-#define RVA_HUD_LATEUPDATE     0x3F16414
+#define RVA_CAMERA_MAIN          0x82D7D50
+#define RVA_CAMERA_W2S           0x82D72A4
+#define RVA_COMP_TRANSFORM       0x834A0F4
+#define RVA_TRANS_POS            0x83601AC // UnityEngine.Transform.get_position
+#define RVA_UNIT_TYPE            0x3F54748
+#define RVA_PHYS_VEL             0x3EACAA4
+#define RVA_HUD_LATEUPDATE       0x3F16414 // GeneralHUD.LateUpdate
+#define RVA_SCREEN_GET_HEIGHT    0x82EA798 // UnityEngine.Screen.get_height
 
-// Multiplayer & Input RVAs
-#define RVA_EVENTSYSTEM_UPDATE 0x86BE318 // UnityEngine.EventSystems.EventSystem.Update
-#define RVA_INPUT_GET_MOUSE_POS 0x83D97C4 // UnityEngine.Input.get_mousePosition
-#define RVA_INPUT_GET_MOUSE_BTN 0x83D9164 // UnityEngine.Input.GetMouseButton
-#define RVA_MP_ENTRY_CLICKED   0x3E2A764 // MultiplayerEntryButton.OnClicked
+// Unity New Input System RVAs
+#define RVA_INPUTSYSTEM_UPDATE   0x7DA85A4 // UnityEngine.InputSystem.InputSystem.Update
+#define RVA_EVENTSYSTEM_UPDATE   0x86BE318 // UnityEngine.EventSystems.EventSystem.Update
+#define RVA_TOUCHSCREEN_GET_CURR 0x7E4C0D8 // UnityEngine.InputSystem.Touchscreen.get_current
+#define RVA_TOUCHSCREEN_PRIMARY  0x7E4C018 // UnityEngine.InputSystem.Touchscreen.get_primaryTouch
+#define RVA_TOUCH_INPROGRESS     0x7DDD084 // UnityEngine.InputSystem.Controls.TouchControl.get_isInProgress
+#define RVA_TOUCH_GET_POS        0x7DDCF94 // UnityEngine.InputSystem.Controls.TouchControl.get_position
+#define RVA_POINTER_GET_CURRENT  0x7E4102C // UnityEngine.InputSystem.Pointer.get_current
+#define RVA_POINTER_GET_POS      0x7E40F9C // UnityEngine.InputSystem.Pointer.get_position
+#define RVA_V2CONTROL_READVAL    0x562D80C // UnityEngine.InputSystem.InputControl<Vector2>.ReadValue
+#define RVA_POINTER_GET_PRESS    0x7E40FFC // UnityEngine.InputSystem.Pointer.get_press
+#define RVA_BTNCONTROL_ISPRESSED 0x7DDAC88 // UnityEngine.InputSystem.Controls.ButtonControl.get_isPressed
+
+// Multiplayer RVAs
+#define RVA_MP_BOOTSTRAP         0x3E30D94 // MultiplayerService.Bootstrap
+#define RVA_MP_ENTRY_CLICKED     0x3E2A764 // MultiplayerEntryButton.OnClicked
 
 // -----------------------------------------------------------------------------
 // Field Offsets from dump.cs & il2cpp.h
@@ -64,10 +77,21 @@ typedef Vector3 (*t_Transform_get_position)(void* transform);
 typedef int (*t_IUnit_GetUnitType)(void* unit);
 typedef Vector3 (*t_PhysicsObject_get_Velocity)(void* physicsObject);
 typedef void (*t_GeneralHUD_LateUpdate)(void* self);
+typedef int (*t_Screen_get_height)();
 
+typedef void (*t_InputSystem_Update)();
 typedef void (*t_EventSystem_Update)(void* self);
-typedef Vector3 (*t_Input_get_mousePosition)();
-typedef bool (*t_Input_GetMouseButton)(int button);
+typedef void* (*t_Touchscreen_get_current)();
+typedef void* (*t_Touchscreen_get_primaryTouch)(void* ts);
+typedef bool (*t_TouchControl_get_isInProgress)(void* tc);
+typedef void* (*t_TouchControl_get_position)(void* tc);
+typedef void* (*t_Pointer_get_current)();
+typedef void* (*t_Pointer_get_position)(void* pointer);
+typedef Vector2 (*t_Vector2Control_ReadValue)(void* v2ctrl);
+typedef void* (*t_Pointer_get_press)(void* pointer);
+typedef bool (*t_ButtonControl_get_isPressed)(void* btnctrl);
+
+typedef void (*t_MpBootstrap)();
 typedef void (*t_MpEntry_OnClicked)(void* self);
 
 static t_Camera_WorldToScreenPoint Camera_WorldToScreenPoint = nullptr;
@@ -77,10 +101,21 @@ static t_Transform_get_position Transform_get_position = nullptr;
 static t_IUnit_GetUnitType IUnit_GetUnitType = nullptr;
 static t_PhysicsObject_get_Velocity PhysicsObject_get_Velocity = nullptr;
 static t_GeneralHUD_LateUpdate orig_GeneralHUD_LateUpdate = nullptr;
+static t_Screen_get_height Screen_get_height = nullptr;
 
+static t_InputSystem_Update orig_InputSystem_Update = nullptr;
 static t_EventSystem_Update orig_EventSystem_Update = nullptr;
-static t_Input_get_mousePosition Input_get_mousePosition = nullptr;
-static t_Input_GetMouseButton Input_GetMouseButton = nullptr;
+static t_Touchscreen_get_current Touchscreen_get_current = nullptr;
+static t_Touchscreen_get_primaryTouch Touchscreen_get_primaryTouch = nullptr;
+static t_TouchControl_get_isInProgress TouchControl_get_isInProgress = nullptr;
+static t_TouchControl_get_position TouchControl_get_position = nullptr;
+static t_Pointer_get_current Pointer_get_current = nullptr;
+static t_Pointer_get_position Pointer_get_position = nullptr;
+static t_Vector2Control_ReadValue Vector2Control_ReadValue = nullptr;
+static t_Pointer_get_press Pointer_get_press = nullptr;
+static t_ButtonControl_get_isPressed ButtonControl_get_isPressed = nullptr;
+
+static t_MpBootstrap MpBootstrap = nullptr;
 static t_MpEntry_OnClicked MpEntry_OnClicked = nullptr;
 
 // -----------------------------------------------------------------------------
@@ -89,12 +124,13 @@ static t_MpEntry_OnClicked MpEntry_OnClicked = nullptr;
 static uintptr_t g_Il2CppBase = 0;
 static bool g_HUDActive = false;
 
-// Touch & Multiplayer State
-static std::atomic<float> g_TouchX(0.0f);
-static std::atomic<float> g_TouchY(0.0f);
+// Touch & UI State (Coordinates initialized to -1000 to prevent false early hover)
+static std::atomic<float> g_TouchX(-1000.0f);
+static std::atomic<float> g_TouchY(-1000.0f);
 static std::atomic<bool> g_TouchDown(false);
 static std::atomic<bool> g_OpenMultiplayerRequested(false);
 static bool g_MultiplayerOpened = false;
+static bool g_MenuOpen = false; // Collapsed by default into a sleek floating button
 
 struct ScreenLeadTarget {
     float leadX, leadY;
@@ -117,34 +153,118 @@ inline bool IsValidPtr(const void* ptr) {
 }
 
 // -----------------------------------------------------------------------------
-// Touch & Multiplayer Processing (Runs on Unity Main Thread)
+// Touch & Multiplayer Processing (Runs on Unity Main Thread, New Input System)
 // -----------------------------------------------------------------------------
 static void ProcessTouchAndMultiplayer() {
-    if (Input_get_mousePosition && Input_GetMouseButton) {
-        Vector3 mPos = Input_get_mousePosition();
-        bool mDown = Input_GetMouseButton(0);
-        g_TouchX.store(mPos.X);
+    try {
         float sH = (glHeight > 0) ? (float)glHeight : 1080.0f;
-        g_TouchY.store(sH - mPos.Y); // Invert Y for ImGui coordinate system
-        g_TouchDown.store(mDown);
+        if (Screen_get_height) {
+            int shVal = Screen_get_height();
+            if (shVal > 0) {
+                sH = (float)shVal;
+            }
+        }
+
+        bool touchHandled = false;
+
+        // Primary Strategy: Touchscreen.current -> primaryTouch
+        if (Touchscreen_get_current) {
+            void* ts = Touchscreen_get_current();
+            if (IsValidPtr(ts) && Touchscreen_get_primaryTouch) {
+                void* pt = Touchscreen_get_primaryTouch(ts);
+                if (IsValidPtr(pt)) {
+                    if (TouchControl_get_isInProgress) {
+                        bool down = TouchControl_get_isInProgress(pt);
+                        g_TouchDown.store(down);
+                    }
+                    if (TouchControl_get_position && Vector2Control_ReadValue) {
+                        void* posCtrl = TouchControl_get_position(pt);
+                        if (IsValidPtr(posCtrl)) {
+                            Vector2 pos = Vector2Control_ReadValue(posCtrl);
+                            if (pos.X > 0.0f || pos.Y > 0.0f) {
+                                g_TouchX.store(pos.X);
+                                g_TouchY.store(sH - pos.Y);
+                            }
+                        }
+                    }
+                    touchHandled = true;
+                }
+            }
+        }
+
+        // Secondary Fallback: Pointer.current
+        if (!touchHandled && Pointer_get_current) {
+            void* ptr = Pointer_get_current();
+            if (IsValidPtr(ptr)) {
+                if (Pointer_get_press && ButtonControl_get_isPressed) {
+                    void* pressCtrl = Pointer_get_press(ptr);
+                    if (IsValidPtr(pressCtrl)) {
+                        bool pressed = ButtonControl_get_isPressed(pressCtrl);
+                        g_TouchDown.store(pressed);
+                    }
+                }
+                if (Pointer_get_position && Vector2Control_ReadValue) {
+                    void* posCtrl = Pointer_get_position(ptr);
+                    if (IsValidPtr(posCtrl)) {
+                        Vector2 pos = Vector2Control_ReadValue(posCtrl);
+                        if (pos.X > 0.0f || pos.Y > 0.0f) {
+                            g_TouchX.store(pos.X);
+                            g_TouchY.store(sH - pos.Y);
+                        }
+                    }
+                }
+            }
+        }
+    } catch (...) {
+        // Safe catch-all
     }
 
+    // Multiplayer Screen Launcher
     if (g_OpenMultiplayerRequested.load()) {
         g_OpenMultiplayerRequested.store(false);
-        LOGI("Triggering MultiplayerEntryButton::OnClicked on Unity Main Thread!");
-        if (MpEntry_OnClicked) {
-            MpEntry_OnClicked(nullptr);
-            g_MultiplayerOpened = true;
-            LOGI("MultiplayerEntryButton::OnClicked executed successfully!");
-        } else {
-            LOGE("MpEntry_OnClicked function pointer is null!");
+        LOGI("Triggering Multiplayer on Unity Main Thread!");
+        try {
+            if (MpBootstrap) {
+                LOGI("Calling MultiplayerService::Bootstrap()...");
+                MpBootstrap();
+            }
+            if (MpEntry_OnClicked) {
+                LOGI("Calling MultiplayerEntryButton::OnClicked()...");
+                MpEntry_OnClicked(nullptr);
+                g_MultiplayerOpened = true;
+                LOGI("Multiplayer launched successfully!");
+            } else {
+                LOGE("MpEntry_OnClicked function pointer is null!");
+            }
+        } catch (...) {
+            LOGE("Exception caught while executing Multiplayer trigger!");
         }
     }
 }
 
 // -----------------------------------------------------------------------------
-// EventSystem.Update Hook (Active in ALL scenes: Menu, Hangar, Battle)
+// Pre-Frame Callback: updates ImGuiIO right before ImGui::NewFrame()
 // -----------------------------------------------------------------------------
+void OnPreFrame() {
+    ImGuiIO& io = ImGui::GetIO();
+    float tx = g_TouchX.load();
+    float ty = g_TouchY.load();
+    if (tx >= 0.0f && ty >= 0.0f) {
+        io.MousePos = ImVec2(tx, ty);
+    }
+    io.MouseDown[0] = g_TouchDown.load();
+}
+
+// -----------------------------------------------------------------------------
+// Hooks on Unity Main Thread
+// -----------------------------------------------------------------------------
+void hook_InputSystem_Update() {
+    if (orig_InputSystem_Update) {
+        orig_InputSystem_Update();
+    }
+    ProcessTouchAndMultiplayer();
+}
+
 void hook_EventSystem_Update(void* self) {
     if (orig_EventSystem_Update) {
         orig_EventSystem_Update(self);
@@ -194,7 +314,6 @@ static bool CalculateLead(
         }
     }
 
-    // Fallback if target faster than bullet or discriminant negative
     if (t <= 0.0f) {
         t = outDistance / bulletSpeed;
     }
@@ -202,7 +321,6 @@ static bool CalculateLead(
     outFlightTime = t;
     outLeadPos = targetPos + targetVel * t;
 
-    // Ballistic drop compensation (game Gravity = -9.0)
     if (!noGravity) {
         outLeadPos.Y += 0.5f * 9.0f * t * t;
     }
@@ -225,7 +343,6 @@ void hook_GeneralHUD_LateUpdate(void* self) {
     }
     g_HUDActive = true;
 
-    // 1. Get Camera
     void* cam = *(void**)((uintptr_t)self + OFFSET_HUD_MAINCAMERA);
     if (!IsValidPtr(cam) && Camera_get_main) {
         cam = Camera_get_main();
@@ -234,7 +351,6 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         return;
     }
 
-    // 2. Determine Gun Position, Bullet Speed, Gravity
     Vector3 gunPos(0, 0, 0);
     float bulletSpeed = 1000.0f;
     bool noGravity = false;
@@ -246,13 +362,11 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         if (IsValidPtr(aws)) {
             void* activeTurret = nullptr;
 
-            // Check selectable turrets
             auto selectable = *(monoList<void*>**)((uintptr_t)aws + OFFSET_AWS_SELECTABLE);
             if (IsValidPtr(selectable) && IsValidPtr(selectable->items) && selectable->getSize() > 0) {
                 activeTurret = ((void**)selectable->items->vector)[0];
             }
 
-            // Fallback to alwaysReadyTurrets
             if (!IsValidPtr(activeTurret)) {
                 auto alwaysReady = *(monoList<void*>**)((uintptr_t)aws + OFFSET_AWS_ALWAYSREADY);
                 if (IsValidPtr(alwaysReady) && IsValidPtr(alwaysReady->items) && alwaysReady->getSize() > 0) {
@@ -274,59 +388,59 @@ void hook_GeneralHUD_LateUpdate(void* self) {
                         bulletSpeed = spd;
                     }
                 }
+
                 noGravity = *(bool*)((uintptr_t)activeTurret + OFFSET_TURRET_NOGRAVITY);
             }
         }
     }
 
-    // Fallback: camera origin
-    if (!foundTurret && Component_get_transform && Transform_get_position) {
-        void* camTr = Component_get_transform(cam);
-        if (IsValidPtr(camTr)) {
-            gunPos = Transform_get_position(camTr);
-        }
+    if (!foundTurret && Transform_get_position) {
+        gunPos = Transform_get_position(cam);
     }
 
-    // 3. Read enemy units list
-    auto enemyList = *(monoList<void*>**)((uintptr_t)self + OFFSET_HUD_ALLENEMIES);
-    if (!IsValidPtr(enemyList) || !IsValidPtr(enemyList->items)) {
+    auto enemies = *(monoList<void*>**)((uintptr_t)self + OFFSET_HUD_ALLENEMIES);
+    if (!IsValidPtr(enemies) || !IsValidPtr(enemies->items)) {
         return;
     }
 
-    int totalEnemies = enemyList->getSize();
-    if (totalEnemies <= 0 || totalEnemies > 250) {
+    int enemyCount = enemies->getSize();
+    if (enemyCount <= 0 || enemyCount > 256) {
         return;
     }
 
     int writeIdx = 1 - g_ActiveBufferIdx.load();
     int count = 0;
-    float screenHeight = (glHeight > 0) ? (float)glHeight : 1080.0f;
 
-    // 4. Calculate lead points for all airborne targets
-    for (int i = 0; i < totalEnemies && count < MAX_TARGETS; i++) {
-        void* target = ((void**)enemyList->items->vector)[i];
-        if (!IsValidPtr(target)) continue;
+    float screenH = (glHeight > 0) ? (float)glHeight : 1080.0f;
+    if (Screen_get_height) {
+        int shVal = Screen_get_height();
+        if (shVal > 0) screenH = (float)shVal;
+    }
 
-        bool isAlive = *(bool*)((uintptr_t)target + OFFSET_UNIT_ISALIVE);
-        if (!isAlive) continue;
+    for (int i = 0; i < enemyCount && count < MAX_TARGETS; i++) {
+        void* unit = ((void**)enemies->items->vector)[i];
+        if (!IsValidPtr(unit)) continue;
 
         if (IUnit_GetUnitType) {
-            int unitType = IUnit_GetUnitType(target);
-            if (unitType != 3 && unitType != 6 && unitType != 7 && unitType != 5) {
-                continue;
-            }
+            int unitType = IUnit_GetUnitType(unit);
+            if (unitType != 0) continue; // 0 = Air
         }
 
-        void* tr = Component_get_transform ? Component_get_transform(target) : nullptr;
-        if (!IsValidPtr(tr) || !Transform_get_position) continue;
-        Vector3 targetPos = Transform_get_position(tr);
+        bool isAlive = *(bool*)((uintptr_t)unit + OFFSET_UNIT_ISALIVE);
+        if (!isAlive) continue;
 
+        if (!Component_get_transform || !Transform_get_position) continue;
+        void* trans = Component_get_transform(unit);
+        if (!IsValidPtr(trans)) continue;
+
+        Vector3 targetPos = Transform_get_position(trans);
         Vector3 targetVel(0, 0, 0);
+
         if (PhysicsObject_get_Velocity) {
-            targetVel = PhysicsObject_get_Velocity(target);
+            targetVel = PhysicsObject_get_Velocity(unit);
         }
 
-        Vector3 leadPos(0, 0, 0);
+        Vector3 leadPos;
         float flightTime = 0.0f;
         float distance = 0.0f;
 
@@ -334,25 +448,21 @@ void hook_GeneralHUD_LateUpdate(void* self) {
             continue;
         }
 
-        Vector3 leadScreen = Camera_WorldToScreenPoint(cam, leadPos);
-        if (leadScreen.Z <= 0.0f) {
-            continue;
-        }
+        Vector3 screenLead = Camera_WorldToScreenPoint(cam, leadPos);
+        if (screenLead.Z <= 1.0f) continue;
 
-        Vector3 targetScreen = Camera_WorldToScreenPoint(cam, targetPos);
+        ScreenLeadTarget& tgt = g_TargetsBuffer[writeIdx][count];
+        tgt.leadX = screenLead.X;
+        tgt.leadY = screenH - screenLead.Y;
+        tgt.distance = distance;
+        tgt.flightTime = flightTime;
+        tgt.hasTargetLine = false;
 
-        ScreenLeadTarget& entry = g_TargetsBuffer[writeIdx][count];
-        entry.leadX = leadScreen.X;
-        entry.leadY = screenHeight - leadScreen.Y;
-        entry.distance = distance;
-        entry.flightTime = flightTime;
-
-        if (targetScreen.Z > 0.0f) {
-            entry.hasTargetLine = true;
-            entry.targetX = targetScreen.X;
-            entry.targetY = screenHeight - targetScreen.Y;
-        } else {
-            entry.hasTargetLine = false;
+        Vector3 screenTarget = Camera_WorldToScreenPoint(cam, targetPos);
+        if (screenTarget.Z > 1.0f) {
+            tgt.targetX = screenTarget.X;
+            tgt.targetY = screenH - screenTarget.Y;
+            tgt.hasTargetLine = true;
         }
 
         count++;
@@ -366,42 +476,66 @@ void hook_GeneralHUD_LateUpdate(void* self) {
 // ImGui Drawing Loop (Called inside swapbuffers_hook on render thread)
 // -----------------------------------------------------------------------------
 void DrawMenu() {
-    // 1. Pass captured touch coordinates into ImGui
-    ImGuiIO& io = ImGui::GetIO();
-    io.MousePos = ImVec2(g_TouchX.load(), g_TouchY.load());
-    io.MouseDown[0] = g_TouchDown.load();
-
-    // 2. Interactive Mod Menu Window
-    ImGui::SetNextWindowPos(ImVec2(40.0f, 60.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(340.0f, 210.0f), ImGuiCond_FirstUseEver);
-
-    if (ImGui::Begin("C-RAM MOD MENU", nullptr, ImGuiWindowFlags_NoCollapse)) {
-        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "C-RAM Mod Menu v2.0");
-        ImGui::Separator();
-
-        // USER REQUESTED BUTTON: [ OPEN MULTIPLAYER ]
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.52f, 0.92f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.62f, 1.0f, 1.0f));
+    // 1. Mod Menu Window (Collapsible Floating Button <-> Expanded Menu)
+    if (!g_MenuOpen) {
+        // Sleek floating pill button [ MOD ] in top-left
+        ImGui::SetNextWindowPos(ImVec2(30.0f, 30.0f), ImGuiCond_FirstUseEver);
+        ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoScrollbar;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 6.0f));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.08f, 0.12f, 0.20f, 0.85f));
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.50f, 0.90f, 0.90f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.60f, 1.0f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.05f, 0.40f, 0.80f, 1.0f));
 
-        if (ImGui::Button("[ OPEN MULTIPLAYER ]", ImVec2(310.0f, 65.0f))) {
-            LOGI("USER PRESSED [ OPEN MULTIPLAYER ] BUTTON!");
-            g_OpenMultiplayerRequested.store(true);
+        if (ImGui::Begin("##ModPill", nullptr, flags)) {
+            if (ImGui::Button(" [ MOD ] ", ImVec2(90.0f, 40.0f))) {
+                g_MenuOpen = true;
+            }
         }
-        ImGui::PopStyleColor(3);
+        ImGui::End();
+        ImGui::PopStyleColor(4);
+        ImGui::PopStyleVar(2);
+    } else {
+        // Expanded compact menu window
+        ImGui::SetNextWindowPos(ImVec2(30.0f, 30.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(320.0f, 0.0f), ImGuiCond_Always);
+        ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
 
-        if (g_MultiplayerOpened) {
-            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.3f, 1.0f), "Multiplayer Screen Launched!");
-        } else {
-            ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.3f, 1.0f), "Status: Ready");
+        if (ImGui::Begin("C-RAM MOD MENU", &g_MenuOpen, flags)) {
+            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "Multiplayer & ESP");
+            ImGui::SameLine(ImGui::GetWindowWidth() - 75.0f);
+            if (ImGui::SmallButton(" [ - ] ")) {
+                g_MenuOpen = false;
+            }
+            ImGui::Separator();
+
+            // USER REQUESTED BUTTON: [ OPEN MULTIPLAYER ]
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.52f, 0.92f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.62f, 1.0f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.05f, 0.40f, 0.80f, 1.0f));
+
+            if (ImGui::Button("[ OPEN MULTIPLAYER ]", ImVec2(-1.0f, 48.0f))) {
+                LOGI("USER PRESSED [ OPEN MULTIPLAYER ] BUTTON!");
+                g_OpenMultiplayerRequested.store(true);
+            }
+            ImGui::PopStyleColor(3);
+
+            if (g_MultiplayerOpened) {
+                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.3f, 1.0f), "Status: Screen Launched!");
+            } else {
+                ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.3f, 1.0f), "Status: Ready");
+            }
+
+            ImGui::Separator();
+            ImGui::Text("Lead ESP: %s", g_HUDActive ? "ACTIVE" : "STANDBY");
         }
-
-        ImGui::Separator();
-        ImGui::Text("Lead Indicator: %s", g_HUDActive ? "ACTIVE" : "STANDBY");
+        ImGui::End();
+        ImGui::PopStyleVar(1);
     }
-    ImGui::End();
 
-    // 3. Lead Indicator ESP Overlay (in battle)
+    // 2. Lead Indicator ESP Overlay (in battle)
     ImDrawList* draw = ImGui::GetBackgroundDrawList();
     if (!draw) return;
 
@@ -506,9 +640,10 @@ static uintptr_t getIl2CppBaseAddress() {
 // Hook Initialization Thread
 // -----------------------------------------------------------------------------
 void* thread(void*) {
-    LOGI("C-RAM Mod Thread Started");
+    LOGI("C-RAM Mod Thread Started (v2.2)");
 
     initModMenu((void*)DrawMenu);
+    setPreFrameCallback(OnPreFrame);
 
     int waitCounter = 0;
     while (!g_Il2CppBase) {
@@ -525,16 +660,28 @@ void* thread(void*) {
     LOGI("libil2cpp.so found at: %p", (void*)g_Il2CppBase);
     sleep(1);
 
-    // Resolve pointers
+    // Resolve battle pointers
     Camera_get_main = (t_Camera_get_main)(g_Il2CppBase + RVA_CAMERA_MAIN);
     Camera_WorldToScreenPoint = (t_Camera_WorldToScreenPoint)(g_Il2CppBase + RVA_CAMERA_W2S);
     Component_get_transform = (t_Component_get_transform)(g_Il2CppBase + RVA_COMP_TRANSFORM);
     Transform_get_position = (t_Transform_get_position)(g_Il2CppBase + RVA_TRANS_POS);
     IUnit_GetUnitType = (t_IUnit_GetUnitType)(g_Il2CppBase + RVA_UNIT_TYPE);
     PhysicsObject_get_Velocity = (t_PhysicsObject_get_Velocity)(g_Il2CppBase + RVA_PHYS_VEL);
+    Screen_get_height = (t_Screen_get_height)(g_Il2CppBase + RVA_SCREEN_GET_HEIGHT);
 
-    Input_get_mousePosition = (t_Input_get_mousePosition)(g_Il2CppBase + RVA_INPUT_GET_MOUSE_POS);
-    Input_GetMouseButton = (t_Input_GetMouseButton)(g_Il2CppBase + RVA_INPUT_GET_MOUSE_BTN);
+    // Resolve New Input System pointers
+    Touchscreen_get_current = (t_Touchscreen_get_current)(g_Il2CppBase + RVA_TOUCHSCREEN_GET_CURR);
+    Touchscreen_get_primaryTouch = (t_Touchscreen_get_primaryTouch)(g_Il2CppBase + RVA_TOUCHSCREEN_PRIMARY);
+    TouchControl_get_isInProgress = (t_TouchControl_get_isInProgress)(g_Il2CppBase + RVA_TOUCH_INPROGRESS);
+    TouchControl_get_position = (t_TouchControl_get_position)(g_Il2CppBase + RVA_TOUCH_GET_POS);
+    Pointer_get_current = (t_Pointer_get_current)(g_Il2CppBase + RVA_POINTER_GET_CURRENT);
+    Pointer_get_position = (t_Pointer_get_position)(g_Il2CppBase + RVA_POINTER_GET_POS);
+    Vector2Control_ReadValue = (t_Vector2Control_ReadValue)(g_Il2CppBase + RVA_V2CONTROL_READVAL);
+    Pointer_get_press = (t_Pointer_get_press)(g_Il2CppBase + RVA_POINTER_GET_PRESS);
+    ButtonControl_get_isPressed = (t_ButtonControl_get_isPressed)(g_Il2CppBase + RVA_BTNCONTROL_ISPRESSED);
+
+    // Resolve Multiplayer pointers
+    MpBootstrap = (t_MpBootstrap)(g_Il2CppBase + RVA_MP_BOOTSTRAP);
     MpEntry_OnClicked = (t_MpEntry_OnClicked)(g_Il2CppBase + RVA_MP_ENTRY_CLICKED);
 
     // 1. Hook GeneralHUD.LateUpdate for Battle ESP
@@ -542,12 +689,17 @@ void* thread(void*) {
     int hudHookRes = DobbyHook(targetHUDMethod, (void*)hook_GeneralHUD_LateUpdate, (void**)&orig_GeneralHUD_LateUpdate);
     LOGI("DobbyHook GeneralHUD.LateUpdate (%p) returned: %d, orig=%p", targetHUDMethod, hudHookRes, orig_GeneralHUD_LateUpdate);
 
-    // 2. Hook EventSystem.Update for Global UI & Main Menu Multiplayer trigger
+    // 2. Hook InputSystem.Update for global main-thread update
+    void* targetInputSystemMethod = (void*)(g_Il2CppBase + RVA_INPUTSYSTEM_UPDATE);
+    int isHookRes = DobbyHook(targetInputSystemMethod, (void*)hook_InputSystem_Update, (void**)&orig_InputSystem_Update);
+    LOGI("DobbyHook InputSystem.Update (%p) returned: %d, orig=%p", targetInputSystemMethod, isHookRes, orig_InputSystem_Update);
+
+    // 3. Hook EventSystem.Update for UI main-thread update
     void* targetEventSystemMethod = (void*)(g_Il2CppBase + RVA_EVENTSYSTEM_UPDATE);
     int esHookRes = DobbyHook(targetEventSystemMethod, (void*)hook_EventSystem_Update, (void**)&orig_EventSystem_Update);
     LOGI("DobbyHook EventSystem.Update (%p) returned: %d, orig=%p", targetEventSystemMethod, esHookRes, orig_EventSystem_Update);
 
-    LOGI("C-RAM Lead & Multiplayer Mod Hooks Installed Successfully!");
+    LOGI("C-RAM Lead & Multiplayer Mod Hooks Installed Successfully (v2.2)!");
     pthread_exit(nullptr);
 }
 
