@@ -1,16 +1,20 @@
 //
-// C-RAM Air Target Lead Indicator & Diamond Icon Multiplayer Mod (v3.0 - Direct Hook)
+// C-RAM Air Target Lead Indicator & Multiplayer Launcher (v4.0 - Direct Hook + ADB Listener)
 //
 
 #include <pthread.h>
 #include <unistd.h>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 #include <atomic>
 #include <ctime>
 #include <link.h>
 #include <dlfcn.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include "../Include/KittyMemory/MemoryPatch.h"
 #include "../Include/ImGui.h"
@@ -30,11 +34,14 @@
 #define RVA_PHYS_VEL             0x3EACAA4
 #define RVA_HUD_LATEUPDATE       0x3F16414 // GeneralHUD.LateUpdate
 
-// Multiplayer & Diamond Button RVAs
-#define RVA_ICONS_SHOWSTORE      0x4267774 // CBS.UI.IconsPanel.ShowStore (Diamond donate icon)
-#define RVA_STORE_ONENABLE       0x427D1EC // CBS.UI.StoreWindow.OnEnable
+// Multiplayer & UI Hooks
+#define RVA_EVENTSYSTEM_UPDATE   0x86BE318 // UnityEngine.EventSystems.EventSystem.Update
 #define RVA_MP_BOOTSTRAP         0x3E30D94 // MultiplayerService.Bootstrap
 #define RVA_MP_ENTRY_CLICKED     0x3E2A764 // MultiplayerEntryButton.OnClicked
+
+// Button / Shop Hooks
+#define RVA_IAP_SHOP_ONENABLE    0x3DBD734 // IAPShopButton.OnEnable (Diamond icon in hangar)
+#define RVA_ICONS_SHOWSTORE      0x4267774 // CBS.UI.IconsPanel.ShowStore (Backup)
 
 // -----------------------------------------------------------------------------
 // Field Offsets from dump.cs & il2cpp.h
@@ -67,10 +74,11 @@ typedef int (*t_IUnit_GetUnitType)(void* unit);
 typedef Vector3 (*t_PhysicsObject_get_Velocity)(void* physicsObject);
 typedef void (*t_GeneralHUD_LateUpdate)(void* self);
 
-typedef void (*t_IconsPanel_ShowStore)(void* self);
-typedef void (*t_StoreWindow_OnEnable)(void* self);
+typedef void (*t_EventSystem_Update)(void* self);
 typedef void (*t_MpBootstrap)();
 typedef void (*t_MpEntry_OnClicked)(void* self);
+typedef void (*t_IAPShopButton_OnEnable)(void* self);
+typedef void (*t_IconsPanel_ShowStore)(void* self);
 
 static t_Camera_WorldToScreenPoint Camera_WorldToScreenPoint = nullptr;
 static t_Camera_get_main Camera_get_main = nullptr;
@@ -80,15 +88,17 @@ static t_IUnit_GetUnitType IUnit_GetUnitType = nullptr;
 static t_PhysicsObject_get_Velocity PhysicsObject_get_Velocity = nullptr;
 static t_GeneralHUD_LateUpdate orig_GeneralHUD_LateUpdate = nullptr;
 
-static t_IconsPanel_ShowStore orig_IconsPanel_ShowStore = nullptr;
-static t_StoreWindow_OnEnable orig_StoreWindow_OnEnable = nullptr;
+static t_EventSystem_Update orig_EventSystem_Update = nullptr;
 static t_MpBootstrap MpBootstrap = nullptr;
 static t_MpEntry_OnClicked MpEntry_OnClicked = nullptr;
+static t_IAPShopButton_OnEnable orig_IAPShopButton_OnEnable = nullptr;
+static t_IconsPanel_ShowStore orig_IconsPanel_ShowStore = nullptr;
 
 // -----------------------------------------------------------------------------
 // Global State & Buffers
 // -----------------------------------------------------------------------------
 static uintptr_t g_Il2CppBase = 0;
+static std::atomic<bool> g_OpenMultiplayerRequested(false);
 static uint64_t g_LastTriggerTime = 0;
 
 struct ScreenLeadTarget {
@@ -118,50 +128,107 @@ static inline uint64_t getNowMs() {
 }
 
 // -----------------------------------------------------------------------------
-// Multiplayer Trigger via Diamond Icon Click
+// Hook on Diamond Button (IAPShopButton.OnEnable & IconsPanel.ShowStore)
 // -----------------------------------------------------------------------------
-void TriggerMultiplayer() {
+void hook_IAPShopButton_OnEnable(void* self) {
+    LOGI("[C-RAM-MOD] Diamond Icon pressed -> IAPShopButton::OnEnable intercepted!");
     uint64_t now = getNowMs();
-    if (now - g_LastTriggerTime < 600) {
-        LOGI("[C-RAM-MOD] TriggerMultiplayer debounced");
-        return;
-    }
-    g_LastTriggerTime = now;
-
-    LOGI("[C-RAM-MOD] Launching Hidden Multiplayer via Diamond Icon!");
-    try {
-        if (MpBootstrap) {
-            LOGI("[C-RAM-MOD] Calling MultiplayerService::Bootstrap()...");
-            MpBootstrap();
-        }
-        if (MpEntry_OnClicked) {
-            LOGI("[C-RAM-MOD] Calling MultiplayerEntryButton::OnClicked()...");
-            MpEntry_OnClicked(nullptr);
-            LOGI("[C-RAM-MOD] Multiplayer Screen Launched Successfully!");
-        } else {
-            LOGE("[C-RAM-MOD] MpEntry_OnClicked is null!");
-        }
-    } catch (...) {
-        LOGE("[C-RAM-MOD] Exception during Multiplayer launch!");
+    if (now - g_LastTriggerTime > 500) {
+        g_LastTriggerTime = now;
+        g_OpenMultiplayerRequested.store(true);
     }
 }
 
-// Hook on CBS.UI.IconsPanel.ShowStore (Diamond donate button)
 void hook_IconsPanel_ShowStore(void* self) {
-    LOGI("[C-RAM-MOD] CBS.UI.IconsPanel::ShowStore tapped (Diamond Icon)!");
-    TriggerMultiplayer();
-    // Do not call orig_IconsPanel_ShowStore so store window doesn't open
-}
-
-// Hook on CBS.UI.StoreWindow.OnEnable (Fallback if store opens through any other path)
-void hook_StoreWindow_OnEnable(void* self) {
-    LOGI("[C-RAM-MOD] CBS.UI.StoreWindow::OnEnable intercepted!");
-    TriggerMultiplayer();
-    // Do not call orig_StoreWindow_OnEnable
+    LOGI("[C-RAM-MOD] IconsPanel::ShowStore intercepted!");
+    uint64_t now = getNowMs();
+    if (now - g_LastTriggerTime > 500) {
+        g_LastTriggerTime = now;
+        g_OpenMultiplayerRequested.store(true);
+    }
 }
 
 // -----------------------------------------------------------------------------
-// Lead Math Solver (Air Target Ballistic Intercept)
+// Unity Main Thread Execution Loop (EventSystem.Update)
+// -----------------------------------------------------------------------------
+void hook_EventSystem_Update(void* self) {
+    if (orig_EventSystem_Update) {
+        orig_EventSystem_Update(self);
+    }
+
+    if (g_OpenMultiplayerRequested.load()) {
+        g_OpenMultiplayerRequested.store(false);
+        LOGI("[C-RAM-MOD] Launching Hidden Multiplayer on Unity Main Thread!");
+        try {
+            if (MpBootstrap) {
+                LOGI("[C-RAM-MOD] Executing MultiplayerService::Bootstrap()...");
+                MpBootstrap();
+            }
+            if (MpEntry_OnClicked) {
+                LOGI("[C-RAM-MOD] Executing MultiplayerEntryButton::OnClicked()...");
+                MpEntry_OnClicked(nullptr);
+                LOGI("[C-RAM-MOD] Multiplayer Screen Launched Successfully!");
+            } else {
+                LOGE("[C-RAM-MOD] MpEntry_OnClicked is null!");
+            }
+        } catch (...) {
+            LOGE("[C-RAM-MOD] Exception during Multiplayer launch!");
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Local TCP Socket Command Listener for ADB Control (Port 8888)
+// -----------------------------------------------------------------------------
+void* socket_server_thread(void*) {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        LOGE("[C-RAM-MOD] Failed to create command socket!");
+        return nullptr;
+    }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1
+    address.sin_port = htons(8888);
+
+    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+        LOGE("[C-RAM-MOD] Socket bind to 127.0.0.1:8888 failed!");
+        close(server_fd);
+        return nullptr;
+    }
+
+    if (listen(server_fd, 4) < 0) {
+        LOGE("[C-RAM-MOD] Socket listen failed!");
+        close(server_fd);
+        return nullptr;
+    }
+
+    LOGI("[C-RAM-MOD] ADB TCP command listener ready on 127.0.0.1:8888");
+
+    while (true) {
+        int client_fd = accept(server_fd, nullptr, nullptr);
+        if (client_fd >= 0) {
+            char buf[128] = {0};
+            ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
+            if (n > 0) {
+                LOGI("[C-RAM-MOD] ADB TCP Command received: %s", buf);
+                g_OpenMultiplayerRequested.store(true);
+                const char* reply = "OK: Multiplayer Triggered\n";
+                write(client_fd, reply, strlen(reply));
+            }
+            close(client_fd);
+        }
+    }
+    return nullptr;
+}
+
+// -----------------------------------------------------------------------------
+// Lead Math Solver (Exact Battle Intercept Calculation)
 // -----------------------------------------------------------------------------
 static bool CalculateLead(
     const Vector3& targetPos,
@@ -474,7 +541,7 @@ static uintptr_t getIl2CppBaseAddress() {
 // Hook Initialization Thread
 // -----------------------------------------------------------------------------
 void* thread(void*) {
-    LOGI("C-RAM Mod Thread Started (v3.0 - Diamond Hook)");
+    LOGI("C-RAM Mod Thread Started (v4.0 - IAPShop Hook + ADB Socket)");
 
     initModMenu((void*)DrawMenu);
 
@@ -510,17 +577,26 @@ void* thread(void*) {
     int hudHookRes = DobbyHook(targetHUDMethod, (void*)hook_GeneralHUD_LateUpdate, (void**)&orig_GeneralHUD_LateUpdate);
     LOGI("DobbyHook GeneralHUD.LateUpdate (%p) returned: %d, orig=%p", targetHUDMethod, hudHookRes, orig_GeneralHUD_LateUpdate);
 
-    // 2. Hook CBS.UI.IconsPanel.ShowStore (Diamond donate button in hangar header)
+    // 2. Hook EventSystem.Update for safe execution on Unity Main Thread
+    void* targetEventSystemMethod = (void*)(g_Il2CppBase + RVA_EVENTSYSTEM_UPDATE);
+    int esHookRes = DobbyHook(targetEventSystemMethod, (void*)hook_EventSystem_Update, (void**)&orig_EventSystem_Update);
+    LOGI("DobbyHook EventSystem.Update (%p) returned: %d, orig=%p", targetEventSystemMethod, esHookRes, orig_EventSystem_Update);
+
+    // 3. Hook IAPShopButton.OnEnable (Diamond icon in hangar header)
+    void* targetIAPShop = (void*)(g_Il2CppBase + RVA_IAP_SHOP_ONENABLE);
+    int iapHookRes = DobbyHook(targetIAPShop, (void*)hook_IAPShopButton_OnEnable, (void**)&orig_IAPShopButton_OnEnable);
+    LOGI("DobbyHook IAPShopButton.OnEnable (%p) returned: %d, orig=%p", targetIAPShop, iapHookRes, orig_IAPShopButton_OnEnable);
+
+    // 4. Hook CBS.UI.IconsPanel.ShowStore (Backup)
     void* targetShowStore = (void*)(g_Il2CppBase + RVA_ICONS_SHOWSTORE);
     int storeHookRes = DobbyHook(targetShowStore, (void*)hook_IconsPanel_ShowStore, (void**)&orig_IconsPanel_ShowStore);
     LOGI("DobbyHook IconsPanel.ShowStore (%p) returned: %d, orig=%p", targetShowStore, storeHookRes, orig_IconsPanel_ShowStore);
 
-    // 3. Hook CBS.UI.StoreWindow.OnEnable (Fallback interceptor for store opening)
-    void* targetStoreOnEnable = (void*)(g_Il2CppBase + RVA_STORE_ONENABLE);
-    int storeEnableRes = DobbyHook(targetStoreOnEnable, (void*)hook_StoreWindow_OnEnable, (void**)&orig_StoreWindow_OnEnable);
-    LOGI("DobbyHook StoreWindow.OnEnable (%p) returned: %d, orig=%p", targetStoreOnEnable, storeEnableRes, orig_StoreWindow_OnEnable);
+    // 5. Start ADB Socket Listener Thread on 127.0.0.1:8888
+    pthread_t sock_t;
+    pthread_create(&sock_t, nullptr, socket_server_thread, nullptr);
 
-    LOGI("C-RAM v3.0 Hooks Installed Successfully: Lead ESP + Diamond Multiplayer Trigger!");
+    LOGI("C-RAM v4.0 Hooks Installed: Lead ESP + IAPShop Diamond Hook + ADB Listener Ready!");
     pthread_exit(nullptr);
 }
 
