@@ -1,5 +1,5 @@
 //
-// C-RAM Air Target Lead Indicator & Multiplayer Launcher (v4.0 - Direct Hook + ADB Listener)
+// C-RAM Air Target Lead Indicator & Multiplayer Launcher (v4.1 - Multi-command TCP Server + Diamond Hook)
 //
 
 #include <pthread.h>
@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <strings.h>
 #include <vector>
 #include <atomic>
 #include <ctime>
@@ -178,7 +179,7 @@ void hook_EventSystem_Update(void* self) {
 }
 
 // -----------------------------------------------------------------------------
-// Local TCP Socket Command Listener for ADB Control (Port 8888)
+// TCP Socket Command Listener for ADB / LAN Control (Port 8888)
 // -----------------------------------------------------------------------------
 void* socket_server_thread(void*) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -193,32 +194,52 @@ void* socket_server_thread(void*) {
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1
+    address.sin_addr.s_addr = htonl(INADDR_ANY); // Bind to 0.0.0.0 (Works with ADB 127.0.0.1 forward & LAN)
     address.sin_port = htons(8888);
 
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        LOGE("[C-RAM-MOD] Socket bind to 127.0.0.1:8888 failed!");
+        LOGE("[C-RAM-MOD] Socket bind to port 8888 failed!");
         close(server_fd);
         return nullptr;
     }
 
-    if (listen(server_fd, 4) < 0) {
+    if (listen(server_fd, 8) < 0) {
         LOGE("[C-RAM-MOD] Socket listen failed!");
         close(server_fd);
         return nullptr;
     }
 
-    LOGI("[C-RAM-MOD] ADB TCP command listener ready on 127.0.0.1:8888");
+    LOGI("[C-RAM-MOD] TCP Command Server ready on 0.0.0.0:8888 (use: adb forward tcp:8888 tcp:8888)");
 
     while (true) {
-        int client_fd = accept(server_fd, nullptr, nullptr);
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
         if (client_fd >= 0) {
-            char buf[128] = {0};
+            char buf[256] = {0};
             ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
             if (n > 0) {
-                LOGI("[C-RAM-MOD] ADB TCP Command received: %s", buf);
-                g_OpenMultiplayerRequested.store(true);
-                const char* reply = "OK: Multiplayer Triggered\n";
+                // Trim trailing newlines and spaces
+                while (n > 0 && (buf[n - 1] == '\r' || buf[n - 1] == '\n' || buf[n - 1] == ' ')) {
+                    buf[--n] = '\0';
+                }
+                LOGI("[C-RAM-MOD] TCP Command received: '%s'", buf);
+
+                char reply[256] = {0};
+                if (strcasecmp(buf, "ping") == 0) {
+                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v4.1 Online\n");
+                } else if (strcasecmp(buf, "help") == 0) {
+                    snprintf(reply, sizeof(reply), "HELP: ping, mp, status\n");
+                } else if (strcasecmp(buf, "status") == 0) {
+                    int curCount = g_TargetsCount[g_ActiveBufferIdx.load()];
+                    snprintf(reply, sizeof(reply), "STATUS: Il2CppBase=%p, Targets=%d, HUDActive=%d\n",
+                             (void*)g_Il2CppBase, curCount, g_HUDActive ? 1 : 0);
+                } else {
+                    // Default / 'mp' / '1' -> trigger multiplayer
+                    g_OpenMultiplayerRequested.store(true);
+                    snprintf(reply, sizeof(reply), "OK: Multiplayer Triggered (cmd: %s)\n", buf);
+                }
+
                 write(client_fd, reply, strlen(reply));
             }
             close(client_fd);
@@ -596,7 +617,7 @@ void* thread(void*) {
     pthread_t sock_t;
     pthread_create(&sock_t, nullptr, socket_server_thread, nullptr);
 
-    LOGI("C-RAM v4.0 Hooks Installed: Lead ESP + IAPShop Diamond Hook + ADB Listener Ready!");
+    LOGI("C-RAM v4.1 Hooks Installed: Lead ESP + IAPShop Diamond Hook + Multi-command TCP Server Ready!");
     pthread_exit(nullptr);
 }
 
