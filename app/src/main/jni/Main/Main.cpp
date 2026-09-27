@@ -575,7 +575,7 @@ void hook_GeneralHUD_LateUpdate(void* self) {
     void* aws = *(void**)((uintptr_t)seat + OFFSET_SEAT_AWS);
     if (!IsValidPtr(aws)) return;
 
-    monoArray<void*>* selectable = *(monoArray<void*>**)((uintptr_t)aws + OFFSET_AWS_SELECTABLE);
+    monoArray<void**>* selectable = *(monoArray<void**>**)((uintptr_t)aws + OFFSET_AWS_SELECTABLE);
     if (!IsValidPtr(selectable) || selectable->getLength() <= 0) return;
 
     void* activeTurret = selectable->getPointer()[0];
@@ -597,7 +597,7 @@ void hook_GeneralHUD_LateUpdate(void* self) {
 
     bool noGravity = *(bool*)((uintptr_t)activeTurret + OFFSET_TURRET_NOGRAVITY);
 
-    monoArray<void*>* allEnemies = *(monoArray<void*>**)((uintptr_t)self + OFFSET_HUD_ALLENEMIES);
+    monoArray<void**>* allEnemies = *(monoArray<void**>**)((uintptr_t)self + OFFSET_HUD_ALLENEMIES);
     if (!IsValidPtr(allEnemies)) return;
 
     int enemyCount = allEnemies->getLength();
