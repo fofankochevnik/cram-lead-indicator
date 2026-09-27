@@ -1,5 +1,5 @@
 //
-// C-RAM Air Target Lead Indicator & Universal Unit Spawner (v4.2 - TCP Command Server)
+// C-RAM Air Target Lead Indicator & Universal Unit Spawner (v4.3 - Full Controls & ESP Fix)
 //
 
 #include <pthread.h>
@@ -137,8 +137,17 @@ static void* g_SpawnManagerInstance = nullptr;
 static std::atomic<bool> g_OpenMultiplayerRequested(false);
 static uint64_t g_LastTriggerTime = 0;
 
+struct SpawnRequest {
+    std::string rawName;
+    bool hasCustomPos;
+    float customX, customY, customZ;
+    float dist; // forward distance (default: -1 = auto)
+    float alt;  // altitude (default: -1 = auto)
+    bool setupAI; // default: true
+};
+
 static std::mutex g_SpawnMutex;
-static std::vector<std::string> g_PendingSpawnQueue;
+static std::vector<SpawnRequest> g_PendingSpawnQueue;
 static std::atomic<bool> g_SpawnRequested(false);
 
 struct ScreenLeadTarget {
@@ -167,6 +176,10 @@ static inline uint64_t getNowMs() {
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+static inline bool StartsWith(const std::string& str, const std::string& prefix) {
+    return str.size() >= prefix.size() && str.compare(0, prefix.size(), prefix) == 0;
+}
+
 // -----------------------------------------------------------------------------
 // Unit Name Alias Resolver
 // -----------------------------------------------------------------------------
@@ -192,6 +205,9 @@ std::string ResolveUnitAlias(const std::string& input) {
     if (s == "patriot" || s == "pac3" || s == "pac-3") return "Patriot";
     if (s == "shilka") return "Shilka_new";
     if (s == "vads" || s == "m163") return "M163 VADS";
+    if (s == "pgz04" || s == "pgz-04") return "PGZ-04";
+    if (s == "type625") return "Type625_new";
+    if (s == "type87") return "Type87_new";
 
     // Fighters & Attack Jets
     if (s == "a10" || s == "a-10" || s == "warthog") return "new A-10 1";
@@ -209,6 +225,7 @@ std::string ResolveUnitAlias(const std::string& input) {
     if (s == "j8" || s == "j-8") return "J-8";
     if (s == "j10" || s == "j-10" || s == "j10ce") return "J-10CE";
     if (s == "j20" || s == "j-20") return "J-20 Chengdu 2";
+    if (s == "mirage" || s == "mirage2000") return "Mirage-2000 2";
 
     // Helicopters
     if (s == "ka52" || s == "ka-52" || s == "alligator") return "Ka-52";
@@ -223,6 +240,12 @@ std::string ResolveUnitAlias(const std::string& input) {
     if (s == "t72" || s == "t-72") return "T-72";
     if (s == "t72heli") return "T-72 Heli";
     if (s == "tonk") return "TONK";
+    if (s == "ztq15" || s == "ztq-15") return "ZTQ-15";
+    if (s == "type99") return "Type 99";
+    if (s == "apc") return "APC_new";
+    if (s == "kamaz") return "KAMAZ_new";
+    if (s == "humvee") return "Humvee_new 2";
+    if (s == "toyota" || s == "pickup") return "ToyotaPickup_new";
 
     // Naval & CIWS
     if (s == "destroyer") return "Destroyer";
@@ -230,11 +253,16 @@ std::string ResolveUnitAlias(const std::string& input) {
     if (s == "kashtan") return "Kashtan";
     if (s == "searam" || s == "sea-ram") return "SEA-RAM";
     if (s == "phalanx") return "PhalanxHD";
+    if (s == "goalkeeper") return "Goalkeeper";
+    if (s == "ak630") return "AK630M-2-Duet";
+    if (s == "flak38") return "Flak38_20mm";
+    if (s == "zu23") return "Zu-23-2-landed";
     if (s == "soldier" || s == "infantry") return "Soldier2";
 
     return input; // return as-is
 }
 
+// Check if unit is an airborne target
 bool IsAirUnit(const std::string& name) {
     if (name.find("Spirit") != std::string::npos ||
         name.find("Shahed-136") != std::string::npos ||
@@ -242,13 +270,29 @@ bool IsAirUnit(const std::string& name) {
         name.find("A-10") != std::string::npos ||
         name.find("Su-") != std::string::npos ||
         name.find("Mig-") != std::string::npos ||
-        name.find("F-") != std::string::npos ||
-        name.find("J-") != std::string::npos ||
         name.find("Ka-") != std::string::npos ||
         name.find("Mi-") != std::string::npos ||
         name.find("AH-") != std::string::npos ||
         name.find("drone") != std::string::npos ||
-        name.find("Mirage") != std::string::npos) {
+        name.find("Drone") != std::string::npos ||
+        name.find("Mirage") != std::string::npos ||
+        StartsWith(name, "F-") ||
+        StartsWith(name, "J-")) {
+        return true;
+    }
+    return false;
+}
+
+// Check if unit is a stationary turret/launcher
+bool IsTurretOrStationary(const std::string& name) {
+    if (name == "ShahedLauncher" ||
+        name == "PhalanxHD" ||
+        name == "Kashtan" ||
+        name == "SEA-RAM" ||
+        name == "Goalkeeper" ||
+        name == "AK630M-2-Duet" ||
+        name == "Flak38_20mm" ||
+        name.find("Zu-23-2") != std::string::npos) {
         return true;
     }
     return false;
@@ -257,28 +301,38 @@ bool IsAirUnit(const std::string& name) {
 // -----------------------------------------------------------------------------
 // Universal Spawn Execution on Unity Main Thread
 // -----------------------------------------------------------------------------
-void ExecuteSpawn(const std::string& rawName) {
+void ExecuteSpawn(const SpawnRequest& req) {
     if (!il2cpp_string_new_fn || !GameAssetCatalog_GetUnitPrefab) {
         LOGE("[C-RAM-MOD] Spawn failed: il2cpp_string_new or GameAssetCatalog_GetUnitPrefab is null!");
         return;
     }
 
-    std::string canonical = ResolveUnitAlias(rawName);
-    LOGI("[C-RAM-MOD] Attempting to spawn unit: '%s' (raw: '%s')", canonical.c_str(), rawName.c_str());
+    std::string canonical = ResolveUnitAlias(req.rawName);
+    LOGI("[C-RAM-MOD] Attempting to spawn: '%s' (raw: '%s', AI: %d, dist: %.0f, alt: %.0f)",
+         canonical.c_str(), req.rawName.c_str(), (int)req.setupAI, req.dist, req.alt);
 
     void* strObj = il2cpp_string_new_fn(canonical.c_str());
     void* prefab = GameAssetCatalog_GetUnitPrefab(strObj, nullptr);
-    if (!prefab && canonical != rawName) {
-        strObj = il2cpp_string_new_fn(rawName.c_str());
+    if (!prefab && canonical != req.rawName) {
+        strObj = il2cpp_string_new_fn(req.rawName.c_str());
         prefab = GameAssetCatalog_GetUnitPrefab(strObj, nullptr);
     }
 
-    if (!prefab) {
+    // Strict pointer validation: never crash on invalid/unloaded prefabs
+    if (!prefab || !IsValidPtr(prefab)) {
         LOGE("[C-RAM-MOD] Prefab not found for '%s'!", canonical.c_str());
         return;
     }
 
-    // Determine spawn position & orientation
+    bool isAir = IsAirUnit(canonical);
+    bool isTurret = IsTurretOrStationary(canonical);
+
+    float defaultDist = isAir ? 400.0f : 120.0f;
+    float defaultAlt = isAir ? 80.0f : 0.0f;
+
+    float spawnDist = (req.dist >= 0.0f) ? req.dist : defaultDist;
+    float spawnAlt = (req.alt >= 0.0f) ? req.alt : defaultAlt;
+
     Vector3 spawnPos(0, 0, 100);
     Quaternion spawnRot = Quaternion::Identity();
 
@@ -287,37 +341,71 @@ void ExecuteSpawn(const std::string& rawName) {
         void* camTr = Component_get_transform(cam);
         if (IsValidPtr(camTr)) {
             Vector3 cPos = Transform_get_position(camTr);
-            bool isAir = IsAirUnit(canonical);
-            if (isAir) {
-                spawnPos = Vector3(cPos.X, cPos.Y + 60.0f, cPos.Z + 200.0f);
+            if (req.hasCustomPos) {
+                spawnPos = Vector3(req.customX, req.customY, req.customZ);
+            } else if (isAir) {
+                spawnPos = Vector3(cPos.X, cPos.Y + spawnAlt, cPos.Z + spawnDist);
             } else {
-                spawnPos = Vector3(cPos.X, 0.0f, cPos.Z + 100.0f);
+                spawnPos = Vector3(cPos.X, 0.0f, cPos.Z + spawnDist);
             }
         }
     }
 
     bool spawned = false;
-    if (g_SpawnManagerInstance) {
-        bool isAir = IsAirUnit(canonical);
-        try {
-            if (isAir && SpawnManager_SpawnAirUnit) {
-                LOGI("[C-RAM-MOD] Spawning via SpawnManager::SpawnAirUnit...");
-                SpawnManager_SpawnAirUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, 350.0f, 7.0f, nullptr);
-                spawned = true;
-            } else if (!isAir && SpawnManager_SpawnGroundUnit) {
-                LOGI("[C-RAM-MOD] Spawning via SpawnManager::SpawnGroundUnit...");
-                SpawnManager_SpawnGroundUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, nullptr);
-                spawned = true;
-            } else if (SpawnManager_SpawnUnit) {
-                LOGI("[C-RAM-MOD] Spawning via SpawnManager::SpawnUnit...");
-                SpawnManager_SpawnUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, true, nullptr);
-                spawned = true;
+
+    // 1. Static Turrets / Launchers (ShahedLauncher, Phalanx, Kashtan) -> Spawn via Object.Instantiate
+    if (isTurret) {
+        if (Object_Instantiate) {
+            LOGI("[C-RAM-MOD] Spawning stationary launcher/turret via Object.Instantiate...");
+            void* obj = Object_Instantiate(prefab, nullptr);
+            if (obj && Component_get_transform && Transform_set_position) {
+                void* tr = Component_get_transform(obj);
+                if (tr) {
+                    Transform_set_position(tr, spawnPos, nullptr);
+                }
             }
-        } catch (...) {
-            LOGE("[C-RAM-MOD] Exception inside SpawnManager call, falling back to Object.Instantiate");
+            spawned = true;
+        }
+    }
+    // 2. Air Units (Su-57, B-2, Shahed, AC-130, FPV, etc.)
+    else if (isAir) {
+        if (g_SpawnManagerInstance) {
+            try {
+                if (req.setupAI && SpawnManager_SpawnAirUnit) {
+                    LOGI("[C-RAM-MOD] Spawning air unit with AI via SpawnManager::SpawnAirUnit...");
+                    float roadH = (spawnAlt > 10.0f) ? spawnAlt : 350.0f;
+                    SpawnManager_SpawnAirUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, roadH, 7.0f, nullptr);
+                    spawned = true;
+                } else if (!req.setupAI && SpawnManager_SpawnUnit) {
+                    LOGI("[C-RAM-MOD] Spawning air unit without AI (Dummy Target)...");
+                    SpawnManager_SpawnUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, false, nullptr);
+                    spawned = true;
+                }
+            } catch (...) {
+                LOGE("[C-RAM-MOD] Exception inside SpawnManager air call");
+            }
+        }
+    }
+    // 3. Ground Vehicles (DF-21D, Tor, Tunguska, Pantsir, Abrams, T-90, etc.)
+    else {
+        if (g_SpawnManagerInstance) {
+            try {
+                if (req.setupAI && SpawnManager_SpawnGroundUnit) {
+                    LOGI("[C-RAM-MOD] Spawning ground unit via SpawnManager::SpawnGroundUnit...");
+                    SpawnManager_SpawnGroundUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, nullptr);
+                    spawned = true;
+                } else if (SpawnManager_SpawnUnit) {
+                    LOGI("[C-RAM-MOD] Spawning ground unit via SpawnManager::SpawnUnit (setupAI=%d)...", (int)req.setupAI);
+                    SpawnManager_SpawnUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, req.setupAI, nullptr);
+                    spawned = true;
+                }
+            } catch (...) {
+                LOGE("[C-RAM-MOD] Exception inside SpawnManager ground call");
+            }
         }
     }
 
+    // Generic fallback if not handled
     if (!spawned && Object_Instantiate) {
         LOGI("[C-RAM-MOD] Spawning via Object.Instantiate fallback...");
         void* obj = Object_Instantiate(prefab, nullptr);
@@ -367,128 +455,171 @@ void hook_IconsPanel_ShowStore(void* self) {
 }
 
 // -----------------------------------------------------------------------------
-// Unity Main Thread Execution Loop (EventSystem.Update)
+// Hook on EventSystem.Update (Unity Main Thread Handler)
 // -----------------------------------------------------------------------------
 void hook_EventSystem_Update(void* self) {
     if (orig_EventSystem_Update) {
         orig_EventSystem_Update(self);
     }
 
-    // 1. Process pending unit spawn requests
-    if (g_SpawnRequested.load()) {
-        std::vector<std::string> toSpawn;
-        {
-            std::lock_guard<std::mutex> lock(g_SpawnMutex);
-            toSpawn = g_PendingSpawnQueue;
-            g_PendingSpawnQueue.clear();
-            g_SpawnRequested.store(false);
-        }
-
-        for (const auto& name : toSpawn) {
-            ExecuteSpawn(name);
-        }
-    }
-
-    // 2. Process multiplayer launch request
+    // 1. Multiplayer Launch Trigger
     if (g_OpenMultiplayerRequested.load()) {
         g_OpenMultiplayerRequested.store(false);
         LOGI("[C-RAM-MOD] Launching Hidden Multiplayer on Unity Main Thread!");
-        try {
-            if (MpBootstrap) {
-                MpBootstrap();
-            }
-            if (MpEntry_OnClicked) {
-                MpEntry_OnClicked(nullptr);
-                LOGI("[C-RAM-MOD] Multiplayer Screen Launched Successfully!");
-            }
-        } catch (...) {
-            LOGE("[C-RAM-MOD] Exception during Multiplayer launch!");
+
+        if (MpBootstrap) {
+            MpBootstrap();
+        }
+
+        if (MpEntry_OnClicked) {
+            MpEntry_OnClicked(self);
+        }
+
+        LOGI("[C-RAM-MOD] Multiplayer Screen Launched Successfully!");
+    }
+
+    // 2. Unit Spawning Trigger
+    if (g_SpawnRequested.load()) {
+        g_SpawnRequested.store(false);
+
+        std::vector<SpawnRequest> toSpawn;
+        {
+            std::lock_guard<std::mutex> lock(g_SpawnMutex);
+            toSpawn.swap(g_PendingSpawnQueue);
+        }
+
+        for (const auto& req : toSpawn) {
+            ExecuteSpawn(req);
         }
     }
 }
 
 // -----------------------------------------------------------------------------
-// TCP Socket Command Listener for ADB / LAN Control (Port 8888)
+// TCP Command Server (Runs on background thread, listening on 0.0.0.0:8888)
 // -----------------------------------------------------------------------------
 void* socket_server_thread(void*) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
-        LOGE("[C-RAM-MOD] Failed to create command socket!");
+        LOGE("[C-RAM-MOD] Failed to create socket");
         return nullptr;
     }
 
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    struct sockaddr_in address;
+    sockaddr_in address;
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_addr.s_addr = INADDR_ANY; // 0.0.0.0 (Accessible via ADB and Wi-Fi)
     address.sin_port = htons(8888);
 
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        LOGE("[C-RAM-MOD] Socket bind to port 8888 failed!");
+        LOGE("[C-RAM-MOD] Failed to bind to port 8888");
         close(server_fd);
         return nullptr;
     }
 
-    if (listen(server_fd, 8) < 0) {
-        LOGE("[C-RAM-MOD] Socket listen failed!");
+    if (listen(server_fd, 5) < 0) {
+        LOGE("[C-RAM-MOD] Failed to listen on socket");
         close(server_fd);
         return nullptr;
     }
 
     LOGI("[C-RAM-MOD] TCP Command Server ready on 0.0.0.0:8888 (use: adb forward tcp:8888 tcp:8888)");
 
+    char buf[512];
     while (true) {
-        struct sockaddr_in client_addr;
+        sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
         if (client_fd >= 0) {
-            char buf[512] = {0};
-            ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
+            memset(buf, 0, sizeof(buf));
+            int n = read(client_fd, buf, sizeof(buf) - 1);
             if (n > 0) {
+                // Trim trailing whitespaces / newlines
                 while (n > 0 && (buf[n - 1] == '\r' || buf[n - 1] == '\n' || buf[n - 1] == ' ')) {
                     buf[--n] = '\0';
                 }
+
                 LOGI("[C-RAM-MOD] TCP Command received: '%s'", buf);
 
-                char reply[1024] = {0};
+                char reply[512];
                 if (strcasecmp(buf, "ping") == 0) {
-                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v4.2 Online\n");
+                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v4.3 Online\n");
                 } else if (strcasecmp(buf, "help") == 0) {
                     snprintf(reply, sizeof(reply),
-                        "COMMANDS:\n"
-                        "  spawn <name>  - Spawn any unit (e.g. spawn DF-21D, spawn B-2, spawn Tor)\n"
-                        "  list          - Show popular spawnable unit names\n"
-                        "  status        - Show il2cpp & active target status\n"
-                        "  ping          - Connection check\n");
-                } else if (strcasecmp(buf, "list") == 0 || strcasecmp(buf, "spawn list") == 0) {
+                             "Commands:\n"
+                             "  ping\n"
+                             "  spawn <unit> [noai] [dist <meters>] [alt <meters>]\n"
+                             "  list\n"
+                             "  mp\n");
+                } else if (strcasecmp(buf, "list") == 0) {
                     snprintf(reply, sizeof(reply),
-                        "SPAWNABLE UNITS:\n"
-                        "  Ballistic: DF-21D, ShahedLauncher\n"
-                        "  Bombers:   B-2 (Spirit), Shahed-136, AC-130\n"
-                        "  AirDef:    Tor (9K332), Pantsir, Tunguska (2K22), Buk (Buk-M1), Patriot\n"
-                        "  Jets:      Su-57, Su-25, Su-27, Su-30, Mig-29, A-10, F-14, F-15, F-16, F-18, F-35, J-8, J-20\n"
-                        "  Helis:     Ka-52, Mi-28, Mi-24, Apache, Cobra\n"
-                        "  Armor:     Abrams, T-90, T-72, TONK, Shilka, VADS\n"
-                        "  Naval:     Destroyer, Frigate, Kashtan, SEA-RAM, Phalanx\n");
-                } else if (strcasecmp(buf, "status") == 0) {
-                    int curCount = g_TargetsCount[g_ActiveBufferIdx.load()];
-                    snprintf(reply, sizeof(reply), "STATUS: Il2CppBase=%p, SpawnManager=%p, Targets=%d\n",
-                             (void*)g_Il2CppBase, g_SpawnManagerInstance, curCount);
-                } else if (strncasecmp(buf, "spawn ", 6) == 0) {
-                    const char* unitName = buf + 6;
-                    while (*unitName == ' ') unitName++;
-                    if (*unitName) {
+                             "Units Available:\n"
+                             "  Ground: df-21d, tor, tunguska, pantsir, buk, patriot, shilka, abrams, t90, t72\n"
+                             "  Air: su57, b2, shahed, ac130, su25, su27, mig29, f14, f15, f16, f18, f35, fpv\n"
+                             "  Heli: ka52, mi28, mi24, apache, cobra\n"
+                             "  Turrets: shahedlauncher, phalanx, kashtan, searam, goalkeeper\n");
+                } else if (strncasecmp(buf, "spawn", 5) == 0) {
+                    char* args = buf + 5;
+                    while (*args == ' ') args++;
+                    if (*args != '\0') {
+                        SpawnRequest req;
+                        req.hasCustomPos = false;
+                        req.dist = -1.0f;
+                        req.alt = -1.0f;
+                        req.setupAI = true;
+
+                        std::vector<std::string> tokens;
+                        char temp[256];
+                        strncpy(temp, args, sizeof(temp) - 1);
+                        temp[sizeof(temp) - 1] = '\0';
+                        char* p = strtok(temp, " \t\r\n");
+                        while (p) {
+                            tokens.push_back(p);
+                            p = strtok(nullptr, " \t\r\n");
+                        }
+
+                        std::string unitStr = "";
+                        for (size_t ti = 0; ti < tokens.size(); ti++) {
+                            std::string t = tokens[ti];
+                            std::string tlower = t;
+                            for (char& c : tlower) c = tolower((unsigned char)c);
+
+                            if (tlower == "noai" || tlower == "--noai") {
+                                req.setupAI = false;
+                            } else if ((tlower == "dist" || tlower == "--dist" || tlower == "-d") && ti + 1 < tokens.size()) {
+                                req.dist = (float)atof(tokens[++ti].c_str());
+                            } else if ((tlower == "alt" || tlower == "--alt" || tlower == "-a") && ti + 1 < tokens.size()) {
+                                req.alt = (float)atof(tokens[++ti].c_str());
+                            } else if (ti + 2 < tokens.size() &&
+                                       (isdigit(t[0]) || t[0] == '-') &&
+                                       (isdigit(tokens[ti+1][0]) || tokens[ti+1][0] == '-') &&
+                                       (isdigit(tokens[ti+2][0]) || tokens[ti+2][0] == '-')) {
+                                req.hasCustomPos = true;
+                                req.customX = (float)atof(t.c_str());
+                                req.customY = (float)atof(tokens[++ti].c_str());
+                                req.customZ = (float)atof(tokens[++ti].c_str());
+                            } else {
+                                if (!unitStr.empty()) unitStr += " ";
+                                unitStr += t;
+                            }
+                        }
+
+                        if (unitStr.empty()) unitStr = "su57";
+                        req.rawName = unitStr;
+
                         {
                             std::lock_guard<std::mutex> lock(g_SpawnMutex);
-                            g_PendingSpawnQueue.push_back(std::string(unitName));
+                            g_PendingSpawnQueue.push_back(req);
+                            g_SpawnRequested.store(true);
                         }
-                        g_SpawnRequested.store(true);
-                        snprintf(reply, sizeof(reply), "OK: Spawn '%s' queued on Unity main thread\n", unitName);
+
+                        snprintf(reply, sizeof(reply), "OK: Spawn '%s' queued (AI: %s, dist: %.0f, alt: %.0f)\n",
+                                 req.rawName.c_str(), req.setupAI ? "ON" : "OFF (Dummy)",
+                                 req.dist, req.alt);
                     } else {
-                        snprintf(reply, sizeof(reply), "ERROR: Usage: spawn <UnitName>\n");
+                        snprintf(reply, sizeof(reply), "ERROR: Usage: spawn <Unit> [noai] [dist <meters>] [alt <meters>]\n");
                     }
                 } else if (strcasecmp(buf, "mp") == 0) {
                     g_OpenMultiplayerRequested.store(true);
@@ -506,9 +637,9 @@ void* socket_server_thread(void*) {
 }
 
 // -----------------------------------------------------------------------------
-// Lead Math Engine
+// Lead Math Solver (Exact Quadratic Ballistic Solver)
 // -----------------------------------------------------------------------------
-bool CalculateLead(
+static bool CalculateLead(
     const Vector3& targetPos,
     const Vector3& targetVel,
     const Vector3& gunPos,
@@ -518,36 +649,47 @@ bool CalculateLead(
     float& outFlightTime,
     float& outDistance
 ) {
-    Vector3 r = targetPos - gunPos;
-    Vector3 v = targetVel;
-    float dist = sqrt(r.X * r.X + r.Y * r.Y + r.Z * r.Z);
-    outDistance = dist;
-
-    if (dist < 1.0f || bulletSpeed <= 10.0f) {
+    Vector3 rel = targetPos - gunPos;
+    outDistance = Vector3::Magnitude(rel);
+    if (outDistance < 2.0f || outDistance > 7000.0f || bulletSpeed <= 10.0f) {
         return false;
     }
 
-    float t = dist / bulletSpeed;
-    for (int iter = 0; iter < 4; iter++) {
-        Vector3 predicted = targetPos + v * t;
-        if (!noGravity) {
-            predicted.Y += 0.5f * 9.81f * t * t;
+    float vSqr = Vector3::Dot(targetVel, targetVel);
+    float bSqr = bulletSpeed * bulletSpeed;
+    float a = vSqr - bSqr;
+    float b = 2.0f * Vector3::Dot(rel, targetVel);
+    float c = Vector3::Dot(rel, rel);
+
+    float t = -1.0f;
+    float D = b * b - 4.0f * a * c;
+
+    if (D >= 0.0f) {
+        float sqrtD = sqrtf(D);
+        float t1 = (-b - sqrtD) / (2.0f * a);
+        float t2 = (-b + sqrtD) / (2.0f * a);
+
+        if (t1 > 0.001f && t2 > 0.001f) {
+            t = fminf(t1, t2);
+        } else if (t1 > 0.001f) {
+            t = t1;
+        } else if (t2 > 0.001f) {
+            t = t2;
         }
-        Vector3 diff = predicted - gunPos;
-        float d = sqrt(diff.X * diff.X + diff.Y * diff.Y + diff.Z * diff.Z);
-        float nextT = d / bulletSpeed;
-        if (fabs(nextT - t) < 0.001f) {
-            t = nextT;
-            break;
-        }
-        t = nextT;
+    }
+
+    if (t <= 0.0f) {
+        t = outDistance / bulletSpeed;
     }
 
     outFlightTime = t;
-    outLeadPos = targetPos + v * t;
+    outLeadPos = targetPos + targetVel * t;
+
+    // Ballistic drop compensation (game gravity = 9.0)
     if (!noGravity) {
-        outLeadPos.Y += 0.5f * 9.81f * t * t;
+        outLeadPos.Y += 0.5f * 9.0f * t * t;
     }
+
     return true;
 }
 
@@ -569,46 +711,70 @@ void hook_GeneralHUD_LateUpdate(void* self) {
     }
     if (!IsValidPtr(cam)) return;
 
-    void* seat = *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT);
-    if (!IsValidPtr(seat)) return;
-
-    void* aws = *(void**)((uintptr_t)seat + OFFSET_SEAT_AWS);
-    if (!IsValidPtr(aws)) return;
-
-    monoArray<void**>* selectable = *(monoArray<void**>**)((uintptr_t)aws + OFFSET_AWS_SELECTABLE);
-    if (!IsValidPtr(selectable) || selectable->getLength() <= 0) return;
-
-    void* activeTurret = selectable->getPointer()[0];
-    if (!IsValidPtr(activeTurret)) return;
-
-    void* muzzle = *(void**)((uintptr_t)activeTurret + OFFSET_TURRET_MUZZLE);
-    if (!IsValidPtr(muzzle)) return;
-
-    void* muzzleTransform = Component_get_transform ? Component_get_transform(muzzle) : nullptr;
-    if (!IsValidPtr(muzzleTransform) || !Transform_get_position) return;
-    Vector3 gunPos = Transform_get_position(muzzleTransform);
-
-    void* ammoConfig = *(void**)((uintptr_t)activeTurret + OFFSET_TURRET_AMMOCONFIG);
+    Vector3 gunPos(0, 0, 0);
     float bulletSpeed = 1050.0f;
-    if (IsValidPtr(ammoConfig)) {
-        float spd = *(float*)((uintptr_t)ammoConfig + OFFSET_AMMO_SPEED);
-        if (spd > 50.0f) bulletSpeed = spd;
+    bool noGravity = false;
+    bool foundTurret = false;
+
+    void* seat = *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT);
+    if (IsValidPtr(seat)) {
+        void* aws = *(void**)((uintptr_t)seat + OFFSET_SEAT_AWS);
+        if (IsValidPtr(aws)) {
+            void* activeTurret = nullptr;
+
+            auto selectable = *(monoList<void*>**)((uintptr_t)aws + OFFSET_AWS_SELECTABLE);
+            if (IsValidPtr(selectable) && IsValidPtr(selectable->items) && selectable->getSize() > 0) {
+                activeTurret = ((void**)selectable->items->vector)[0];
+            }
+
+            if (!IsValidPtr(activeTurret)) {
+                auto alwaysReady = *(monoList<void*>**)((uintptr_t)aws + OFFSET_AWS_ALWAYSREADY);
+                if (IsValidPtr(alwaysReady) && IsValidPtr(alwaysReady->items) && alwaysReady->getSize() > 0) {
+                    activeTurret = ((void**)alwaysReady->items->vector)[0];
+                }
+            }
+
+            if (IsValidPtr(activeTurret)) {
+                foundTurret = true;
+                void* muzzle = *(void**)((uintptr_t)activeTurret + OFFSET_TURRET_MUZZLE);
+                if (IsValidPtr(muzzle) && Component_get_transform && Transform_get_position) {
+                    void* muzzleTr = Component_get_transform(muzzle);
+                    if (IsValidPtr(muzzleTr)) {
+                        gunPos = Transform_get_position(muzzleTr);
+                    }
+                }
+
+                void* ammoConfig = *(void**)((uintptr_t)activeTurret + OFFSET_TURRET_AMMOCONFIG);
+                if (IsValidPtr(ammoConfig)) {
+                    float spd = *(float*)((uintptr_t)ammoConfig + OFFSET_AMMO_SPEED);
+                    if (spd > 50.0f) bulletSpeed = spd;
+                }
+
+                noGravity = *(bool*)((uintptr_t)activeTurret + OFFSET_TURRET_NOGRAVITY);
+            }
+        }
     }
 
-    bool noGravity = *(bool*)((uintptr_t)activeTurret + OFFSET_TURRET_NOGRAVITY);
+    if (!foundTurret && Component_get_transform && Transform_get_position) {
+        void* camTr = Component_get_transform(cam);
+        if (IsValidPtr(camTr)) {
+            gunPos = Transform_get_position(camTr);
+        }
+    }
 
-    monoArray<void**>* allEnemies = *(monoArray<void**>**)((uintptr_t)self + OFFSET_HUD_ALLENEMIES);
-    if (!IsValidPtr(allEnemies)) return;
+    auto enemyList = *(monoList<void*>**)((uintptr_t)self + OFFSET_HUD_ALLENEMIES);
+    if (!IsValidPtr(enemyList) || !IsValidPtr(enemyList->items)) return;
 
-    int enemyCount = allEnemies->getLength();
+    int enemyCount = enemyList->getSize();
     if (enemyCount <= 0 || enemyCount > 256) return;
 
     int writeIdx = 1 - g_ActiveBufferIdx.load();
     int count = 0;
-    float screenHeight = (float)ImGui::GetIO().DisplaySize.y;
+    float screenHeight = (glHeight > 0) ? (float)glHeight : (float)ImGui::GetIO().DisplaySize.y;
+    if (screenHeight <= 0.0f) screenHeight = 1080.0f;
 
     for (int i = 0; i < enemyCount && count < MAX_TARGETS; i++) {
-        void* target = allEnemies->getPointer()[i];
+        void* target = ((void**)enemyList->items->vector)[i];
         if (!IsValidPtr(target)) continue;
 
         bool isAlive = *(bool*)((uintptr_t)target + OFFSET_UNIT_ISALIVE);
@@ -770,7 +936,7 @@ static uintptr_t getIl2CppBaseAddress() {
 // Hook Initialization Thread
 // -----------------------------------------------------------------------------
 void* thread(void*) {
-    LOGI("C-RAM Mod Thread Started (v4.2 - Universal Spawner + TCP Control)");
+    LOGI("C-RAM Mod Thread Started (v4.3 - Full Controls & ESP Fix)");
 
     initModMenu((void*)DrawMenu);
 
@@ -837,7 +1003,7 @@ void* thread(void*) {
     pthread_t sock_t;
     pthread_create(&sock_t, nullptr, socket_server_thread, nullptr);
 
-    LOGI("C-RAM v4.2 Hooks Installed: Lead ESP + Universal Unit Spawner + TCP Server Ready!");
+    LOGI("C-RAM v4.3 Hooks Installed: Lead ESP + Universal Spawner (AI & Coord Controls) + TCP Server Ready!");
     pthread_exit(nullptr);
 }
 
