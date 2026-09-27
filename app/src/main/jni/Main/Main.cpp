@@ -1,5 +1,5 @@
 //
-// C-RAM Air Target Lead Indicator & Multiplayer Launcher (v4.1 - Multi-command TCP Server + Diamond Hook)
+// C-RAM Air Target Lead Indicator & Universal Unit Spawner (v4.2 - TCP Command Server)
 //
 
 #include <pthread.h>
@@ -8,7 +8,10 @@
 #include <cstdio>
 #include <cstring>
 #include <strings.h>
+#include <cctype>
 #include <vector>
+#include <string>
+#include <mutex>
 #include <atomic>
 #include <ctime>
 #include <link.h>
@@ -22,6 +25,8 @@
 #include "../Include/Drawing.h"
 #include "../Include/Unity.h"
 #include "../Include/Math/Vector2.hpp"
+#include "../Include/Math/Vector3.hpp"
+#include "../Include/Math/Quaternion.hpp"
 #include "../Include/Logger.h"
 
 // -----------------------------------------------------------------------------
@@ -31,6 +36,7 @@
 #define RVA_CAMERA_W2S           0x82D72A4
 #define RVA_COMP_TRANSFORM       0x834A0F4
 #define RVA_TRANS_POS            0x83601AC // UnityEngine.Transform.get_position
+#define RVA_TRANS_SETPOS         0x8360280 // UnityEngine.Transform.set_position
 #define RVA_UNIT_TYPE            0x3F54748
 #define RVA_PHYS_VEL             0x3EACAA4
 #define RVA_HUD_LATEUPDATE       0x3F16414 // GeneralHUD.LateUpdate
@@ -43,6 +49,14 @@
 // Button / Shop Hooks
 #define RVA_IAP_SHOP_ONENABLE    0x3DBD734 // IAPShopButton.OnEnable (Diamond icon in hangar)
 #define RVA_ICONS_SHOWSTORE      0x4267774 // CBS.UI.IconsPanel.ShowStore (Backup)
+
+// Unit Spawning & Catalog
+#define RVA_ASSET_CATALOG_GET_PREFAB    0x3DA6210 // GameAssetCatalog.GetUnitPrefab(string idOrName)
+#define RVA_SPAWN_MANAGER_AWAKE         0x3EC39F4 // SpawnManager.Awake
+#define RVA_SPAWN_MANAGER_SPAWN_UNIT    0x3EC7308 // SpawnManager.SpawnUnit
+#define RVA_SPAWN_MANAGER_SPAWN_AIR     0x3EC78DC // SpawnManager.SpawnAirUnit
+#define RVA_SPAWN_MANAGER_SPAWN_GROUND  0x3EC7CBC // SpawnManager.SpawnGroundUnit
+#define RVA_OBJECT_INSTANTIATE          0x8355558 // UnityEngine.Object.Instantiate(Object original)
 
 // -----------------------------------------------------------------------------
 // Field Offsets from dump.cs & il2cpp.h
@@ -71,6 +85,7 @@ typedef Vector3 (*t_Camera_WorldToScreenPoint)(void* camera, Vector3 position);
 typedef void* (*t_Camera_get_main)();
 typedef void* (*t_Component_get_transform)(void* component);
 typedef Vector3 (*t_Transform_get_position)(void* transform);
+typedef void (*t_Transform_set_position)(void* transform, Vector3 position, void* method);
 typedef int (*t_IUnit_GetUnitType)(void* unit);
 typedef Vector3 (*t_PhysicsObject_get_Velocity)(void* physicsObject);
 typedef void (*t_GeneralHUD_LateUpdate)(void* self);
@@ -81,10 +96,20 @@ typedef void (*t_MpEntry_OnClicked)(void* self);
 typedef void (*t_IAPShopButton_OnEnable)(void* self);
 typedef void (*t_IconsPanel_ShowStore)(void* self);
 
+// Spawning function pointers
+typedef void* (*t_il2cpp_string_new)(const char* str);
+typedef void* (*t_GameAssetCatalog_GetUnitPrefab)(void* idOrName, void* method);
+typedef void (*t_SpawnManager_Awake)(void* self);
+typedef void* (*t_SpawnManager_SpawnUnit)(void* self, void* prefab, Vector3 pos, Quaternion rot, void* parent, bool setupAI, void* method);
+typedef void* (*t_SpawnManager_SpawnAirUnit)(void* self, void* prefab, Vector3 pos, Quaternion rot, void* parent, float wayRoadHeight, float wayRoadScale, void* method);
+typedef void* (*t_SpawnManager_SpawnGroundUnit)(void* self, void* prefab, Vector3 pos, Quaternion rot, void* parent, void* method);
+typedef void* (*t_Object_Instantiate)(void* original, void* method);
+
 static t_Camera_WorldToScreenPoint Camera_WorldToScreenPoint = nullptr;
 static t_Camera_get_main Camera_get_main = nullptr;
 static t_Component_get_transform Component_get_transform = nullptr;
 static t_Transform_get_position Transform_get_position = nullptr;
+static t_Transform_set_position Transform_set_position = nullptr;
 static t_IUnit_GetUnitType IUnit_GetUnitType = nullptr;
 static t_PhysicsObject_get_Velocity PhysicsObject_get_Velocity = nullptr;
 static t_GeneralHUD_LateUpdate orig_GeneralHUD_LateUpdate = nullptr;
@@ -95,12 +120,26 @@ static t_MpEntry_OnClicked MpEntry_OnClicked = nullptr;
 static t_IAPShopButton_OnEnable orig_IAPShopButton_OnEnable = nullptr;
 static t_IconsPanel_ShowStore orig_IconsPanel_ShowStore = nullptr;
 
+static t_il2cpp_string_new il2cpp_string_new_fn = nullptr;
+static t_GameAssetCatalog_GetUnitPrefab GameAssetCatalog_GetUnitPrefab = nullptr;
+static t_SpawnManager_Awake orig_SpawnManager_Awake = nullptr;
+static t_SpawnManager_SpawnUnit SpawnManager_SpawnUnit = nullptr;
+static t_SpawnManager_SpawnAirUnit SpawnManager_SpawnAirUnit = nullptr;
+static t_SpawnManager_SpawnGroundUnit SpawnManager_SpawnGroundUnit = nullptr;
+static t_Object_Instantiate Object_Instantiate = nullptr;
+
 // -----------------------------------------------------------------------------
 // Global State & Buffers
 // -----------------------------------------------------------------------------
 static uintptr_t g_Il2CppBase = 0;
+static void* g_SpawnManagerInstance = nullptr;
+
 static std::atomic<bool> g_OpenMultiplayerRequested(false);
 static uint64_t g_LastTriggerTime = 0;
+
+static std::mutex g_SpawnMutex;
+static std::vector<std::string> g_PendingSpawnQueue;
+static std::atomic<bool> g_SpawnRequested(false);
 
 struct ScreenLeadTarget {
     float leadX, leadY;
@@ -115,7 +154,7 @@ static ScreenLeadTarget g_TargetsBuffer[2][MAX_TARGETS];
 static int g_TargetsCount[2] = {0, 0};
 static std::atomic<int> g_ActiveBufferIdx(0);
 
-// Check if pointer looks like valid userspace memory on 64-bit Android (Scudo / PAC)
+// Check if pointer looks like valid userspace memory on 64-bit Android
 inline bool IsValidPtr(const void* ptr) {
     if (!ptr) return false;
     uintptr_t p = (uintptr_t)ptr & 0x00FFFFFFFFFFFFFFULL;
@@ -126,6 +165,184 @@ static inline uint64_t getNowMs() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// -----------------------------------------------------------------------------
+// Unit Name Alias Resolver
+// -----------------------------------------------------------------------------
+std::string ResolveUnitAlias(const std::string& input) {
+    std::string s = input;
+    for (char &c : s) c = tolower((unsigned char)c);
+
+    // Ballistic & Missile Launchers
+    if (s == "df-21d" || s == "df21d" || s == "df21" || s == "df-21") return "DF-21D";
+    if (s == "shahedlauncher" || s == "launcher") return "ShahedLauncher";
+
+    // Bombers & Drones
+    if (s == "b2" || s == "b-2" || s == "spirit" || s == "b2 spirit" || s == "b-2 spirit") return "B-2 Spirit new";
+    if (s == "shahed" || s == "shahed136" || s == "shahed-136") return "Shahed-136";
+    if (s == "fpv" || s == "drone") return "FPV drone enemy";
+    if (s == "ac130" || s == "ac-130" || s == "gunship") return "AC-130";
+
+    // Air Defense Systems (Ground)
+    if (s == "tor" || s == "tor-m1" || s == "tor-m2" || s == "9k332") return "9K332-Tor_new";
+    if (s == "tunguska" || s == "2k22") return "2K22Tunguska_new";
+    if (s == "pantsir" || s == "pantsir-s1") return "Pantsir";
+    if (s == "buk" || s == "buk-m1") return "Buk-M1";
+    if (s == "patriot" || s == "pac3" || s == "pac-3") return "Patriot";
+    if (s == "shilka") return "Shilka_new";
+    if (s == "vads" || s == "m163") return "M163 VADS";
+
+    // Fighters & Attack Jets
+    if (s == "a10" || s == "a-10" || s == "warthog") return "new A-10 1";
+    if (s == "su57" || s == "su-57" || s == "felon") return "Su-57 Felon";
+    if (s == "su25" || s == "su-25" || s == "frogfoot") return "Su-25 1";
+    if (s == "su27" || s == "su-27") return "Su-27";
+    if (s == "su30" || s == "su-30") return "Su-30MKK";
+    if (s == "mig29" || s == "mig-29") return "Mig-29 1";
+    if (s == "f14" || s == "f-14" || s == "tomcat") return "F-14 Tomcat";
+    if (s == "f15" || s == "f-15") return "F-15 1";
+    if (s == "f16" || s == "f-16") return "F-16";
+    if (s == "f18" || s == "f-18" || s == "hornet" || s == "f18f") return "F-18F Super Hornet";
+    if (s == "f35" || s == "f-35" || s == "f35a") return "F-35A";
+    if (s == "f4" || s == "f-4" || s == "phantom") return "F-4 Phantom 2";
+    if (s == "j8" || s == "j-8") return "J-8";
+    if (s == "j10" || s == "j-10" || s == "j10ce") return "J-10CE";
+    if (s == "j20" || s == "j-20") return "J-20 Chengdu 2";
+
+    // Helicopters
+    if (s == "ka52" || s == "ka-52" || s == "alligator") return "Ka-52";
+    if (s == "mi28" || s == "mi-28" || s == "havoc") return "Mi-28";
+    if (s == "mi24" || s == "mi-24" || s == "hind") return "Mi-24";
+    if (s == "apache" || s == "ah64" || s == "ah-64") return "AH-64 Apache";
+    if (s == "cobra" || s == "ah1" || s == "ah-1") return "AH-1 Cobra";
+
+    // Armor & Ground Vehicles
+    if (s == "abrams" || s == "m1" || s == "m1a2") return "M1Abrams_new 1";
+    if (s == "t90" || s == "t-90" || s == "t90a") return "T-90A";
+    if (s == "t72" || s == "t-72") return "T-72";
+    if (s == "t72heli") return "T-72 Heli";
+    if (s == "tonk") return "TONK";
+
+    // Naval & CIWS
+    if (s == "destroyer") return "Destroyer";
+    if (s == "frigate") return "Frigate";
+    if (s == "kashtan") return "Kashtan";
+    if (s == "searam" || s == "sea-ram") return "SEA-RAM";
+    if (s == "phalanx") return "PhalanxHD";
+    if (s == "soldier" || s == "infantry") return "Soldier2";
+
+    return input; // return as-is
+}
+
+bool IsAirUnit(const std::string& name) {
+    if (name.find("Spirit") != std::string::npos ||
+        name.find("Shahed-136") != std::string::npos ||
+        name.find("AC-130") != std::string::npos ||
+        name.find("A-10") != std::string::npos ||
+        name.find("Su-") != std::string::npos ||
+        name.find("Mig-") != std::string::npos ||
+        name.find("F-") != std::string::npos ||
+        name.find("J-") != std::string::npos ||
+        name.find("Ka-") != std::string::npos ||
+        name.find("Mi-") != std::string::npos ||
+        name.find("AH-") != std::string::npos ||
+        name.find("drone") != std::string::npos ||
+        name.find("Mirage") != std::string::npos) {
+        return true;
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// Universal Spawn Execution on Unity Main Thread
+// -----------------------------------------------------------------------------
+void ExecuteSpawn(const std::string& rawName) {
+    if (!il2cpp_string_new_fn || !GameAssetCatalog_GetUnitPrefab) {
+        LOGE("[C-RAM-MOD] Spawn failed: il2cpp_string_new or GameAssetCatalog_GetUnitPrefab is null!");
+        return;
+    }
+
+    std::string canonical = ResolveUnitAlias(rawName);
+    LOGI("[C-RAM-MOD] Attempting to spawn unit: '%s' (raw: '%s')", canonical.c_str(), rawName.c_str());
+
+    void* strObj = il2cpp_string_new_fn(canonical.c_str());
+    void* prefab = GameAssetCatalog_GetUnitPrefab(strObj, nullptr);
+    if (!prefab && canonical != rawName) {
+        strObj = il2cpp_string_new_fn(rawName.c_str());
+        prefab = GameAssetCatalog_GetUnitPrefab(strObj, nullptr);
+    }
+
+    if (!prefab) {
+        LOGE("[C-RAM-MOD] Prefab not found for '%s'!", canonical.c_str());
+        return;
+    }
+
+    // Determine spawn position & orientation
+    Vector3 spawnPos(0, 0, 100);
+    Quaternion spawnRot = Quaternion::Identity();
+
+    void* cam = Camera_get_main ? Camera_get_main() : nullptr;
+    if (cam && Component_get_transform && Transform_get_position) {
+        void* camTr = Component_get_transform(cam);
+        if (IsValidPtr(camTr)) {
+            Vector3 cPos = Transform_get_position(camTr);
+            bool isAir = IsAirUnit(canonical);
+            if (isAir) {
+                spawnPos = Vector3(cPos.X, cPos.Y + 60.0f, cPos.Z + 200.0f);
+            } else {
+                spawnPos = Vector3(cPos.X, 0.0f, cPos.Z + 100.0f);
+            }
+        }
+    }
+
+    bool spawned = false;
+    if (g_SpawnManagerInstance) {
+        bool isAir = IsAirUnit(canonical);
+        try {
+            if (isAir && SpawnManager_SpawnAirUnit) {
+                LOGI("[C-RAM-MOD] Spawning via SpawnManager::SpawnAirUnit...");
+                SpawnManager_SpawnAirUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, 350.0f, 7.0f, nullptr);
+                spawned = true;
+            } else if (!isAir && SpawnManager_SpawnGroundUnit) {
+                LOGI("[C-RAM-MOD] Spawning via SpawnManager::SpawnGroundUnit...");
+                SpawnManager_SpawnGroundUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, nullptr);
+                spawned = true;
+            } else if (SpawnManager_SpawnUnit) {
+                LOGI("[C-RAM-MOD] Spawning via SpawnManager::SpawnUnit...");
+                SpawnManager_SpawnUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, true, nullptr);
+                spawned = true;
+            }
+        } catch (...) {
+            LOGE("[C-RAM-MOD] Exception inside SpawnManager call, falling back to Object.Instantiate");
+        }
+    }
+
+    if (!spawned && Object_Instantiate) {
+        LOGI("[C-RAM-MOD] Spawning via Object.Instantiate fallback...");
+        void* obj = Object_Instantiate(prefab, nullptr);
+        if (obj && Component_get_transform && Transform_set_position) {
+            void* tr = Component_get_transform(obj);
+            if (tr) {
+                Transform_set_position(tr, spawnPos, nullptr);
+            }
+        }
+        spawned = true;
+    }
+
+    LOGI("[C-RAM-MOD] Spawned '%s' successfully! spawned=%d at (%.1f, %.1f, %.1f)",
+         canonical.c_str(), (int)spawned, spawnPos.X, spawnPos.Y, spawnPos.Z);
+}
+
+// -----------------------------------------------------------------------------
+// Hook on SpawnManager.Awake (Captures active battle spawner)
+// -----------------------------------------------------------------------------
+void hook_SpawnManager_Awake(void* self) {
+    g_SpawnManagerInstance = self;
+    LOGI("[C-RAM-MOD] SpawnManager::Awake captured! Instance: %p", self);
+    if (orig_SpawnManager_Awake) {
+        orig_SpawnManager_Awake(self);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -157,20 +374,32 @@ void hook_EventSystem_Update(void* self) {
         orig_EventSystem_Update(self);
     }
 
+    // 1. Process pending unit spawn requests
+    if (g_SpawnRequested.load()) {
+        std::vector<std::string> toSpawn;
+        {
+            std::lock_guard<std::mutex> lock(g_SpawnMutex);
+            toSpawn = g_PendingSpawnQueue;
+            g_PendingSpawnQueue.clear();
+            g_SpawnRequested.store(false);
+        }
+
+        for (const auto& name : toSpawn) {
+            ExecuteSpawn(name);
+        }
+    }
+
+    // 2. Process multiplayer launch request
     if (g_OpenMultiplayerRequested.load()) {
         g_OpenMultiplayerRequested.store(false);
         LOGI("[C-RAM-MOD] Launching Hidden Multiplayer on Unity Main Thread!");
         try {
             if (MpBootstrap) {
-                LOGI("[C-RAM-MOD] Executing MultiplayerService::Bootstrap()...");
                 MpBootstrap();
             }
             if (MpEntry_OnClicked) {
-                LOGI("[C-RAM-MOD] Executing MultiplayerEntryButton::OnClicked()...");
                 MpEntry_OnClicked(nullptr);
                 LOGI("[C-RAM-MOD] Multiplayer Screen Launched Successfully!");
-            } else {
-                LOGE("[C-RAM-MOD] MpEntry_OnClicked is null!");
             }
         } catch (...) {
             LOGE("[C-RAM-MOD] Exception during Multiplayer launch!");
@@ -194,7 +423,7 @@ void* socket_server_thread(void*) {
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_ANY); // Bind to 0.0.0.0 (Works with ADB 127.0.0.1 forward & LAN)
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
     address.sin_port = htons(8888);
 
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
@@ -216,28 +445,56 @@ void* socket_server_thread(void*) {
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
         if (client_fd >= 0) {
-            char buf[256] = {0};
+            char buf[512] = {0};
             ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
             if (n > 0) {
-                // Trim trailing newlines and spaces
                 while (n > 0 && (buf[n - 1] == '\r' || buf[n - 1] == '\n' || buf[n - 1] == ' ')) {
                     buf[--n] = '\0';
                 }
                 LOGI("[C-RAM-MOD] TCP Command received: '%s'", buf);
 
-                char reply[256] = {0};
+                char reply[1024] = {0};
                 if (strcasecmp(buf, "ping") == 0) {
-                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v4.1 Online\n");
+                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v4.2 Online\n");
                 } else if (strcasecmp(buf, "help") == 0) {
-                    snprintf(reply, sizeof(reply), "HELP: ping, mp, status\n");
+                    snprintf(reply, sizeof(reply),
+                        "COMMANDS:\n"
+                        "  spawn <name>  - Spawn any unit (e.g. spawn DF-21D, spawn B-2, spawn Tor)\n"
+                        "  list          - Show popular spawnable unit names\n"
+                        "  status        - Show il2cpp & active target status\n"
+                        "  ping          - Connection check\n");
+                } else if (strcasecmp(buf, "list") == 0 || strcasecmp(buf, "spawn list") == 0) {
+                    snprintf(reply, sizeof(reply),
+                        "SPAWNABLE UNITS:\n"
+                        "  Ballistic: DF-21D, ShahedLauncher\n"
+                        "  Bombers:   B-2 (Spirit), Shahed-136, AC-130\n"
+                        "  AirDef:    Tor (9K332), Pantsir, Tunguska (2K22), Buk (Buk-M1), Patriot\n"
+                        "  Jets:      Su-57, Su-25, Su-27, Su-30, Mig-29, A-10, F-14, F-15, F-16, F-18, F-35, J-8, J-20\n"
+                        "  Helis:     Ka-52, Mi-28, Mi-24, Apache, Cobra\n"
+                        "  Armor:     Abrams, T-90, T-72, TONK, Shilka, VADS\n"
+                        "  Naval:     Destroyer, Frigate, Kashtan, SEA-RAM, Phalanx\n");
                 } else if (strcasecmp(buf, "status") == 0) {
                     int curCount = g_TargetsCount[g_ActiveBufferIdx.load()];
-                    snprintf(reply, sizeof(reply), "STATUS: Il2CppBase=%p, Targets=%d\n",
-                             (void*)g_Il2CppBase, curCount);
-                } else {
-                    // Default / 'mp' / '1' -> trigger multiplayer
+                    snprintf(reply, sizeof(reply), "STATUS: Il2CppBase=%p, SpawnManager=%p, Targets=%d\n",
+                             (void*)g_Il2CppBase, g_SpawnManagerInstance, curCount);
+                } else if (strncasecmp(buf, "spawn ", 6) == 0) {
+                    const char* unitName = buf + 6;
+                    while (*unitName == ' ') unitName++;
+                    if (*unitName) {
+                        {
+                            std::lock_guard<std::mutex> lock(g_SpawnMutex);
+                            g_PendingSpawnQueue.push_back(std::string(unitName));
+                        }
+                        g_SpawnRequested.store(true);
+                        snprintf(reply, sizeof(reply), "OK: Spawn '%s' queued on Unity main thread\n", unitName);
+                    } else {
+                        snprintf(reply, sizeof(reply), "ERROR: Usage: spawn <UnitName>\n");
+                    }
+                } else if (strcasecmp(buf, "mp") == 0) {
                     g_OpenMultiplayerRequested.store(true);
-                    snprintf(reply, sizeof(reply), "OK: Multiplayer Triggered (cmd: %s)\n", buf);
+                    snprintf(reply, sizeof(reply), "OK: Multiplayer Triggered\n");
+                } else {
+                    snprintf(reply, sizeof(reply), "UNKNOWN COMMAND: '%s'. Type 'help' or 'list'\n", buf);
                 }
 
                 write(client_fd, reply, strlen(reply));
@@ -249,9 +506,9 @@ void* socket_server_thread(void*) {
 }
 
 // -----------------------------------------------------------------------------
-// Lead Math Solver (Exact Battle Intercept Calculation)
+// Lead Math Engine
 // -----------------------------------------------------------------------------
-static bool CalculateLead(
+bool CalculateLead(
     const Vector3& targetPos,
     const Vector3& targetVel,
     const Vector3& gunPos,
@@ -261,139 +518,97 @@ static bool CalculateLead(
     float& outFlightTime,
     float& outDistance
 ) {
-    Vector3 rel = targetPos - gunPos;
-    outDistance = Vector3::Magnitude(rel);
-    if (outDistance < 2.0f || outDistance > 7000.0f || bulletSpeed <= 10.0f) {
+    Vector3 r = targetPos - gunPos;
+    Vector3 v = targetVel;
+    float dist = sqrt(r.X * r.X + r.Y * r.Y + r.Z * r.Z);
+    outDistance = dist;
+
+    if (dist < 1.0f || bulletSpeed <= 10.0f) {
         return false;
     }
 
-    float vSqr = Vector3::Dot(targetVel, targetVel);
-    float bSqr = bulletSpeed * bulletSpeed;
-    float a = vSqr - bSqr;
-    float b = 2.0f * Vector3::Dot(rel, targetVel);
-    float c = Vector3::Dot(rel, rel);
-
-    float t = -1.0f;
-    float D = b * b - 4.0f * a * c;
-
-    if (D >= 0.0f) {
-        float sqrtD = sqrtf(D);
-        float t1 = (-b - sqrtD) / (2.0f * a);
-        float t2 = (-b + sqrtD) / (2.0f * a);
-
-        if (t1 > 0.001f && t2 > 0.001f) {
-            t = fminf(t1, t2);
-        } else if (t1 > 0.001f) {
-            t = t1;
-        } else if (t2 > 0.001f) {
-            t = t2;
+    float t = dist / bulletSpeed;
+    for (int iter = 0; iter < 4; iter++) {
+        Vector3 predicted = targetPos + v * t;
+        if (!noGravity) {
+            predicted.Y += 0.5f * 9.81f * t * t;
         }
-    }
-
-    if (t <= 0.0f) {
-        t = outDistance / bulletSpeed;
+        Vector3 diff = predicted - gunPos;
+        float d = sqrt(diff.X * diff.X + diff.Y * diff.Y + diff.Z * diff.Z);
+        float nextT = d / bulletSpeed;
+        if (fabs(nextT - t) < 0.001f) {
+            t = nextT;
+            break;
+        }
+        t = nextT;
     }
 
     outFlightTime = t;
-    outLeadPos = targetPos + targetVel * t;
-
+    outLeadPos = targetPos + v * t;
     if (!noGravity) {
-        outLeadPos.Y += 0.5f * 9.0f * t * t;
+        outLeadPos.Y += 0.5f * 9.81f * t * t;
     }
-
     return true;
 }
 
 // -----------------------------------------------------------------------------
-// GeneralHUD.LateUpdate Hook (Runs on Unity Main Thread during Battle)
+// Battle Hook (GeneralHUD.LateUpdate)
 // -----------------------------------------------------------------------------
 void hook_GeneralHUD_LateUpdate(void* self) {
     if (orig_GeneralHUD_LateUpdate) {
         orig_GeneralHUD_LateUpdate(self);
     }
 
-    if (!IsValidPtr(self)) {
+    if (!IsValidPtr(self) || !Camera_WorldToScreenPoint || !Camera_get_main) {
         return;
     }
 
-    // 1. Resolve camera
     void* cam = *(void**)((uintptr_t)self + OFFSET_HUD_MAINCAMERA);
-    if (!IsValidPtr(cam) && Camera_get_main) {
+    if (!IsValidPtr(cam)) {
         cam = Camera_get_main();
     }
-    if (!IsValidPtr(cam) || !Camera_WorldToScreenPoint) {
-        return;
+    if (!IsValidPtr(cam)) return;
+
+    void* seat = *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT);
+    if (!IsValidPtr(seat)) return;
+
+    void* aws = *(void**)((uintptr_t)seat + OFFSET_SEAT_AWS);
+    if (!IsValidPtr(aws)) return;
+
+    monoArray<void*>* selectable = *(monoArray<void*>**)((uintptr_t)aws + OFFSET_AWS_SELECTABLE);
+    if (!IsValidPtr(selectable) || selectable->getLength() <= 0) return;
+
+    void* activeTurret = selectable->getPointer()[0];
+    if (!IsValidPtr(activeTurret)) return;
+
+    void* muzzle = *(void**)((uintptr_t)activeTurret + OFFSET_TURRET_MUZZLE);
+    if (!IsValidPtr(muzzle)) return;
+
+    void* muzzleTransform = Component_get_transform ? Component_get_transform(muzzle) : nullptr;
+    if (!IsValidPtr(muzzleTransform) || !Transform_get_position) return;
+    Vector3 gunPos = Transform_get_position(muzzleTransform);
+
+    void* ammoConfig = *(void**)((uintptr_t)activeTurret + OFFSET_TURRET_AMMOCONFIG);
+    float bulletSpeed = 1050.0f;
+    if (IsValidPtr(ammoConfig)) {
+        float spd = *(float*)((uintptr_t)ammoConfig + OFFSET_AMMO_SPEED);
+        if (spd > 50.0f) bulletSpeed = spd;
     }
 
-    // 2. Resolve active turret muzzle position and bullet speed
-    Vector3 gunPos(0, 0, 0);
-    float bulletSpeed = 1000.0f;
-    bool noGravity = false;
-    bool foundTurret = false;
+    bool noGravity = *(bool*)((uintptr_t)activeTurret + OFFSET_TURRET_NOGRAVITY);
 
-    void* parentSeat = *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT);
-    if (IsValidPtr(parentSeat)) {
-        void* aws = *(void**)((uintptr_t)parentSeat + OFFSET_SEAT_AWS);
-        if (IsValidPtr(aws)) {
-            void* activeTurret = nullptr;
+    monoArray<void*>* allEnemies = *(monoArray<void*>**)((uintptr_t)self + OFFSET_HUD_ALLENEMIES);
+    if (!IsValidPtr(allEnemies)) return;
 
-            auto selectable = *(monoList<void*>**)((uintptr_t)aws + OFFSET_AWS_SELECTABLE);
-            if (IsValidPtr(selectable) && IsValidPtr(selectable->items) && selectable->getSize() > 0) {
-                activeTurret = ((void**)selectable->items->vector)[0];
-            }
-
-            if (!IsValidPtr(activeTurret)) {
-                auto alwaysReady = *(monoList<void*>**)((uintptr_t)aws + OFFSET_AWS_ALWAYSREADY);
-                if (IsValidPtr(alwaysReady) && IsValidPtr(alwaysReady->items) && alwaysReady->getSize() > 0) {
-                    activeTurret = ((void**)alwaysReady->items->vector)[0];
-                }
-            }
-
-            if (IsValidPtr(activeTurret)) {
-                foundTurret = true;
-                void* muzzle = *(void**)((uintptr_t)activeTurret + OFFSET_TURRET_MUZZLE);
-                if (IsValidPtr(muzzle) && Transform_get_position) {
-                    gunPos = Transform_get_position(muzzle);
-                }
-
-                void* ammoConfig = *(void**)((uintptr_t)activeTurret + OFFSET_TURRET_AMMOCONFIG);
-                if (IsValidPtr(ammoConfig)) {
-                    float spd = *(float*)((uintptr_t)ammoConfig + OFFSET_AMMO_SPEED);
-                    if (spd > 50.0f) {
-                        bulletSpeed = spd;
-                    }
-                }
-                noGravity = *(bool*)((uintptr_t)activeTurret + OFFSET_TURRET_NOGRAVITY);
-            }
-        }
-    }
-
-    // Fallback: camera origin
-    if (!foundTurret && Component_get_transform && Transform_get_position) {
-        void* camTr = Component_get_transform(cam);
-        if (IsValidPtr(camTr)) {
-            gunPos = Transform_get_position(camTr);
-        }
-    }
-
-    // 3. Read enemy units list
-    auto enemyList = *(monoList<void*>**)((uintptr_t)self + OFFSET_HUD_ALLENEMIES);
-    if (!IsValidPtr(enemyList) || !IsValidPtr(enemyList->items)) {
-        return;
-    }
-
-    int totalEnemies = enemyList->getSize();
-    if (totalEnemies <= 0 || totalEnemies > 250) {
-        return;
-    }
+    int enemyCount = allEnemies->getLength();
+    if (enemyCount <= 0 || enemyCount > 256) return;
 
     int writeIdx = 1 - g_ActiveBufferIdx.load();
     int count = 0;
-    float screenHeight = (glHeight > 0) ? (float)glHeight : 1080.0f;
+    float screenHeight = (float)ImGui::GetIO().DisplaySize.y;
 
-    // 4. Calculate lead points for all airborne targets (Type 3, 5, 6, 7)
-    for (int i = 0; i < totalEnemies && count < MAX_TARGETS; i++) {
-        void* target = ((void**)enemyList->items->vector)[i];
+    for (int i = 0; i < enemyCount && count < MAX_TARGETS; i++) {
+        void* target = allEnemies->getPointer()[i];
         if (!IsValidPtr(target)) continue;
 
         bool isAlive = *(bool*)((uintptr_t)target + OFFSET_UNIT_ISALIVE);
@@ -401,7 +616,6 @@ void hook_GeneralHUD_LateUpdate(void* self) {
 
         if (IUnit_GetUnitType) {
             int unitType = IUnit_GetUnitType(target);
-            // 3 = Jet, 5 = Missile, 6 = Heli/Drone, 7 = Bomber
             if (unitType != 3 && unitType != 6 && unitType != 7 && unitType != 5) {
                 continue;
             }
@@ -425,9 +639,7 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         }
 
         Vector3 leadScreen = Camera_WorldToScreenPoint(cam, leadPos);
-        if (leadScreen.Z <= 0.0f) {
-            continue;
-        }
+        if (leadScreen.Z <= 0.0f) continue;
 
         Vector3 targetScreen = Camera_WorldToScreenPoint(cam, targetPos);
 
@@ -456,8 +668,6 @@ void hook_GeneralHUD_LateUpdate(void* self) {
 // ESP Drawing Loop (Render Thread inside eglSwapBuffers)
 // -----------------------------------------------------------------------------
 void DrawMenu() {
-    // Only draw the Lead Indicator ESP overlay in battle.
-    // Absolutely NO window is drawn in hangar/menu!
     ImDrawList* draw = ImGui::GetBackgroundDrawList();
     if (!draw) return;
 
@@ -532,9 +742,7 @@ static uintptr_t getIl2CppBaseAddress() {
     }
 
     void* h = dlopen("libil2cpp.so", RTLD_NOLOAD);
-    if (!h) {
-        h = dlopen("libil2cpp.so", RTLD_LAZY);
-    }
+    if (!h) h = dlopen("libil2cpp.so", RTLD_LAZY);
     if (h) {
         for (const char* symName : testSyms) {
             void* sym = dlsym(h, symName);
@@ -562,7 +770,7 @@ static uintptr_t getIl2CppBaseAddress() {
 // Hook Initialization Thread
 // -----------------------------------------------------------------------------
 void* thread(void*) {
-    LOGI("C-RAM Mod Thread Started (v4.0 - IAPShop Hook + ADB Socket)");
+    LOGI("C-RAM Mod Thread Started (v4.2 - Universal Spawner + TCP Control)");
 
     initModMenu((void*)DrawMenu);
 
@@ -586,6 +794,7 @@ void* thread(void*) {
     Camera_WorldToScreenPoint = (t_Camera_WorldToScreenPoint)(g_Il2CppBase + RVA_CAMERA_W2S);
     Component_get_transform = (t_Component_get_transform)(g_Il2CppBase + RVA_COMP_TRANSFORM);
     Transform_get_position = (t_Transform_get_position)(g_Il2CppBase + RVA_TRANS_POS);
+    Transform_set_position = (t_Transform_set_position)(g_Il2CppBase + RVA_TRANS_SETPOS);
     IUnit_GetUnitType = (t_IUnit_GetUnitType)(g_Il2CppBase + RVA_UNIT_TYPE);
     PhysicsObject_get_Velocity = (t_PhysicsObject_get_Velocity)(g_Il2CppBase + RVA_PHYS_VEL);
 
@@ -593,31 +802,42 @@ void* thread(void*) {
     MpBootstrap = (t_MpBootstrap)(g_Il2CppBase + RVA_MP_BOOTSTRAP);
     MpEntry_OnClicked = (t_MpEntry_OnClicked)(g_Il2CppBase + RVA_MP_ENTRY_CLICKED);
 
+    // Spawning pointers
+    il2cpp_string_new_fn = (t_il2cpp_string_new)dlsym(RTLD_DEFAULT, "il2cpp_string_new");
+    if (!il2cpp_string_new_fn) {
+        void* h = dlopen("libil2cpp.so", RTLD_NOLOAD);
+        if (h) il2cpp_string_new_fn = (t_il2cpp_string_new)dlsym(h, "il2cpp_string_new");
+    }
+    GameAssetCatalog_GetUnitPrefab = (t_GameAssetCatalog_GetUnitPrefab)(g_Il2CppBase + RVA_ASSET_CATALOG_GET_PREFAB);
+    SpawnManager_SpawnUnit = (t_SpawnManager_SpawnUnit)(g_Il2CppBase + RVA_SPAWN_MANAGER_SPAWN_UNIT);
+    SpawnManager_SpawnAirUnit = (t_SpawnManager_SpawnAirUnit)(g_Il2CppBase + RVA_SPAWN_MANAGER_SPAWN_AIR);
+    SpawnManager_SpawnGroundUnit = (t_SpawnManager_SpawnGroundUnit)(g_Il2CppBase + RVA_SPAWN_MANAGER_SPAWN_GROUND);
+    Object_Instantiate = (t_Object_Instantiate)(g_Il2CppBase + RVA_OBJECT_INSTANTIATE);
+
     // 1. Hook GeneralHUD.LateUpdate for Battle ESP (Lead Indicator)
     void* targetHUDMethod = (void*)(g_Il2CppBase + RVA_HUD_LATEUPDATE);
-    int hudHookRes = DobbyHook(targetHUDMethod, (void*)hook_GeneralHUD_LateUpdate, (void**)&orig_GeneralHUD_LateUpdate);
-    LOGI("DobbyHook GeneralHUD.LateUpdate (%p) returned: %d, orig=%p", targetHUDMethod, hudHookRes, orig_GeneralHUD_LateUpdate);
+    DobbyHook(targetHUDMethod, (void*)hook_GeneralHUD_LateUpdate, (void**)&orig_GeneralHUD_LateUpdate);
 
     // 2. Hook EventSystem.Update for safe execution on Unity Main Thread
     void* targetEventSystemMethod = (void*)(g_Il2CppBase + RVA_EVENTSYSTEM_UPDATE);
-    int esHookRes = DobbyHook(targetEventSystemMethod, (void*)hook_EventSystem_Update, (void**)&orig_EventSystem_Update);
-    LOGI("DobbyHook EventSystem.Update (%p) returned: %d, orig=%p", targetEventSystemMethod, esHookRes, orig_EventSystem_Update);
+    DobbyHook(targetEventSystemMethod, (void*)hook_EventSystem_Update, (void**)&orig_EventSystem_Update);
 
-    // 3. Hook IAPShopButton.OnEnable (Diamond icon in hangar header)
+    // 3. Hook SpawnManager.Awake to capture active battle spawner
+    void* targetSpawnManagerAwake = (void*)(g_Il2CppBase + RVA_SPAWN_MANAGER_AWAKE);
+    DobbyHook(targetSpawnManagerAwake, (void*)hook_SpawnManager_Awake, (void**)&orig_SpawnManager_Awake);
+
+    // 4. Hook IAPShopButton.OnEnable & IconsPanel.ShowStore (Diamond icon in hangar header)
     void* targetIAPShop = (void*)(g_Il2CppBase + RVA_IAP_SHOP_ONENABLE);
-    int iapHookRes = DobbyHook(targetIAPShop, (void*)hook_IAPShopButton_OnEnable, (void**)&orig_IAPShopButton_OnEnable);
-    LOGI("DobbyHook IAPShopButton.OnEnable (%p) returned: %d, orig=%p", targetIAPShop, iapHookRes, orig_IAPShopButton_OnEnable);
+    DobbyHook(targetIAPShop, (void*)hook_IAPShopButton_OnEnable, (void**)&orig_IAPShopButton_OnEnable);
 
-    // 4. Hook CBS.UI.IconsPanel.ShowStore (Backup)
     void* targetShowStore = (void*)(g_Il2CppBase + RVA_ICONS_SHOWSTORE);
-    int storeHookRes = DobbyHook(targetShowStore, (void*)hook_IconsPanel_ShowStore, (void**)&orig_IconsPanel_ShowStore);
-    LOGI("DobbyHook IconsPanel.ShowStore (%p) returned: %d, orig=%p", targetShowStore, storeHookRes, orig_IconsPanel_ShowStore);
+    DobbyHook(targetShowStore, (void*)hook_IconsPanel_ShowStore, (void**)&orig_IconsPanel_ShowStore);
 
-    // 5. Start ADB Socket Listener Thread on 127.0.0.1:8888
+    // 5. Start ADB Socket Listener Thread on 0.0.0.0:8888
     pthread_t sock_t;
     pthread_create(&sock_t, nullptr, socket_server_thread, nullptr);
 
-    LOGI("C-RAM v4.1 Hooks Installed: Lead ESP + IAPShop Diamond Hook + Multi-command TCP Server Ready!");
+    LOGI("C-RAM v4.2 Hooks Installed: Lead ESP + Universal Unit Spawner + TCP Server Ready!");
     pthread_exit(nullptr);
 }
 
