@@ -232,8 +232,8 @@ void* socket_server_thread(void*) {
                     snprintf(reply, sizeof(reply), "HELP: ping, mp, status\n");
                 } else if (strcasecmp(buf, "status") == 0) {
                     int curCount = g_TargetsCount[g_ActiveBufferIdx.load()];
-                    snprintf(reply, sizeof(reply), "STATUS: Il2CppBase=%p, Targets=%d, HUDActive=%d\n",
-                             (void*)g_Il2CppBase, curCount, g_HUDActive ? 1 : 0);
+                    snprintf(reply, sizeof(reply), "STATUS: Il2CppBase=%p, Targets=%d\n",
+                             (void*)g_Il2CppBase, curCount);
                 } else {
                     // Default / 'mp' / '1' -> trigger multiplayer
                     g_OpenMultiplayerRequested.store(true);
