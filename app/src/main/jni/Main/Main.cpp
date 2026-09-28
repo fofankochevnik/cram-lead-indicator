@@ -1,5 +1,5 @@
 //
-// C-RAM Air Target Lead Indicator & Universal Unit Spawner (v4.4 - Ground & DF-21D Fixed)
+// C-RAM Air Target Lead Indicator & Universal Unit Spawner (v4.5 - Ground & DF-21D Fixed)
 //
 
 #include <pthread.h>
@@ -37,7 +37,7 @@
 #define RVA_COMP_TRANSFORM       0x834A0F4
 #define RVA_TRANS_POS            0x83601AC // UnityEngine.Transform.get_position
 #define RVA_TRANS_SETPOS         0x8360280 // UnityEngine.Transform.set_position
-#define RVA_TRANS_GETROT         0x8360D0C // UnityEngine.Transform.get_rotation_Injected
+#define RVA_TRANS_GETFORWARD     0x8360C08 // UnityEngine.Transform.get_forward
 #define RVA_UNIT_TYPE            0x3F54748
 #define RVA_PHYS_VEL             0x3EACAA4
 #define RVA_HUD_LATEUPDATE       0x3F16414 // GeneralHUD.LateUpdate
@@ -92,7 +92,7 @@ typedef void* (*t_Camera_get_main)();
 typedef void* (*t_Component_get_transform)(void* component);
 typedef Vector3 (*t_Transform_get_position)(void* transform);
 typedef void (*t_Transform_set_position)(void* transform, Vector3 position, void* method);
-typedef void (*t_Transform_get_rotation_Injected)(void* transform, Quaternion* outRot, void* method);
+typedef Vector3 (*t_Transform_get_forward)(void* transform, void* method);
 typedef int (*t_IUnit_GetUnitType)(void* unit);
 typedef Vector3 (*t_PhysicsObject_get_Velocity)(void* physicsObject);
 typedef void (*t_GeneralHUD_LateUpdate)(void* self);
@@ -122,7 +122,7 @@ static t_Camera_get_main Camera_get_main = nullptr;
 static t_Component_get_transform Component_get_transform = nullptr;
 static t_Transform_get_position Transform_get_position = nullptr;
 static t_Transform_set_position Transform_set_position = nullptr;
-static t_Transform_get_rotation_Injected Transform_get_rotation_Injected = nullptr;
+static t_Transform_get_forward Transform_get_forward = nullptr;
 static t_IUnit_GetUnitType IUnit_GetUnitType = nullptr;
 static t_PhysicsObject_get_Velocity PhysicsObject_get_Velocity = nullptr;
 static t_GeneralHUD_LateUpdate orig_GeneralHUD_LateUpdate = nullptr;
@@ -396,17 +396,16 @@ void ExecuteSpawn(const SpawnRequest& req) {
         if (IsValidPtr(camTr)) {
             Vector3 cPos = Transform_get_position(camTr);
 
-            Quaternion camRot = Quaternion::Identity();
-            if (Transform_get_rotation_Injected) {
-                Transform_get_rotation_Injected(camTr, &camRot, nullptr);
+            Vector3 fwd(0, 0, 1);
+            if (Transform_get_forward) {
+                fwd = Transform_get_forward(camTr, nullptr);
             }
-
-            Vector3 fwd = RotateVector(camRot, Vector3(0, 0, 1));
 
             if (req.hasCustomPos) {
                 spawnPos = Vector3(req.customX, req.customY, req.customZ);
             } else if (isAir) {
                 spawnPos = cPos + fwd * spawnDist + Vector3(0, spawnAlt, 0);
+                spawnRot = Quaternion::LookRotation(fwd * -1.0f);
             } else {
                 Vector3 groundFwd(fwd.X, 0.0f, fwd.Z);
                 float len = Vector3::Magnitude(groundFwd);
@@ -415,9 +414,11 @@ void ExecuteSpawn(const SpawnRequest& req) {
                 } else {
                     groundFwd = Vector3(0, 0, 1);
                 }
-                // Place slightly above camera Y so ground snap raycasts down directly to surface
+                // Place vehicle in front of player on ground
                 spawnPos = cPos + groundFwd * spawnDist;
-                spawnPos.Y = cPos.Y + 2.0f;
+                if (req.alt >= 0.0f) {
+                    spawnPos.Y = req.alt;
+                }
                 // Face the vehicle towards the player
                 spawnRot = Quaternion::LookRotation(groundFwd * -1.0f);
             }
@@ -468,10 +469,16 @@ void ExecuteSpawn(const SpawnRequest& req) {
                     SpawnManager_SpawnGroundUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, nullptr);
                     spawned = true;
                 } else if (SpawnManager_SpawnUnit) {
-                    LOGI("[C-RAM-MOD] Spawning ground unit (setupAI=%d)...", (int)req.setupAI);
-                    void* unit = SpawnManager_SpawnUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, req.setupAI, nullptr);
-                    if (unit && SpawnManager_SnapGroundUnitToSurface) {
-                        SpawnManager_SnapGroundUnitToSurface(g_SpawnManagerInstance, unit, nullptr);
+                    LOGI("[C-RAM-MOD] Spawning ground unit without AI (setupAI=0)...");
+                    void* unit = SpawnManager_SpawnUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, false, nullptr);
+                    if (unit && IsValidPtr(unit) && IUnit_GetUnitType && SpawnManager_SnapGroundUnitToSurface) {
+                        try {
+                            if (IUnit_GetUnitType(unit) == 1) {
+                                SpawnManager_SnapGroundUnitToSurface(g_SpawnManagerInstance, unit, nullptr);
+                            }
+                        } catch (...) {
+                            LOGE("[C-RAM-MOD] Exception in SnapGroundUnitToSurface");
+                        }
                     }
                     spawned = true;
                 }
@@ -621,7 +628,7 @@ void* socket_server_thread(void*) {
 
                 char reply[512];
                 if (strcasecmp(buf, "ping") == 0) {
-                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v4.4 Online\n");
+                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v4.5 Online\n");
                 } else if (strcasecmp(buf, "help") == 0) {
                     snprintf(reply, sizeof(reply),
                              "Commands:\n"
@@ -1012,7 +1019,7 @@ static uintptr_t getIl2CppBaseAddress() {
 // Hook Initialization Thread
 // -----------------------------------------------------------------------------
 void* thread(void*) {
-    LOGI("C-RAM Mod Thread Started (v4.4 - Ground & DF-21D Fixed)");
+    LOGI("C-RAM Mod Thread Started (v4.5 - Ground & DF-21D Fixed)");
 
     initModMenu((void*)DrawMenu);
 
@@ -1037,7 +1044,7 @@ void* thread(void*) {
     Component_get_transform = (t_Component_get_transform)(g_Il2CppBase + RVA_COMP_TRANSFORM);
     Transform_get_position = (t_Transform_get_position)(g_Il2CppBase + RVA_TRANS_POS);
     Transform_set_position = (t_Transform_set_position)(g_Il2CppBase + RVA_TRANS_SETPOS);
-    Transform_get_rotation_Injected = (t_Transform_get_rotation_Injected)(g_Il2CppBase + RVA_TRANS_GETROT);
+    Transform_get_forward = (t_Transform_get_forward)(g_Il2CppBase + RVA_TRANS_GETFORWARD);
     IUnit_GetUnitType = (t_IUnit_GetUnitType)(g_Il2CppBase + RVA_UNIT_TYPE);
     PhysicsObject_get_Velocity = (t_PhysicsObject_get_Velocity)(g_Il2CppBase + RVA_PHYS_VEL);
 
@@ -1088,7 +1095,7 @@ void* thread(void*) {
     pthread_t sock_t;
     pthread_create(&sock_t, nullptr, socket_server_thread, nullptr);
 
-    LOGI("C-RAM v4.4 Hooks Installed: Lead ESP + Crash Guards + Camera Forward Aiming + TCP Server Ready!");
+    LOGI("C-RAM v4.5 Hooks Installed: Lead ESP + Crash Guards + Camera Forward Aiming + TCP Server Ready!");
     pthread_exit(nullptr);
 }
 
