@@ -1,5 +1,5 @@
 //
-// C-RAM Air Target Lead Indicator & Universal Unit Spawner (v4.3 - Full Controls & ESP Fix)
+// C-RAM Air Target Lead Indicator & Universal Unit Spawner (v4.4 - Ground & DF-21D Fixed)
 //
 
 #include <pthread.h>
@@ -37,6 +37,7 @@
 #define RVA_COMP_TRANSFORM       0x834A0F4
 #define RVA_TRANS_POS            0x83601AC // UnityEngine.Transform.get_position
 #define RVA_TRANS_SETPOS         0x8360280 // UnityEngine.Transform.set_position
+#define RVA_TRANS_GETROT         0x8360D0C // UnityEngine.Transform.get_rotation_Injected
 #define RVA_UNIT_TYPE            0x3F54748
 #define RVA_PHYS_VEL             0x3EACAA4
 #define RVA_HUD_LATEUPDATE       0x3F16414 // GeneralHUD.LateUpdate
@@ -56,7 +57,12 @@
 #define RVA_SPAWN_MANAGER_SPAWN_UNIT    0x3EC7308 // SpawnManager.SpawnUnit
 #define RVA_SPAWN_MANAGER_SPAWN_AIR     0x3EC78DC // SpawnManager.SpawnAirUnit
 #define RVA_SPAWN_MANAGER_SPAWN_GROUND  0x3EC7CBC // SpawnManager.SpawnGroundUnit
+#define RVA_SPAWN_MANAGER_SNAP_GROUND   0x3EC7E78 // SpawnManager.SnapGroundUnitToSurface
 #define RVA_OBJECT_INSTANTIATE          0x8355558 // UnityEngine.Object.Instantiate(Object original)
+
+// Ground Component Fixes (TrackDeformer & RotatingSensor NullReferenceException guards)
+#define RVA_TRACK_DEFORMER_UPDATE       0x3F68C20 // TrackDeformer.Update
+#define RVA_ROTATING_SENSOR_UPDATE      0x3FB20FC // RotatingSensor.Update
 
 // -----------------------------------------------------------------------------
 // Field Offsets from dump.cs & il2cpp.h
@@ -86,6 +92,7 @@ typedef void* (*t_Camera_get_main)();
 typedef void* (*t_Component_get_transform)(void* component);
 typedef Vector3 (*t_Transform_get_position)(void* transform);
 typedef void (*t_Transform_set_position)(void* transform, Vector3 position, void* method);
+typedef void (*t_Transform_get_rotation_Injected)(void* transform, Quaternion* outRot, void* method);
 typedef int (*t_IUnit_GetUnitType)(void* unit);
 typedef Vector3 (*t_PhysicsObject_get_Velocity)(void* physicsObject);
 typedef void (*t_GeneralHUD_LateUpdate)(void* self);
@@ -103,13 +110,19 @@ typedef void (*t_SpawnManager_Awake)(void* self);
 typedef void* (*t_SpawnManager_SpawnUnit)(void* self, void* prefab, Vector3 pos, Quaternion rot, void* parent, bool setupAI, void* method);
 typedef void* (*t_SpawnManager_SpawnAirUnit)(void* self, void* prefab, Vector3 pos, Quaternion rot, void* parent, float wayRoadHeight, float wayRoadScale, void* method);
 typedef void* (*t_SpawnManager_SpawnGroundUnit)(void* self, void* prefab, Vector3 pos, Quaternion rot, void* parent, void* method);
+typedef void (*t_SpawnManager_SnapGroundUnitToSurface)(void* self, void* unit, void* method);
 typedef void* (*t_Object_Instantiate)(void* original, void* method);
+
+// Component guard function pointers
+typedef void (*t_TrackDeformer_Update)(void* self);
+typedef void (*t_RotatingSensor_Update)(void* self);
 
 static t_Camera_WorldToScreenPoint Camera_WorldToScreenPoint = nullptr;
 static t_Camera_get_main Camera_get_main = nullptr;
 static t_Component_get_transform Component_get_transform = nullptr;
 static t_Transform_get_position Transform_get_position = nullptr;
 static t_Transform_set_position Transform_set_position = nullptr;
+static t_Transform_get_rotation_Injected Transform_get_rotation_Injected = nullptr;
 static t_IUnit_GetUnitType IUnit_GetUnitType = nullptr;
 static t_PhysicsObject_get_Velocity PhysicsObject_get_Velocity = nullptr;
 static t_GeneralHUD_LateUpdate orig_GeneralHUD_LateUpdate = nullptr;
@@ -126,7 +139,11 @@ static t_SpawnManager_Awake orig_SpawnManager_Awake = nullptr;
 static t_SpawnManager_SpawnUnit SpawnManager_SpawnUnit = nullptr;
 static t_SpawnManager_SpawnAirUnit SpawnManager_SpawnAirUnit = nullptr;
 static t_SpawnManager_SpawnGroundUnit SpawnManager_SpawnGroundUnit = nullptr;
+static t_SpawnManager_SnapGroundUnitToSurface SpawnManager_SnapGroundUnitToSurface = nullptr;
 static t_Object_Instantiate Object_Instantiate = nullptr;
+
+static t_TrackDeformer_Update orig_TrackDeformer_Update = nullptr;
+static t_RotatingSensor_Update orig_RotatingSensor_Update = nullptr;
 
 // -----------------------------------------------------------------------------
 // Global State & Buffers
@@ -180,6 +197,43 @@ static inline bool StartsWith(const std::string& str, const std::string& prefix)
     return str.size() >= prefix.size() && str.compare(0, prefix.size(), prefix) == 0;
 }
 
+inline Vector3 RotateVector(const Quaternion& q, const Vector3& v) {
+    Vector3 u(q.X, q.Y, q.Z);
+    float s = q.W;
+    Vector3 uxv = Vector3::Cross(u, v);
+    Vector3 u_uxv = Vector3::Cross(u, uxv);
+    return v + (uxv * (2.0f * s)) + (u_uxv * 2.0f);
+}
+
+// -----------------------------------------------------------------------------
+// Component Safety Guards (Eliminates NullReferenceExceptions on Ground Units)
+// -----------------------------------------------------------------------------
+void hook_TrackDeformer_Update(void* self) {
+    if (!IsValidPtr(self)) return;
+    void* initialVerts = *(void**)((uintptr_t)self + 0x40);
+    void* currentVerts = *(void**)((uintptr_t)self + 0x58);
+    // If vertices are not properly allocated by prefab, skip updating to prevent NullReferenceException
+    if (!IsValidPtr(initialVerts) || !IsValidPtr(currentVerts)) {
+        return;
+    }
+    if (orig_TrackDeformer_Update) {
+        orig_TrackDeformer_Update(self);
+    }
+}
+
+void hook_RotatingSensor_Update(void* self) {
+    if (!IsValidPtr(self)) return;
+    void* rotatingObj = *(void**)((uintptr_t)self + 0x48);
+    void* sensorMio = *(void**)((uintptr_t)self + 0x20);
+    // If target rotating object or sensor link is missing, skip updating
+    if (!IsValidPtr(rotatingObj) || !IsValidPtr(sensorMio)) {
+        return;
+    }
+    if (orig_RotatingSensor_Update) {
+        orig_RotatingSensor_Update(self);
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Unit Name Alias Resolver
 // -----------------------------------------------------------------------------
@@ -188,7 +242,7 @@ std::string ResolveUnitAlias(const std::string& input) {
     for (char &c : s) c = tolower((unsigned char)c);
 
     // Ballistic & Missile Launchers
-    if (s == "df-21d" || s == "df21d" || s == "df21" || s == "df-21") return "DF-21D";
+    if (s == "df-21d" || s == "df21d" || s == "df21" || s == "df-21" || s == "df 21" || s == "df 21d") return "DF-21D";
     if (s == "shahedlauncher" || s == "launcher") return "ShahedLauncher";
 
     // Bombers & Drones
@@ -262,7 +316,7 @@ std::string ResolveUnitAlias(const std::string& input) {
     return input; // return as-is
 }
 
-// Check if unit is an airborne target
+// Check if unit is an airborne target (Prefix check ensures DF-21D is NEVER classified as air)
 bool IsAirUnit(const std::string& name) {
     if (name.find("Spirit") != std::string::npos ||
         name.find("Shahed-136") != std::string::npos ||
@@ -327,7 +381,7 @@ void ExecuteSpawn(const SpawnRequest& req) {
     bool isAir = IsAirUnit(canonical);
     bool isTurret = IsTurretOrStationary(canonical);
 
-    float defaultDist = isAir ? 400.0f : 120.0f;
+    float defaultDist = isAir ? 400.0f : 25.0f;
     float defaultAlt = isAir ? 80.0f : 0.0f;
 
     float spawnDist = (req.dist >= 0.0f) ? req.dist : defaultDist;
@@ -341,19 +395,38 @@ void ExecuteSpawn(const SpawnRequest& req) {
         void* camTr = Component_get_transform(cam);
         if (IsValidPtr(camTr)) {
             Vector3 cPos = Transform_get_position(camTr);
+
+            Quaternion camRot = Quaternion::Identity();
+            if (Transform_get_rotation_Injected) {
+                Transform_get_rotation_Injected(camTr, &camRot, nullptr);
+            }
+
+            Vector3 fwd = RotateVector(camRot, Vector3(0, 0, 1));
+
             if (req.hasCustomPos) {
                 spawnPos = Vector3(req.customX, req.customY, req.customZ);
             } else if (isAir) {
-                spawnPos = Vector3(cPos.X, cPos.Y + spawnAlt, cPos.Z + spawnDist);
+                spawnPos = cPos + fwd * spawnDist + Vector3(0, spawnAlt, 0);
             } else {
-                spawnPos = Vector3(cPos.X, 0.0f, cPos.Z + spawnDist);
+                Vector3 groundFwd(fwd.X, 0.0f, fwd.Z);
+                float len = Vector3::Magnitude(groundFwd);
+                if (len > 0.001f) {
+                    groundFwd = groundFwd / len;
+                } else {
+                    groundFwd = Vector3(0, 0, 1);
+                }
+                // Place slightly above camera Y so ground snap raycasts down directly to surface
+                spawnPos = cPos + groundFwd * spawnDist;
+                spawnPos.Y = cPos.Y + 2.0f;
+                // Face the vehicle towards the player
+                spawnRot = Quaternion::LookRotation(groundFwd * -1.0f);
             }
         }
     }
 
     bool spawned = false;
 
-    // 1. Static Turrets / Launchers (ShahedLauncher, Phalanx, Kashtan) -> Spawn via Object.Instantiate
+    // 1. Static Turrets / Launchers (ShahedLauncher, Phalanx, Kashtan) -> Object.Instantiate on ground
     if (isTurret) {
         if (Object_Instantiate) {
             LOGI("[C-RAM-MOD] Spawning stationary launcher/turret via Object.Instantiate...");
@@ -391,12 +464,15 @@ void ExecuteSpawn(const SpawnRequest& req) {
         if (g_SpawnManagerInstance) {
             try {
                 if (req.setupAI && SpawnManager_SpawnGroundUnit) {
-                    LOGI("[C-RAM-MOD] Spawning ground unit via SpawnManager::SpawnGroundUnit...");
+                    LOGI("[C-RAM-MOD] Spawning ground unit with AI via SpawnManager::SpawnGroundUnit...");
                     SpawnManager_SpawnGroundUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, nullptr);
                     spawned = true;
                 } else if (SpawnManager_SpawnUnit) {
-                    LOGI("[C-RAM-MOD] Spawning ground unit via SpawnManager::SpawnUnit (setupAI=%d)...", (int)req.setupAI);
-                    SpawnManager_SpawnUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, req.setupAI, nullptr);
+                    LOGI("[C-RAM-MOD] Spawning ground unit (setupAI=%d)...", (int)req.setupAI);
+                    void* unit = SpawnManager_SpawnUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, req.setupAI, nullptr);
+                    if (unit && SpawnManager_SnapGroundUnitToSurface) {
+                        SpawnManager_SnapGroundUnitToSurface(g_SpawnManagerInstance, unit, nullptr);
+                    }
                     spawned = true;
                 }
             } catch (...) {
@@ -545,7 +621,7 @@ void* socket_server_thread(void*) {
 
                 char reply[512];
                 if (strcasecmp(buf, "ping") == 0) {
-                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v4.3 Online\n");
+                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v4.4 Online\n");
                 } else if (strcasecmp(buf, "help") == 0) {
                     snprintf(reply, sizeof(reply),
                              "Commands:\n"
@@ -936,7 +1012,7 @@ static uintptr_t getIl2CppBaseAddress() {
 // Hook Initialization Thread
 // -----------------------------------------------------------------------------
 void* thread(void*) {
-    LOGI("C-RAM Mod Thread Started (v4.3 - Full Controls & ESP Fix)");
+    LOGI("C-RAM Mod Thread Started (v4.4 - Ground & DF-21D Fixed)");
 
     initModMenu((void*)DrawMenu);
 
@@ -961,6 +1037,7 @@ void* thread(void*) {
     Component_get_transform = (t_Component_get_transform)(g_Il2CppBase + RVA_COMP_TRANSFORM);
     Transform_get_position = (t_Transform_get_position)(g_Il2CppBase + RVA_TRANS_POS);
     Transform_set_position = (t_Transform_set_position)(g_Il2CppBase + RVA_TRANS_SETPOS);
+    Transform_get_rotation_Injected = (t_Transform_get_rotation_Injected)(g_Il2CppBase + RVA_TRANS_GETROT);
     IUnit_GetUnitType = (t_IUnit_GetUnitType)(g_Il2CppBase + RVA_UNIT_TYPE);
     PhysicsObject_get_Velocity = (t_PhysicsObject_get_Velocity)(g_Il2CppBase + RVA_PHYS_VEL);
 
@@ -978,6 +1055,7 @@ void* thread(void*) {
     SpawnManager_SpawnUnit = (t_SpawnManager_SpawnUnit)(g_Il2CppBase + RVA_SPAWN_MANAGER_SPAWN_UNIT);
     SpawnManager_SpawnAirUnit = (t_SpawnManager_SpawnAirUnit)(g_Il2CppBase + RVA_SPAWN_MANAGER_SPAWN_AIR);
     SpawnManager_SpawnGroundUnit = (t_SpawnManager_SpawnGroundUnit)(g_Il2CppBase + RVA_SPAWN_MANAGER_SPAWN_GROUND);
+    SpawnManager_SnapGroundUnitToSurface = (t_SpawnManager_SnapGroundUnitToSurface)(g_Il2CppBase + RVA_SPAWN_MANAGER_SNAP_GROUND);
     Object_Instantiate = (t_Object_Instantiate)(g_Il2CppBase + RVA_OBJECT_INSTANTIATE);
 
     // 1. Hook GeneralHUD.LateUpdate for Battle ESP (Lead Indicator)
@@ -999,11 +1077,18 @@ void* thread(void*) {
     void* targetShowStore = (void*)(g_Il2CppBase + RVA_ICONS_SHOWSTORE);
     DobbyHook(targetShowStore, (void*)hook_IconsPanel_ShowStore, (void**)&orig_IconsPanel_ShowStore);
 
-    // 5. Start ADB Socket Listener Thread on 0.0.0.0:8888
+    // 5. Component Guards: Eliminate NullReferenceExceptions on Ground Units & DF-21D
+    void* targetTrackDeformer = (void*)(g_Il2CppBase + RVA_TRACK_DEFORMER_UPDATE);
+    DobbyHook(targetTrackDeformer, (void*)hook_TrackDeformer_Update, (void**)&orig_TrackDeformer_Update);
+
+    void* targetRotatingSensor = (void*)(g_Il2CppBase + RVA_ROTATING_SENSOR_UPDATE);
+    DobbyHook(targetRotatingSensor, (void*)hook_RotatingSensor_Update, (void**)&orig_RotatingSensor_Update);
+
+    // 6. Start ADB Socket Listener Thread on 0.0.0.0:8888
     pthread_t sock_t;
     pthread_create(&sock_t, nullptr, socket_server_thread, nullptr);
 
-    LOGI("C-RAM v4.3 Hooks Installed: Lead ESP + Universal Spawner (AI & Coord Controls) + TCP Server Ready!");
+    LOGI("C-RAM v4.4 Hooks Installed: Lead ESP + Crash Guards + Camera Forward Aiming + TCP Server Ready!");
     pthread_exit(nullptr);
 }
 
