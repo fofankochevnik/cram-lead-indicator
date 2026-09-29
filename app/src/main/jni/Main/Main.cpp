@@ -154,6 +154,9 @@ static t_RotatingSensor_Update orig_RotatingSensor_Update = nullptr;
 static uintptr_t g_Il2CppBase = 0;
 static void* g_SpawnManagerInstance = nullptr;
 
+static Vector3 g_PlayerVehiclePos(0, 0, 0);
+static std::atomic<bool> g_HasPlayerVehiclePos(false);
+
 static std::atomic<bool> g_OpenMultiplayerRequested(false);
 static uint64_t g_LastTriggerTime = 0;
 
@@ -343,6 +346,8 @@ bool IsAirUnit(const std::string& name) {
 // Check if unit is a stationary turret/launcher
 bool IsTurretOrStationary(const std::string& name) {
     if (name == "ShahedLauncher" ||
+        name.find("Launcher") != std::string::npos ||
+        name.find("launcher") != std::string::npos ||
         name == "PhalanxHD" ||
         name == "Kashtan" ||
         name == "SEA-RAM" ||
@@ -416,8 +421,13 @@ void ExecuteSpawn(const SpawnRequest& req) {
                 } else {
                     groundFwd = Vector3(0, 0, 1);
                 }
-                // Place vehicle in front of player on ground
-                spawnPos = cPos + groundFwd * spawnDist;
+                // Place vehicle in front of player at ground level
+                Vector3 basePos = cPos;
+                if (g_HasPlayerVehiclePos.load()) {
+                    basePos = g_PlayerVehiclePos;
+                }
+
+                spawnPos = basePos + groundFwd * spawnDist;
                 if (req.alt >= 0.0f) {
                     spawnPos.Y = req.alt;
                 }
@@ -452,25 +462,29 @@ void ExecuteSpawn(const SpawnRequest& req) {
     else {
         if (g_SpawnManagerInstance && SpawnManager_SpawnUnit) {
             try {
-                LOGI("[C-RAM-MOD] Spawning ground/launcher unit (setupAI=%d)...", (int)req.setupAI);
-                void* unit = SpawnManager_SpawnUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, req.setupAI, nullptr);
-                if (unit && IsValidPtr(unit) && IUnit_GetUnitType && SpawnManager_SnapGroundUnitToSurface) {
-                    try {
-                        if (IUnit_GetUnitType(unit) == 1) { // 1 = Ground
+                bool isStationary = IsTurretOrStationary(canonical);
+                bool needAI = req.setupAI && !isStationary;
+                LOGI("[C-RAM-MOD] Spawning ground/launcher unit '%s' (needAI=%d, isStationary=%d)...",
+                     canonical.c_str(), (int)needAI, (int)isStationary);
+                void* unit = SpawnManager_SpawnUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, needAI, nullptr);
+                if (unit && IsValidPtr(unit)) {
+                    spawned = true;
+                    if (SpawnManager_SnapGroundUnitToSurface) {
+                        try {
                             SpawnManager_SnapGroundUnitToSurface(g_SpawnManagerInstance, unit, nullptr);
+                            LOGI("[C-RAM-MOD] Snapped '%s' to surface successfully!", canonical.c_str());
+                        } catch (...) {
+                            LOGE("[C-RAM-MOD] Exception in SnapGroundUnitToSurface");
                         }
-                    } catch (...) {
-                        LOGE("[C-RAM-MOD] Exception in SnapGroundUnitToSurface");
                     }
                 }
-                spawned = true;
             } catch (...) {
                 LOGE("[C-RAM-MOD] Exception inside SpawnManager ground call");
             }
         }
     }
 
-    // Generic fallback if not handled
+    // Generic fallback ONLY if SpawnManager completely failed or was null
     if (!spawned && Object_Instantiate) {
         LOGI("[C-RAM-MOD] Spawning via Object.Instantiate fallback...");
         void* obj = Object_Instantiate(prefab, nullptr);
@@ -609,8 +623,23 @@ void* socket_server_thread(void*) {
                 LOGI("[C-RAM-MOD] TCP Command received: '%s'", buf);
 
                 char reply[512];
+
+                // Deduplicate identical commands received within 500ms
+                uint64_t nowMs = getNowMs();
+                static std::string s_LastCmdStr = "";
+                static uint64_t s_LastCmdTime = 0;
+                if (s_LastCmdStr == buf && (nowMs - s_LastCmdTime) < 500) {
+                    LOGI("[C-RAM-MOD] Duplicate command '%s' ignored (within %llums)", buf, (unsigned long long)(nowMs - s_LastCmdTime));
+                    snprintf(reply, sizeof(reply), "OK: Duplicate ignored\n");
+                    write(client_fd, reply, strlen(reply));
+                    close(client_fd);
+                    continue;
+                }
+                s_LastCmdStr = buf;
+                s_LastCmdTime = nowMs;
+
                 if (strcasecmp(buf, "ping") == 0) {
-                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v4.7 Online\n");
+                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v4.8 Online\n");
                 } else if (strcasecmp(buf, "help") == 0) {
                     snprintf(reply, sizeof(reply),
                              "Commands:\n"
@@ -783,6 +812,14 @@ void hook_GeneralHUD_LateUpdate(void* self) {
 
     void* seat = *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT);
     if (IsValidPtr(seat)) {
+        if (Component_get_transform && Transform_get_position) {
+            void* seatTr = Component_get_transform(seat);
+            if (IsValidPtr(seatTr)) {
+                g_PlayerVehiclePos = Transform_get_position(seatTr);
+                g_HasPlayerVehiclePos.store(true);
+            }
+        }
+
         void* aws = *(void**)((uintptr_t)seat + OFFSET_SEAT_AWS);
         if (IsValidPtr(aws)) {
             void* activeTurret = nullptr;
@@ -1001,7 +1038,7 @@ static uintptr_t getIl2CppBaseAddress() {
 // Hook Initialization Thread
 // -----------------------------------------------------------------------------
 void* thread(void*) {
-    LOGI("C-RAM Mod Thread Started (v4.7 - Universal SpawnUnit)");
+    LOGI("C-RAM Mod Thread Started (v4.8 - Ground Snapping & Deduplication)");
 
     initModMenu((void*)DrawMenu);
 
@@ -1078,7 +1115,7 @@ void* thread(void*) {
     pthread_t sock_t;
     pthread_create(&sock_t, nullptr, socket_server_thread, nullptr);
 
-    LOGI("C-RAM v4.7 Hooks Installed: Lead ESP + Crash Guards + Camera Forward Aiming + TCP Server Ready!");
+    LOGI("C-RAM v4.8 Hooks Installed: Lead ESP + Crash Guards + Ground Snapping + TCP Server Ready!");
     pthread_exit(nullptr);
 }
 
