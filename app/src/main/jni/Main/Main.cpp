@@ -1,5 +1,5 @@
 //
-// C-RAM Air Target Lead Indicator & Universal Unit Spawner (v4.6 - Launchers & Turrets Fixed)
+// C-RAM Air Target Lead Indicator & Universal Unit Spawner (v4.7 - Universal SpawnUnit)
 //
 
 #include <pthread.h>
@@ -35,6 +35,7 @@
 #define RVA_CAMERA_MAIN          0x82D7D50
 #define RVA_CAMERA_W2S           0x82D72A4
 #define RVA_COMP_TRANSFORM       0x834A0F4
+#define RVA_GAMEOBJECT_TRANSFORM 0x834EBA0 // UnityEngine.GameObject.get_transform
 #define RVA_TRANS_POS            0x83601AC // UnityEngine.Transform.get_position
 #define RVA_TRANS_SETPOS         0x8360280 // UnityEngine.Transform.set_position
 #define RVA_TRANS_GETFORWARD     0x8360C08 // UnityEngine.Transform.get_forward
@@ -90,6 +91,7 @@
 typedef Vector3 (*t_Camera_WorldToScreenPoint)(void* camera, Vector3 position);
 typedef void* (*t_Camera_get_main)();
 typedef void* (*t_Component_get_transform)(void* component);
+typedef void* (*t_GameObject_get_transform)(void* gameObject);
 typedef Vector3 (*t_Transform_get_position)(void* transform);
 typedef void (*t_Transform_set_position)(void* transform, Vector3 position, void* method);
 typedef Vector3 (*t_Transform_get_forward)(void* transform, void* method);
@@ -120,6 +122,7 @@ typedef void (*t_RotatingSensor_Update)(void* self);
 static t_Camera_WorldToScreenPoint Camera_WorldToScreenPoint = nullptr;
 static t_Camera_get_main Camera_get_main = nullptr;
 static t_Component_get_transform Component_get_transform = nullptr;
+static t_GameObject_get_transform GameObject_get_transform = nullptr;
 static t_Transform_get_position Transform_get_position = nullptr;
 static t_Transform_set_position Transform_set_position = nullptr;
 static t_Transform_get_forward Transform_get_forward = nullptr;
@@ -447,26 +450,20 @@ void ExecuteSpawn(const SpawnRequest& req) {
     }
     // 2. Ground Vehicles, Launchers & Turrets (DF-21D, ShahedLauncher, Tor, Tunguska, Pantsir, Abrams, etc.)
     else {
-        if (g_SpawnManagerInstance) {
+        if (g_SpawnManagerInstance && SpawnManager_SpawnUnit) {
             try {
-                if (req.setupAI && SpawnManager_SpawnGroundUnit) {
-                    LOGI("[C-RAM-MOD] Spawning ground unit with AI via SpawnManager::SpawnGroundUnit...");
-                    SpawnManager_SpawnGroundUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, nullptr);
-                    spawned = true;
-                } else if (SpawnManager_SpawnUnit) {
-                    LOGI("[C-RAM-MOD] Spawning ground unit without AI (setupAI=0)...");
-                    void* unit = SpawnManager_SpawnUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, false, nullptr);
-                    if (unit && IsValidPtr(unit) && IUnit_GetUnitType && SpawnManager_SnapGroundUnitToSurface) {
-                        try {
-                            if (IUnit_GetUnitType(unit) == 1) {
-                                SpawnManager_SnapGroundUnitToSurface(g_SpawnManagerInstance, unit, nullptr);
-                            }
-                        } catch (...) {
-                            LOGE("[C-RAM-MOD] Exception in SnapGroundUnitToSurface");
+                LOGI("[C-RAM-MOD] Spawning ground/launcher unit (setupAI=%d)...", (int)req.setupAI);
+                void* unit = SpawnManager_SpawnUnit(g_SpawnManagerInstance, prefab, spawnPos, spawnRot, nullptr, req.setupAI, nullptr);
+                if (unit && IsValidPtr(unit) && IUnit_GetUnitType && SpawnManager_SnapGroundUnitToSurface) {
+                    try {
+                        if (IUnit_GetUnitType(unit) == 1) { // 1 = Ground
+                            SpawnManager_SnapGroundUnitToSurface(g_SpawnManagerInstance, unit, nullptr);
                         }
+                    } catch (...) {
+                        LOGE("[C-RAM-MOD] Exception in SnapGroundUnitToSurface");
                     }
-                    spawned = true;
                 }
+                spawned = true;
             } catch (...) {
                 LOGE("[C-RAM-MOD] Exception inside SpawnManager ground call");
             }
@@ -477,8 +474,8 @@ void ExecuteSpawn(const SpawnRequest& req) {
     if (!spawned && Object_Instantiate) {
         LOGI("[C-RAM-MOD] Spawning via Object.Instantiate fallback...");
         void* obj = Object_Instantiate(prefab, nullptr);
-        if (obj && Component_get_transform && Transform_set_position) {
-            void* tr = Component_get_transform(obj);
+        if (obj && GameObject_get_transform && Transform_set_position) {
+            void* tr = GameObject_get_transform(obj);
             if (tr) {
                 Transform_set_position(tr, spawnPos, nullptr);
             }
@@ -613,7 +610,7 @@ void* socket_server_thread(void*) {
 
                 char reply[512];
                 if (strcasecmp(buf, "ping") == 0) {
-                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v4.6 Online\n");
+                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v4.7 Online\n");
                 } else if (strcasecmp(buf, "help") == 0) {
                     snprintf(reply, sizeof(reply),
                              "Commands:\n"
@@ -1004,7 +1001,7 @@ static uintptr_t getIl2CppBaseAddress() {
 // Hook Initialization Thread
 // -----------------------------------------------------------------------------
 void* thread(void*) {
-    LOGI("C-RAM Mod Thread Started (v4.6 - Launchers & Turrets Fixed)");
+    LOGI("C-RAM Mod Thread Started (v4.7 - Universal SpawnUnit)");
 
     initModMenu((void*)DrawMenu);
 
@@ -1027,6 +1024,7 @@ void* thread(void*) {
     Camera_get_main = (t_Camera_get_main)(g_Il2CppBase + RVA_CAMERA_MAIN);
     Camera_WorldToScreenPoint = (t_Camera_WorldToScreenPoint)(g_Il2CppBase + RVA_CAMERA_W2S);
     Component_get_transform = (t_Component_get_transform)(g_Il2CppBase + RVA_COMP_TRANSFORM);
+    GameObject_get_transform = (t_GameObject_get_transform)(g_Il2CppBase + RVA_GAMEOBJECT_TRANSFORM);
     Transform_get_position = (t_Transform_get_position)(g_Il2CppBase + RVA_TRANS_POS);
     Transform_set_position = (t_Transform_set_position)(g_Il2CppBase + RVA_TRANS_SETPOS);
     Transform_get_forward = (t_Transform_get_forward)(g_Il2CppBase + RVA_TRANS_GETFORWARD);
@@ -1080,7 +1078,7 @@ void* thread(void*) {
     pthread_t sock_t;
     pthread_create(&sock_t, nullptr, socket_server_thread, nullptr);
 
-    LOGI("C-RAM v4.6 Hooks Installed: Lead ESP + Crash Guards + Camera Forward Aiming + TCP Server Ready!");
+    LOGI("C-RAM v4.7 Hooks Installed: Lead ESP + Crash Guards + Camera Forward Aiming + TCP Server Ready!");
     pthread_exit(nullptr);
 }
 
