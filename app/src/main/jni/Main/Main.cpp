@@ -1,5 +1,5 @@
 //
-// C-RAM Air Target Lead Indicator & Universal Unit Spawner (v4.5 - Ground & DF-21D Fixed)
+// C-RAM Air Target Lead Indicator & Universal Unit Spawner (v4.6 - Launchers & Turrets Fixed)
 //
 
 #include <pthread.h>
@@ -58,7 +58,7 @@
 #define RVA_SPAWN_MANAGER_SPAWN_AIR     0x3EC78DC // SpawnManager.SpawnAirUnit
 #define RVA_SPAWN_MANAGER_SPAWN_GROUND  0x3EC7CBC // SpawnManager.SpawnGroundUnit
 #define RVA_SPAWN_MANAGER_SNAP_GROUND   0x3EC7E78 // SpawnManager.SnapGroundUnitToSurface
-#define RVA_OBJECT_INSTANTIATE          0x8355558 // UnityEngine.Object.Instantiate(Object original)
+#define RVA_OBJECT_INSTANTIATE          0x8356158 // UnityEngine.Object.Instantiate(Object original)
 
 // Ground Component Fixes (TrackDeformer & RotatingSensor NullReferenceException guards)
 #define RVA_TRACK_DEFORMER_UPDATE       0x3F68C20 // TrackDeformer.Update
@@ -243,7 +243,7 @@ std::string ResolveUnitAlias(const std::string& input) {
 
     // Ballistic & Missile Launchers
     if (s == "df-21d" || s == "df21d" || s == "df21" || s == "df-21" || s == "df 21" || s == "df 21d") return "DF-21D";
-    if (s == "shahedlauncher" || s == "launcher") return "ShahedLauncher";
+    if (s == "shahed launcher" || s == "shahed-launcher" || s == "shahedlauncher" || s == "launcher") return "ShahedLauncher";
 
     // Bombers & Drones
     if (s == "b2" || s == "b-2" || s == "spirit" || s == "b2 spirit" || s == "b-2 spirit") return "B-2 Spirit new";
@@ -379,7 +379,6 @@ void ExecuteSpawn(const SpawnRequest& req) {
     }
 
     bool isAir = IsAirUnit(canonical);
-    bool isTurret = IsTurretOrStationary(canonical);
 
     float defaultDist = isAir ? 400.0f : 25.0f;
     float defaultAlt = isAir ? 80.0f : 0.0f;
@@ -427,22 +426,8 @@ void ExecuteSpawn(const SpawnRequest& req) {
 
     bool spawned = false;
 
-    // 1. Static Turrets / Launchers (ShahedLauncher, Phalanx, Kashtan) -> Object.Instantiate on ground
-    if (isTurret) {
-        if (Object_Instantiate) {
-            LOGI("[C-RAM-MOD] Spawning stationary launcher/turret via Object.Instantiate...");
-            void* obj = Object_Instantiate(prefab, nullptr);
-            if (obj && Component_get_transform && Transform_set_position) {
-                void* tr = Component_get_transform(obj);
-                if (tr) {
-                    Transform_set_position(tr, spawnPos, nullptr);
-                }
-            }
-            spawned = true;
-        }
-    }
-    // 2. Air Units (Su-57, B-2, Shahed, AC-130, FPV, etc.)
-    else if (isAir) {
+    // 1. Air Units (Su-57, B-2, Shahed, AC-130, FPV, etc.)
+    if (isAir) {
         if (g_SpawnManagerInstance) {
             try {
                 if (req.setupAI && SpawnManager_SpawnAirUnit) {
@@ -460,7 +445,7 @@ void ExecuteSpawn(const SpawnRequest& req) {
             }
         }
     }
-    // 3. Ground Vehicles (DF-21D, Tor, Tunguska, Pantsir, Abrams, T-90, etc.)
+    // 2. Ground Vehicles, Launchers & Turrets (DF-21D, ShahedLauncher, Tor, Tunguska, Pantsir, Abrams, etc.)
     else {
         if (g_SpawnManagerInstance) {
             try {
@@ -628,7 +613,7 @@ void* socket_server_thread(void*) {
 
                 char reply[512];
                 if (strcasecmp(buf, "ping") == 0) {
-                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v4.5 Online\n");
+                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v4.6 Online\n");
                 } else if (strcasecmp(buf, "help") == 0) {
                     snprintf(reply, sizeof(reply),
                              "Commands:\n"
@@ -1019,7 +1004,7 @@ static uintptr_t getIl2CppBaseAddress() {
 // Hook Initialization Thread
 // -----------------------------------------------------------------------------
 void* thread(void*) {
-    LOGI("C-RAM Mod Thread Started (v4.5 - Ground & DF-21D Fixed)");
+    LOGI("C-RAM Mod Thread Started (v4.6 - Launchers & Turrets Fixed)");
 
     initModMenu((void*)DrawMenu);
 
@@ -1095,7 +1080,7 @@ void* thread(void*) {
     pthread_t sock_t;
     pthread_create(&sock_t, nullptr, socket_server_thread, nullptr);
 
-    LOGI("C-RAM v4.5 Hooks Installed: Lead ESP + Crash Guards + Camera Forward Aiming + TCP Server Ready!");
+    LOGI("C-RAM v4.6 Hooks Installed: Lead ESP + Crash Guards + Camera Forward Aiming + TCP Server Ready!");
     pthread_exit(nullptr);
 }
 
