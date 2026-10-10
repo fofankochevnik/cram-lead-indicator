@@ -868,8 +868,8 @@ void hook_EventSystem_Update(void* self) {
                 Input_get_mousePosition_Injected(&mPos);
             }
             // Unity mousePosition.y is inverted relative to top-left screen coordinates
-            float touchX = mPos.x;
-            float touchY = (float)sH - mPos.y;
+            float touchX = mPos.X;
+            float touchY = (float)sH - mPos.Y;
 
             if (touchX >= btnX && touchX <= (btnX + btnW) && touchY >= btnY && touchY <= (btnY + btnH)) {
                 shouldToggleGear = true;
