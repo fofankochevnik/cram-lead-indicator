@@ -80,6 +80,13 @@
 #define RVA_INVENTORY_AWAKE             0x38EAB78 // InventoryWrapper.Awake
 #define RVA_INVENTORY_ADDCURRENCY       0x38EB6C4 // InventoryWrapper.AddCurrency(int amount)
 
+// StageUI & Landing Gear Hooks
+#define RVA_TRANSFORM_GETPARENT         0x768C000 // UnityEngine.Transform.get_parent
+#define RVA_TRANSFORM_SETPARENT         0x768D1E0 // UnityEngine.Transform.SetParent(Transform parent, bool worldPositionStays)
+#define RVA_STAGEUI_AWAKE               0x3B77318 // StageUI.Awake
+#define RVA_STAGEUI_APPLYFLIGHTCONTROL  0x3B74168 // StageUI.ApplyFlightControlStyle
+#define RVA_STAGEUI_REFRESHUI           0x3B77A74 // StageUI.refreshUI
+
 // -----------------------------------------------------------------------------
 // Field Offsets from dump.cs & il2cpp.h (Updated for latest game version)
 // -----------------------------------------------------------------------------
@@ -159,6 +166,13 @@ typedef void* (*t_Component_get_gameObject)(void* self, void* method);
 typedef void (*t_InventoryWrapper_Awake)(void* self, void* method);
 typedef void (*t_InventoryWrapper_AddCurrency)(void* self, int amount, void* method);
 
+// StageUI & Transform pointers
+typedef void* (*t_Transform_get_parent)(void* self, void* method);
+typedef void (*t_Transform_SetParent)(void* self, void* parent, bool worldPositionStays, void* method);
+typedef void (*t_StageUI_Awake)(void* self, void* method);
+typedef void (*t_StageUI_ApplyFlightControlStyle)(void* self, void* method);
+typedef void (*t_StageUI_refreshUI)(void* self, void* method);
+
 static t_Camera_WorldToScreenPoint Camera_WorldToScreenPoint = nullptr;
 static t_Camera_get_main Camera_get_main = nullptr;
 static t_Component_get_transform Component_get_transform = nullptr;
@@ -202,6 +216,13 @@ static t_Component_get_gameObject Component_get_gameObject = nullptr;
 static t_InventoryWrapper_Awake orig_InventoryWrapper_Awake = nullptr;
 static t_InventoryWrapper_AddCurrency orig_InventoryWrapper_AddCurrency = nullptr;
 static t_InventoryWrapper_AddCurrency InventoryWrapper_AddCurrency = nullptr;
+
+static t_Transform_get_parent Transform_get_parent = nullptr;
+static t_Transform_SetParent Transform_SetParent = nullptr;
+static t_StageUI_Awake orig_StageUI_Awake = nullptr;
+static t_StageUI_ApplyFlightControlStyle orig_StageUI_ApplyFlightControlStyle = nullptr;
+static t_StageUI_refreshUI orig_StageUI_refreshUI = nullptr;
+static void* g_StageUIInstance = nullptr;
 
 // -----------------------------------------------------------------------------
 // Global State & Buffers
@@ -306,35 +327,44 @@ void hook_Joystick_Start(void* self, void* method) {
 void ApplyCockpitCursorSteering(void* seat, int cameraType) {
     if (!IsValidPtr(seat)) return;
 
+    void* parentSeatSys = *(void**)((uintptr_t)seat + 0x20); // VehicleSeat.parent
+    if (!IsValidPtr(parentSeatSys)) return;
+
+    void* unit = *(void**)((uintptr_t)parentSeatSys + 0x20); // SeatSystem.parent (IUnit)
+    if (!IsValidPtr(unit)) return;
+
+    // Helicopter & Non-airplane Safety: Check unit type
+    int uType = 0;
+    if (IUnit_GetUnitType) {
+        uType = IUnit_GetUnitType(unit, nullptr);
+    }
+    // Only apply arcade airplane steering if it is strictly an Air unit (3)
+    if (uType != 3) {
+        return;
+    }
+
     if (cameraType == 9) { // UNIT_FPS_POV (Cockpit View)
         // 1. Resolve aircraft & airplane
-        void* parentSeatSys = *(void**)((uintptr_t)seat + 0x20); // VehicleSeat.parent
-        if (IsValidPtr(parentSeatSys)) {
-            void* unit = *(void**)((uintptr_t)parentSeatSys + 0x20); // SeatSystem.parent (IUnit / AircraftMio)
-            if (IsValidPtr(unit)) {
-                // If it is an AircraftMio, set ArcadeCursor = 3
-                if (AircraftMio_SetAirCraftControllerType) {
-                    AircraftMio_SetAirCraftControllerType(unit, 3, nullptr);
-                    LOGI("[C-RAM-MOD] SetAirCraftControllerType(ArcadeCursor=3) applied in Cockpit POV!");
-                }
-                void* airplane = *(void**)((uintptr_t)unit + OFFSET_MIO_AIRPLANE); // AircraftMio.airplane
-                if (IsValidPtr(airplane)) {
-                    *(bool*)((uintptr_t)airplane + OFFSET_AIRPLANE_CURSORSTEERING) = true;
-                    LOGI("[C-RAM-MOD] airplane->cursorSteering forced to true in Cockpit POV!");
+        if (AircraftMio_SetAirCraftControllerType) {
+            AircraftMio_SetAirCraftControllerType(unit, 3, nullptr);
+            LOGI("[C-RAM-MOD] SetAirCraftControllerType(ArcadeCursor=3) applied in Cockpit POV!");
+        }
+        void* airplane = *(void**)((uintptr_t)unit + OFFSET_MIO_AIRPLANE); // AircraftMio.airplane
+        if (IsValidPtr(airplane)) {
+            *(bool*)((uintptr_t)airplane + OFFSET_AIRPLANE_CURSORSTEERING) = true;
+            LOGI("[C-RAM-MOD] airplane->cursorSteering forced to true in Cockpit POV!");
 
-                    // Ensure aimReticle and cursor GameObjects are active
-                    if (Component_get_gameObject && GameObject_SetActive) {
-                        void* reticle = *(void**)((uintptr_t)airplane + OFFSET_AIRPLANE_AIMRETICLE);
-                        if (IsValidPtr(reticle)) {
-                            void* reticleGO = Component_get_gameObject(reticle, nullptr);
-                            if (IsValidPtr(reticleGO)) GameObject_SetActive(reticleGO, true, nullptr);
-                        }
-                        void* cursor = *(void**)((uintptr_t)airplane + OFFSET_AIRPLANE_CURSOR);
-                        if (IsValidPtr(cursor)) {
-                            void* cursorGO = Component_get_gameObject(cursor, nullptr);
-                            if (IsValidPtr(cursorGO)) GameObject_SetActive(cursorGO, true, nullptr);
-                        }
-                    }
+            // Ensure aimReticle and cursor GameObjects are active
+            if (Component_get_gameObject && GameObject_SetActive) {
+                void* reticle = *(void**)((uintptr_t)airplane + OFFSET_AIRPLANE_AIMRETICLE);
+                if (IsValidPtr(reticle)) {
+                    void* reticleGO = Component_get_gameObject(reticle, nullptr);
+                    if (IsValidPtr(reticleGO)) GameObject_SetActive(reticleGO, true, nullptr);
+                }
+                void* cursor = *(void**)((uintptr_t)airplane + OFFSET_AIRPLANE_CURSOR);
+                if (IsValidPtr(cursor)) {
+                    void* cursorGO = Component_get_gameObject(cursor, nullptr);
+                    if (IsValidPtr(cursorGO)) GameObject_SetActive(cursorGO, true, nullptr);
                 }
             }
         }
@@ -420,21 +450,86 @@ void hook_CameraManager_SetCamera(void* self, int gameCameraType, void* follow, 
 // -----------------------------------------------------------------------------
 void hook_Airplane_FixedUpdate(void* self, void* method) {
     if (IsValidPtr(self)) {
-        int curCam = g_CurrentCameraType.load();
-        if (curCam == 0 && IsValidPtr(g_CameraManagerInstance)) {
-            curCam = *(int*)((uintptr_t)g_CameraManagerInstance + 0x1B8);
-        }
-        if (curCam == 9) { // In Cockpit POV
-            *(bool*)((uintptr_t)self + OFFSET_AIRPLANE_CURSORSTEERING) = true;
-            void* parentMio = *(void**)((uintptr_t)self + OFFSET_AIRPLANE_PARENT);
-            if (IsValidPtr(parentMio)) {
-                *(int*)((uintptr_t)parentMio + OFFSET_MIO_CONTROLLERTYPE) = 3; // ArcadeCursor
+        void* parentMio = *(void**)((uintptr_t)self + OFFSET_AIRPLANE_PARENT);
+        if (IsValidPtr(parentMio)) {
+            int uType = IUnit_GetUnitType ? IUnit_GetUnitType(parentMio, nullptr) : 0;
+            if (uType == 3) { // Air only
+                int curCam = g_CurrentCameraType.load();
+                if (curCam == 0 && IsValidPtr(g_CameraManagerInstance)) {
+                    curCam = *(int*)((uintptr_t)g_CameraManagerInstance + 0x1B8);
+                }
+                if (curCam == 9) { // In Cockpit POV
+                    *(bool*)((uintptr_t)self + OFFSET_AIRPLANE_CURSORSTEERING) = true;
+                    *(int*)((uintptr_t)parentMio + OFFSET_MIO_CONTROLLERTYPE) = 3; // ArcadeCursor
+                }
             }
         }
     }
     if (orig_Airplane_FixedUpdate) {
         orig_Airplane_FixedUpdate(self, method);
     }
+}
+
+// -----------------------------------------------------------------------------
+// StageUI & Landing Gear Button Support for Simplified (Arcade) Mode
+// -----------------------------------------------------------------------------
+void EnsureLandingGearButtonVisible(void* stageUI) {
+    if (!IsValidPtr(stageUI)) return;
+
+    void* gearBtn = *(void**)((uintptr_t)stageUI + 0x1A8); // StageUI.LandingGearButton
+    if (!IsValidPtr(gearBtn)) return;
+
+    if (!Component_get_gameObject || !GameObject_SetActive || !Component_get_transform) return;
+
+    void* gearGO = Component_get_gameObject(gearBtn, nullptr);
+    if (!IsValidPtr(gearGO)) return;
+
+    void* gearTr = Component_get_transform(gearGO, nullptr);
+    if (!IsValidPtr(gearTr)) return;
+
+    // Reparent to mobileCommon (0x58) so it stays active across realistic and arcade modes
+    void* mobileCommonGO = *(void**)((uintptr_t)stageUI + 0x58); // StageUI.mobileCommon
+    if (IsValidPtr(mobileCommonGO) && Transform_SetParent && Transform_get_parent) {
+        void* mobileCommonTr = Component_get_transform(mobileCommonGO, nullptr);
+        void* currentParentTr = Transform_get_parent(gearTr, nullptr);
+        if (IsValidPtr(mobileCommonTr) && currentParentTr != mobileCommonTr) {
+            Transform_SetParent(gearTr, mobileCommonTr, true, nullptr); // worldPositionStays = true
+            LOGI("[C-RAM-MOD] LandingGearButton reparented to mobileCommon (exact screen position preserved)!");
+        }
+    }
+
+    // Check player unit: show button if player is in an Airplane (3) or Heli (6)
+    void* playerUnit = *(void**)((uintptr_t)stageUI + 0x2A0); // StageUI.playerUnit
+    if (IsValidPtr(playerUnit)) {
+        int uType = IUnit_GetUnitType ? IUnit_GetUnitType(playerUnit, nullptr) : 0;
+        if (uType == 3 || uType == 6) { // Air (3) or Heli (6)
+            GameObject_SetActive(gearGO, true, nullptr);
+        }
+    }
+}
+
+void hook_StageUI_Awake(void* self, void* method) {
+    g_StageUIInstance = self;
+    LOGI("[C-RAM-MOD] StageUI::Awake captured! Instance: %p", self);
+    if (orig_StageUI_Awake) {
+        orig_StageUI_Awake(self, method);
+    }
+}
+
+void hook_StageUI_ApplyFlightControlStyle(void* self, void* method) {
+    g_StageUIInstance = self;
+    if (orig_StageUI_ApplyFlightControlStyle) {
+        orig_StageUI_ApplyFlightControlStyle(self, method);
+    }
+    EnsureLandingGearButtonVisible(self);
+}
+
+void hook_StageUI_refreshUI(void* self, void* method) {
+    g_StageUIInstance = self;
+    if (orig_StageUI_refreshUI) {
+        orig_StageUI_refreshUI(self, method);
+    }
+    EnsureLandingGearButtonVisible(self);
 }
 
 // -----------------------------------------------------------------------------
@@ -789,6 +884,11 @@ void hook_EventSystem_Update(void* self) {
         } else {
             LOGE("[C-RAM-MOD] InventoryWrapper instance or AddCurrency function not ready!");
         }
+    }
+
+    // 4. Ensure Landing Gear Button Visible in Arcade Mode
+    if (IsValidPtr(g_StageUIInstance)) {
+        EnsureLandingGearButtonVisible(g_StageUIInstance);
     }
 }
 
@@ -1369,11 +1469,25 @@ void* thread(void*) {
     void* targetRotatingSensor = (void*)(g_Il2CppBase + RVA_ROTATING_SENSOR_UPDATE);
     DobbyHook(targetRotatingSensor, (void*)hook_RotatingSensor_Update, (void**)&orig_RotatingSensor_Update);
 
-    // 10. Start ADB Socket Listener Thread on 0.0.0.0:8888
+    // Transform hierarchy pointers
+    Transform_get_parent = (t_Transform_get_parent)(g_Il2CppBase + RVA_TRANSFORM_GETPARENT);
+    Transform_SetParent = (t_Transform_SetParent)(g_Il2CppBase + RVA_TRANSFORM_SETPARENT);
+
+    // 10. Hook StageUI for Landing Gear Button in Arcade Mode
+    void* targetStageUIAwake = (void*)(g_Il2CppBase + RVA_STAGEUI_AWAKE);
+    DobbyHook(targetStageUIAwake, (void*)hook_StageUI_Awake, (void**)&orig_StageUI_Awake);
+
+    void* targetStageUIApply = (void*)(g_Il2CppBase + RVA_STAGEUI_APPLYFLIGHTCONTROL);
+    DobbyHook(targetStageUIApply, (void*)hook_StageUI_ApplyFlightControlStyle, (void**)&orig_StageUI_ApplyFlightControlStyle);
+
+    void* targetStageUIRefresh = (void*)(g_Il2CppBase + RVA_STAGEUI_REFRESHUI);
+    DobbyHook(targetStageUIRefresh, (void*)hook_StageUI_refreshUI, (void**)&orig_StageUI_refreshUI);
+
+    // 11. Start ADB Socket Listener Thread on 0.0.0.0:8888
     pthread_t sock_t;
     pthread_create(&sock_t, nullptr, socket_server_thread, nullptr);
 
-    LOGI("C-RAM v5.0 Hooks Installed: Cockpit Steering + Lead ESP + Economy Give + TCP Server Ready!");
+    LOGI("C-RAM v5.1 Hooks Installed: Cockpit Steering + Lead ESP + Economy Give + Arcade Landing Gear Ready!");
     pthread_exit(nullptr);
 }
 
