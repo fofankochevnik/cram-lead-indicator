@@ -851,16 +851,16 @@ void hook_EventSystem_Update(void* self) {
 
     bool shouldToggleGear = g_PendingGearToggle.exchange(false);
 
-    if (playerUnitType == 3 || playerUnitType == 6) {
+    if (playerUnitType == 3) {
         int sW = Screen_get_width ? Screen_get_width(nullptr) : glWidth;
         int sH = Screen_get_height ? Screen_get_height(nullptr) : glHeight;
         if (sW <= 0) sW = 1920;
         if (sH <= 0) sH = 1080;
 
-        float btnW = 100.0f;
-        float btnH = 46.0f;
-        float btnX = (float)sW - btnW - 30.0f;
-        float btnY = (float)sH * 0.35f;
+        float btnX = (float)sW * 0.0957f;
+        float btnY = (float)sH * 0.5348f;
+        float btnW = (float)sW * 0.0820f;
+        float btnH = (float)sH * 0.0870f;
 
         if (Input_GetMouseButtonDown && Input_GetMouseButtonDown(0, nullptr)) {
             Vector3 mPos(0, 0, 0);
@@ -1266,22 +1266,28 @@ void DrawMenu() {
     float screenWidth = (glWidth > 0) ? (float)glWidth : ImGui::GetIO().DisplaySize.x;
     float screenHeight = (glHeight > 0) ? (float)glHeight : ImGui::GetIO().DisplaySize.y;
 
-    // Draw Landing Gear Button when player is in Airplane (3) or Helicopter (6)
+    // Draw exact native-style LDG Button when player is in Airplane (3)
     int pType = g_ActivePlayerUnitType.load();
-    if (pType == 3 || pType == 6) {
-        float btnW = 100.0f;
-        float btnH = 46.0f;
-        float btnX = (screenWidth > 0) ? (screenWidth - btnW - 30.0f) : 1780.0f;
-        float btnY = (screenHeight > 0) ? (screenHeight * 0.35f) : 380.0f;
+    if (pType == 3) {
+        float btnX = screenWidth * 0.0957f;
+        float btnY = screenHeight * 0.5348f;
+        float btnW = screenWidth * 0.0820f;
+        float btnH = screenHeight * 0.0870f;
 
         bool isFlashing = (std::time(nullptr) <= g_GearButtonFlashTime.load());
-        ImU32 bgColor = isFlashing ? IM_COL32(50, 205, 50, 220) : IM_COL32(30, 35, 45, 175);
-        ImU32 borderColor = isFlashing ? IM_COL32(255, 255, 255, 255) : IM_COL32(100, 215, 255, 220);
-        ImU32 textColor = isFlashing ? IM_COL32(0, 0, 0, 255) : IM_COL32(255, 255, 255, 255);
+        ImU32 bgColor = isFlashing ? IM_COL32(180, 200, 230, 150) : IM_COL32(20, 25, 30, 95);
+        ImU32 borderColor = isFlashing ? IM_COL32(255, 255, 255, 255) : IM_COL32(230, 235, 240, 210);
+        ImU32 textColor = isFlashing ? IM_COL32(255, 255, 255, 255) : IM_COL32(245, 245, 250, 240);
 
-        draw->AddRectFilled(ImVec2(btnX, btnY), ImVec2(btnX + btnW, btnY + btnH), bgColor, 8.0f);
-        draw->AddRect(ImVec2(btnX, btnY), ImVec2(btnX + btnW, btnY + btnH), borderColor, 8.0f, 0, 2.0f);
-        draw->AddText(ImVec2(btnX + 22.0f, btnY + 11.0f), textColor, "GEAR");
+        // Rectangular box with thin outline (matching FILR, LDG, AOA+, TRK)
+        draw->AddRectFilled(ImVec2(btnX, btnY), ImVec2(btnX + btnW, btnY + btnH), bgColor, 0.0f);
+        draw->AddRect(ImVec2(btnX, btnY), ImVec2(btnX + btnW, btnY + btnH), borderColor, 0.0f, 0, 1.5f);
+
+        // Centered exact text "LDG"
+        ImVec2 textSize = ImGui::CalcTextSize("LDG");
+        float tx = btnX + (btnW - textSize.x) * 0.5f;
+        float ty = btnY + (btnH - textSize.y) * 0.5f;
+        draw->AddText(ImVec2(tx, ty), textColor, "LDG");
     }
 
     int readIdx = g_ActiveBufferIdx.load();
