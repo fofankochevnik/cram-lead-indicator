@@ -80,12 +80,13 @@
 #define RVA_INVENTORY_AWAKE             0x38EAB78 // InventoryWrapper.Awake
 #define RVA_INVENTORY_ADDCURRENCY       0x38EB6C4 // InventoryWrapper.AddCurrency(int amount)
 
-// StageUI & Landing Gear Hooks
-#define RVA_TRANSFORM_GETPARENT         0x768C000 // UnityEngine.Transform.get_parent
-#define RVA_TRANSFORM_SETPARENT         0x768D1E0 // UnityEngine.Transform.SetParent(Transform parent, bool worldPositionStays)
-#define RVA_STAGEUI_AWAKE               0x3B77318 // StageUI.Awake
-#define RVA_STAGEUI_APPLYFLIGHTCONTROL  0x3B74168 // StageUI.ApplyFlightControlStyle
-#define RVA_STAGEUI_REFRESHUI           0x3B77A74 // StageUI.refreshUI
+// Landing Gear & Screen/Input RVAs
+#define RVA_AIRCRAFTMIO_TOGGLEGEAR      0x3B24E7C // AircraftMio.ToggleLandingGear
+#define RVA_HELICOPTERMIO_TOGGLEGEAR    0x3B3559C // HelicopterMio.ToggleLandingGear
+#define RVA_INPUT_GETMOUSEBUTTONDOWN    0x7704724 // UnityEngine.Input.GetMouseButtonDown
+#define RVA_INPUT_GETMOUSEPOS_INJ       0x7704D94 // UnityEngine.Input.get_mousePosition_Injected
+#define RVA_SCREEN_GETWIDTH             0x7614088 // UnityEngine.Screen.get_width
+#define RVA_SCREEN_GETHEIGHT            0x76140B0 // UnityEngine.Screen.get_height
 
 // -----------------------------------------------------------------------------
 // Field Offsets from dump.cs & il2cpp.h (Updated for latest game version)
@@ -166,12 +167,13 @@ typedef void* (*t_Component_get_gameObject)(void* self, void* method);
 typedef void (*t_InventoryWrapper_Awake)(void* self, void* method);
 typedef void (*t_InventoryWrapper_AddCurrency)(void* self, int amount, void* method);
 
-// StageUI & Transform pointers
-typedef void* (*t_Transform_get_parent)(void* self, void* method);
-typedef void (*t_Transform_SetParent)(void* self, void* parent, bool worldPositionStays, void* method);
-typedef void (*t_StageUI_Awake)(void* self, void* method);
-typedef void (*t_StageUI_ApplyFlightControlStyle)(void* self, void* method);
-typedef void (*t_StageUI_refreshUI)(void* self, void* method);
+// Landing Gear & Screen/Input pointers
+typedef void (*t_AircraftMio_ToggleLandingGear)(void* self, void* method);
+typedef void (*t_HelicopterMio_ToggleLandingGear)(void* self, void* method);
+typedef bool (*t_Input_GetMouseButtonDown)(int button, void* method);
+typedef void (*t_Input_get_mousePosition_Injected)(Vector3* ret);
+typedef int (*t_Screen_get_width)(void* method);
+typedef int (*t_Screen_get_height)(void* method);
 
 static t_Camera_WorldToScreenPoint Camera_WorldToScreenPoint = nullptr;
 static t_Camera_get_main Camera_get_main = nullptr;
@@ -217,12 +219,16 @@ static t_InventoryWrapper_Awake orig_InventoryWrapper_Awake = nullptr;
 static t_InventoryWrapper_AddCurrency orig_InventoryWrapper_AddCurrency = nullptr;
 static t_InventoryWrapper_AddCurrency InventoryWrapper_AddCurrency = nullptr;
 
-static t_Transform_get_parent Transform_get_parent = nullptr;
-static t_Transform_SetParent Transform_SetParent = nullptr;
-static t_StageUI_Awake orig_StageUI_Awake = nullptr;
-static t_StageUI_ApplyFlightControlStyle orig_StageUI_ApplyFlightControlStyle = nullptr;
-static t_StageUI_refreshUI orig_StageUI_refreshUI = nullptr;
-static void* g_StageUIInstance = nullptr;
+static t_AircraftMio_ToggleLandingGear AircraftMio_ToggleLandingGear = nullptr;
+static t_HelicopterMio_ToggleLandingGear HelicopterMio_ToggleLandingGear = nullptr;
+static t_Input_GetMouseButtonDown Input_GetMouseButtonDown = nullptr;
+static t_Input_get_mousePosition_Injected Input_get_mousePosition_Injected = nullptr;
+static t_Screen_get_width Screen_get_width = nullptr;
+static t_Screen_get_height Screen_get_height = nullptr;
+
+static std::atomic<int> g_ActivePlayerUnitType{0};
+static std::atomic<bool> g_PendingGearToggle{false};
+static std::atomic<std::time_t> g_GearButtonFlashTime{0};
 
 // -----------------------------------------------------------------------------
 // Global State & Buffers
@@ -470,67 +476,6 @@ void hook_Airplane_FixedUpdate(void* self, void* method) {
     }
 }
 
-// -----------------------------------------------------------------------------
-// StageUI & Landing Gear Button Support for Simplified (Arcade) Mode
-// -----------------------------------------------------------------------------
-void EnsureLandingGearButtonVisible(void* stageUI) {
-    if (!IsValidPtr(stageUI)) return;
-
-    void* gearBtn = *(void**)((uintptr_t)stageUI + 0x1A8); // StageUI.LandingGearButton
-    if (!IsValidPtr(gearBtn)) return;
-
-    if (!Component_get_gameObject || !GameObject_SetActive || !Component_get_transform) return;
-
-    void* gearGO = Component_get_gameObject(gearBtn, nullptr);
-    if (!IsValidPtr(gearGO)) return;
-
-    void* gearTr = Component_get_transform(gearGO);
-    if (!IsValidPtr(gearTr)) return;
-
-    // Reparent to mobileCommon (0x58) so it stays active across realistic and arcade modes
-    void* mobileCommonGO = *(void**)((uintptr_t)stageUI + 0x58); // StageUI.mobileCommon
-    if (IsValidPtr(mobileCommonGO) && Transform_SetParent && Transform_get_parent) {
-        void* mobileCommonTr = Component_get_transform(mobileCommonGO);
-        void* currentParentTr = Transform_get_parent(gearTr, nullptr);
-        if (IsValidPtr(mobileCommonTr) && currentParentTr != mobileCommonTr) {
-            Transform_SetParent(gearTr, mobileCommonTr, true, nullptr); // worldPositionStays = true
-            LOGI("[C-RAM-MOD] LandingGearButton reparented to mobileCommon (exact screen position preserved)!");
-        }
-    }
-
-    // Check player unit: show button if player is in an Airplane (3) or Heli (6)
-    void* playerUnit = *(void**)((uintptr_t)stageUI + 0x2A0); // StageUI.playerUnit
-    if (IsValidPtr(playerUnit)) {
-        int uType = IUnit_GetUnitType ? IUnit_GetUnitType(playerUnit) : 0;
-        if (uType == 3 || uType == 6) { // Air (3) or Heli (6)
-            GameObject_SetActive(gearGO, true, nullptr);
-        }
-    }
-}
-
-void hook_StageUI_Awake(void* self, void* method) {
-    g_StageUIInstance = self;
-    LOGI("[C-RAM-MOD] StageUI::Awake captured! Instance: %p", self);
-    if (orig_StageUI_Awake) {
-        orig_StageUI_Awake(self, method);
-    }
-}
-
-void hook_StageUI_ApplyFlightControlStyle(void* self, void* method) {
-    g_StageUIInstance = self;
-    if (orig_StageUI_ApplyFlightControlStyle) {
-        orig_StageUI_ApplyFlightControlStyle(self, method);
-    }
-    EnsureLandingGearButtonVisible(self);
-}
-
-void hook_StageUI_refreshUI(void* self, void* method) {
-    g_StageUIInstance = self;
-    if (orig_StageUI_refreshUI) {
-        orig_StageUI_refreshUI(self, method);
-    }
-    EnsureLandingGearButtonVisible(self);
-}
 
 // -----------------------------------------------------------------------------
 // Component Safety Guards (Eliminates NullReferenceExceptions on Ground Units)
@@ -886,9 +831,61 @@ void hook_EventSystem_Update(void* self) {
         }
     }
 
-    // 4. Ensure Landing Gear Button Visible in Arcade Mode
-    if (IsValidPtr(g_StageUIInstance)) {
-        EnsureLandingGearButtonVisible(g_StageUIInstance);
+    // 4. Safe Landing Gear Toggle Handling (Screen Touch & TCP Command)
+    void* playerUnit = nullptr;
+    int playerUnitType = 0;
+    if (IsValidPtr(g_CameraManagerInstance)) {
+        void* seat = *(void**)((uintptr_t)g_CameraManagerInstance + 0x1A0); // CameraManager.selectedSeat
+        if (IsValidPtr(seat)) {
+            void* parentSeatSys = *(void**)((uintptr_t)seat + 0x20); // VehicleSeat.parent
+            if (IsValidPtr(parentSeatSys)) {
+                playerUnit = *(void**)((uintptr_t)parentSeatSys + 0x20); // SeatSystem.parent (IUnit)
+                if (IsValidPtr(playerUnit) && IUnit_GetUnitType) {
+                    playerUnitType = IUnit_GetUnitType(playerUnit);
+                }
+            }
+        }
+    }
+
+    g_ActivePlayerUnitType.store(playerUnitType);
+
+    bool shouldToggleGear = g_PendingGearToggle.exchange(false);
+
+    if (playerUnitType == 3 || playerUnitType == 6) {
+        int sW = Screen_get_width ? Screen_get_width(nullptr) : glWidth;
+        int sH = Screen_get_height ? Screen_get_height(nullptr) : glHeight;
+        if (sW <= 0) sW = 1920;
+        if (sH <= 0) sH = 1080;
+
+        float btnW = 100.0f;
+        float btnH = 46.0f;
+        float btnX = (float)sW - btnW - 30.0f;
+        float btnY = (float)sH * 0.35f;
+
+        if (Input_GetMouseButtonDown && Input_GetMouseButtonDown(0, nullptr)) {
+            Vector3 mPos(0, 0, 0);
+            if (Input_get_mousePosition_Injected) {
+                Input_get_mousePosition_Injected(&mPos);
+            }
+            // Unity mousePosition.y is inverted relative to top-left screen coordinates
+            float touchX = mPos.x;
+            float touchY = (float)sH - mPos.y;
+
+            if (touchX >= btnX && touchX <= (btnX + btnW) && touchY >= btnY && touchY <= (btnY + btnH)) {
+                shouldToggleGear = true;
+                g_GearButtonFlashTime.store(std::time(nullptr) + 1);
+            }
+        }
+    }
+
+    if (shouldToggleGear && IsValidPtr(playerUnit)) {
+        if (playerUnitType == 3 && AircraftMio_ToggleLandingGear) {
+            AircraftMio_ToggleLandingGear(playerUnit, nullptr);
+            LOGI("[C-RAM-MOD] AircraftMio::ToggleLandingGear triggered!");
+        } else if (playerUnitType == 6 && HelicopterMio_ToggleLandingGear) {
+            HelicopterMio_ToggleLandingGear(playerUnit, nullptr);
+            LOGI("[C-RAM-MOD] HelicopterMio::ToggleLandingGear triggered!");
+        }
     }
 }
 
@@ -1043,6 +1040,9 @@ void* socket_server_thread(void*) {
                 } else if (strcasecmp(buf, "mp") == 0) {
                     g_OpenMultiplayerRequested.store(true);
                     snprintf(reply, sizeof(reply), "OK: Multiplayer Triggered\n");
+                } else if (strcasecmp(buf, "gear") == 0) {
+                    g_PendingGearToggle.store(true);
+                    snprintf(reply, sizeof(reply), "OK: Landing gear toggle requested\n");
                 } else {
                     snprintf(reply, sizeof(reply), "UNKNOWN COMMAND: '%s'. Type 'help' or 'list'\n", buf);
                 }
@@ -1263,6 +1263,27 @@ void DrawMenu() {
     ImDrawList* draw = ImGui::GetBackgroundDrawList();
     if (!draw) return;
 
+    float screenWidth = (glWidth > 0) ? (float)glWidth : ImGui::GetIO().DisplaySize.x;
+    float screenHeight = (glHeight > 0) ? (float)glHeight : ImGui::GetIO().DisplaySize.y;
+
+    // Draw Landing Gear Button when player is in Airplane (3) or Helicopter (6)
+    int pType = g_ActivePlayerUnitType.load();
+    if (pType == 3 || pType == 6) {
+        float btnW = 100.0f;
+        float btnH = 46.0f;
+        float btnX = (screenWidth > 0) ? (screenWidth - btnW - 30.0f) : 1780.0f;
+        float btnY = (screenHeight > 0) ? (screenHeight * 0.35f) : 380.0f;
+
+        bool isFlashing = (std::time(nullptr) <= g_GearButtonFlashTime.load());
+        ImU32 bgColor = isFlashing ? IM_COL32(50, 205, 50, 220) : IM_COL32(30, 35, 45, 175);
+        ImU32 borderColor = isFlashing ? IM_COL32(255, 255, 255, 255) : IM_COL32(100, 215, 255, 220);
+        ImU32 textColor = isFlashing ? IM_COL32(0, 0, 0, 255) : IM_COL32(255, 255, 255, 255);
+
+        draw->AddRectFilled(ImVec2(btnX, btnY), ImVec2(btnX + btnW, btnY + btnH), bgColor, 8.0f);
+        draw->AddRect(ImVec2(btnX, btnY), ImVec2(btnX + btnW, btnY + btnH), borderColor, 8.0f, 0, 2.0f);
+        draw->AddText(ImVec2(btnX + 22.0f, btnY + 11.0f), textColor, "GEAR");
+    }
+
     int readIdx = g_ActiveBufferIdx.load();
     int count = g_TargetsCount[readIdx];
     if (count <= 0) return;
@@ -1469,25 +1490,19 @@ void* thread(void*) {
     void* targetRotatingSensor = (void*)(g_Il2CppBase + RVA_ROTATING_SENSOR_UPDATE);
     DobbyHook(targetRotatingSensor, (void*)hook_RotatingSensor_Update, (void**)&orig_RotatingSensor_Update);
 
-    // Transform hierarchy pointers
-    Transform_get_parent = (t_Transform_get_parent)(g_Il2CppBase + RVA_TRANSFORM_GETPARENT);
-    Transform_SetParent = (t_Transform_SetParent)(g_Il2CppBase + RVA_TRANSFORM_SETPARENT);
-
-    // 10. Hook StageUI for Landing Gear Button in Arcade Mode
-    void* targetStageUIAwake = (void*)(g_Il2CppBase + RVA_STAGEUI_AWAKE);
-    DobbyHook(targetStageUIAwake, (void*)hook_StageUI_Awake, (void**)&orig_StageUI_Awake);
-
-    void* targetStageUIApply = (void*)(g_Il2CppBase + RVA_STAGEUI_APPLYFLIGHTCONTROL);
-    DobbyHook(targetStageUIApply, (void*)hook_StageUI_ApplyFlightControlStyle, (void**)&orig_StageUI_ApplyFlightControlStyle);
-
-    void* targetStageUIRefresh = (void*)(g_Il2CppBase + RVA_STAGEUI_REFRESHUI);
-    DobbyHook(targetStageUIRefresh, (void*)hook_StageUI_refreshUI, (void**)&orig_StageUI_refreshUI);
+    // 10. Landing Gear & Screen/Input Pointers
+    AircraftMio_ToggleLandingGear = (t_AircraftMio_ToggleLandingGear)(g_Il2CppBase + RVA_AIRCRAFTMIO_TOGGLEGEAR);
+    HelicopterMio_ToggleLandingGear = (t_HelicopterMio_ToggleLandingGear)(g_Il2CppBase + RVA_HELICOPTERMIO_TOGGLEGEAR);
+    Input_GetMouseButtonDown = (t_Input_GetMouseButtonDown)(g_Il2CppBase + RVA_INPUT_GETMOUSEBUTTONDOWN);
+    Input_get_mousePosition_Injected = (t_Input_get_mousePosition_Injected)(g_Il2CppBase + RVA_INPUT_GETMOUSEPOS_INJ);
+    Screen_get_width = (t_Screen_get_width)(g_Il2CppBase + RVA_SCREEN_GETWIDTH);
+    Screen_get_height = (t_Screen_get_height)(g_Il2CppBase + RVA_SCREEN_GETHEIGHT);
 
     // 11. Start ADB Socket Listener Thread on 0.0.0.0:8888
     pthread_t sock_t;
     pthread_create(&sock_t, nullptr, socket_server_thread, nullptr);
 
-    LOGI("C-RAM v5.1 Hooks Installed: Cockpit Steering + Lead ESP + Economy Give + Arcade Landing Gear Ready!");
+    LOGI("C-RAM v5.2 Hooks Installed: Cockpit Steering + Lead ESP + Economy Give + Heli Safety + Arcade Landing Gear Ready!");
     pthread_exit(nullptr);
 }
 
