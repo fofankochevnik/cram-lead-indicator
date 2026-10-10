@@ -83,6 +83,8 @@
 // Landing Gear & Screen/Input RVAs
 #define RVA_AIRCRAFTMIO_TOGGLEGEAR      0x3B24E7C // AircraftMio.ToggleLandingGear
 #define RVA_HELICOPTERMIO_TOGGLEGEAR    0x3B3559C // HelicopterMio.ToggleLandingGear
+#define RVA_STAGEUI_TYPEINFO            0x08110330 // StageUI_TypeInfo (metadata class pointer)
+#define RVA_OBJECT_INSTANTIATE_PARENT   0x7682438  // UnityEngine.Object.Instantiate(Object original, Transform parent, bool instantiateInWorldSpace)
 #define RVA_INPUT_GETMOUSEBUTTONDOWN    0x7704724 // UnityEngine.Input.GetMouseButtonDown
 #define RVA_INPUT_GETMOUSEPOS_INJ       0x7704D94 // UnityEngine.Input.get_mousePosition_Injected
 #define RVA_SCREEN_GETWIDTH             0x7614088 // UnityEngine.Screen.get_width
@@ -170,11 +172,13 @@ typedef void (*t_InventoryWrapper_AddCurrency)(void* self, int amount, void* met
 // Landing Gear & Screen/Input pointers
 typedef void (*t_AircraftMio_ToggleLandingGear)(void* self, void* method);
 typedef void (*t_HelicopterMio_ToggleLandingGear)(void* self, void* method);
+typedef void* (*t_Object_Instantiate_Parent)(void* original, void* parent, bool instantiateInWorldSpace, void* method);
 typedef bool (*t_Input_GetMouseButtonDown)(int button, void* method);
 typedef void (*t_Input_get_mousePosition_Injected)(Vector3* ret);
 typedef int (*t_Screen_get_width)(void* method);
 typedef int (*t_Screen_get_height)(void* method);
 
+static t_Object_Instantiate_Parent Object_Instantiate_Parent = nullptr;
 static t_Camera_WorldToScreenPoint Camera_WorldToScreenPoint = nullptr;
 static t_Camera_get_main Camera_get_main = nullptr;
 static t_Component_get_transform Component_get_transform = nullptr;
@@ -849,42 +853,76 @@ void hook_EventSystem_Update(void* self) {
 
     g_ActivePlayerUnitType.store(playerUnitType);
 
-    bool shouldToggleGear = g_PendingGearToggle.exchange(false);
+    // 5. StageUI: Clone native LandingGearButton into mobileArcadeAircraft for Arcade (Simplified) Airplane Mode
+    static void* s_LastStageUI = nullptr;
+    static void* s_ClonedGearButtonComp = nullptr;
+    static bool s_PrevHeld = false;
+    static uint64_t s_LastGearToggleMs = 0;
 
-    if (playerUnitType == 3) {
-        int sW = Screen_get_width ? Screen_get_width(nullptr) : glWidth;
-        int sH = Screen_get_height ? Screen_get_height(nullptr) : glHeight;
-        if (sW <= 0) sW = 1920;
-        if (sH <= 0) sH = 1080;
+    void* stageUI = nullptr;
+    void** pStageUI_Class = (void**)(g_Il2CppBase + RVA_STAGEUI_TYPEINFO);
+    if (IsValidPtr(pStageUI_Class) && IsValidPtr(*pStageUI_Class)) {
+        void* klass = *pStageUI_Class;
+        void** pStatics = *(void***)((uintptr_t)klass + 0xB8); // StageUI_c.static_fields
+        if (IsValidPtr(pStatics)) {
+            stageUI = pStatics[0]; // StageUI.instance
+        }
+    }
 
-        float btnX = (float)sW * 0.0957f;
-        float btnY = (float)sH * 0.5348f;
-        float btnW = (float)sW * 0.0820f;
-        float btnH = (float)sH * 0.0870f;
+    // Reset when exiting match or entering a new match
+    if (stageUI != s_LastStageUI) {
+        s_LastStageUI = stageUI;
+        s_ClonedGearButtonComp = nullptr;
+        s_PrevHeld = false;
+    }
 
-        if (Input_GetMouseButtonDown && Input_GetMouseButtonDown(0, nullptr)) {
-            Vector3 mPos(0, 0, 0);
-            if (Input_get_mousePosition_Injected) {
-                Input_get_mousePosition_Injected(&mPos);
-            }
-            // Unity mousePosition.y is inverted relative to top-left screen coordinates
-            float touchX = mPos.X;
-            float touchY = (float)sH - mPos.Y;
+    if (IsValidPtr(stageUI)) {
+        void* origLdgBtn = *(void**)((uintptr_t)stageUI + 0x1A8);      // StageUI.LandingGearButton (ToggleOrHoldButton)
+        void* arcadeAircraftGO = *(void**)((uintptr_t)stageUI + 0x68); // StageUI.mobileArcadeAircraft (GameObject)
 
-            if (touchX >= btnX && touchX <= (btnX + btnW) && touchY >= btnY && touchY <= (btnY + btnH)) {
-                shouldToggleGear = true;
-                g_GearButtonFlashTime.store(std::time(nullptr) + 1);
+        if (IsValidPtr(origLdgBtn) && IsValidPtr(arcadeAircraftGO) && s_ClonedGearButtonComp == nullptr) {
+            if (GameObject_get_transform && Object_Instantiate_Parent) {
+                void* arcadeTr = GameObject_get_transform(arcadeAircraftGO);
+                if (IsValidPtr(arcadeTr)) {
+                    // Instantiate exact clone of native LandingGearButton as child of mobileArcadeAircraft
+                    // worldPositionStays = false preserves exact native RectTransform layout, sizing, and styling
+                    void* clonedComp = Object_Instantiate_Parent(origLdgBtn, arcadeTr, false, nullptr);
+                    if (IsValidPtr(clonedComp)) {
+                        s_ClonedGearButtonComp = clonedComp;
+                        LOGI("[C-RAM-MOD] Successfully cloned native LandingGearButton into mobileArcadeAircraft!");
+                    }
+                }
             }
         }
     }
 
+    // 6. Handle Landing Gear Toggle from Cloned Button Touch OR TCP Command
+    bool shouldToggleGear = g_PendingGearToggle.exchange(false);
+
+    if (IsValidPtr(s_ClonedGearButtonComp)) {
+        // ToggleOrHoldButton._held is at offset 0x91
+        bool isHeld = *(bool*)((uintptr_t)s_ClonedGearButtonComp + 0x91);
+        if (isHeld && !s_PrevHeld) {
+            shouldToggleGear = true;
+        }
+        s_PrevHeld = isHeld;
+    }
+
     if (shouldToggleGear && IsValidPtr(playerUnit)) {
-        if (playerUnitType == 3 && AircraftMio_ToggleLandingGear) {
-            AircraftMio_ToggleLandingGear(playerUnit, nullptr);
-            LOGI("[C-RAM-MOD] AircraftMio::ToggleLandingGear triggered!");
-        } else if (playerUnitType == 6 && HelicopterMio_ToggleLandingGear) {
-            HelicopterMio_ToggleLandingGear(playerUnit, nullptr);
-            LOGI("[C-RAM-MOD] HelicopterMio::ToggleLandingGear triggered!");
+        uint64_t nowMs = 0;
+        struct timespec ts;
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+            nowMs = (uint64_t)ts.tv_sec * 1000 + (ts.tv_nsec / 1000000);
+        }
+        if (nowMs - s_LastGearToggleMs > 350) {
+            s_LastGearToggleMs = nowMs;
+            if (playerUnitType == 3 && AircraftMio_ToggleLandingGear) {
+                AircraftMio_ToggleLandingGear(playerUnit, nullptr);
+                LOGI("[C-RAM-MOD] Native LDG button tapped -> AircraftMio::ToggleLandingGear triggered!");
+            } else if (playerUnitType == 6 && HelicopterMio_ToggleLandingGear) {
+                HelicopterMio_ToggleLandingGear(playerUnit, nullptr);
+                LOGI("[C-RAM-MOD] HelicopterMio::ToggleLandingGear triggered!");
+            }
         }
     }
 }
@@ -1263,33 +1301,6 @@ void DrawMenu() {
     ImDrawList* draw = ImGui::GetBackgroundDrawList();
     if (!draw) return;
 
-    float screenWidth = (glWidth > 0) ? (float)glWidth : ImGui::GetIO().DisplaySize.x;
-    float screenHeight = (glHeight > 0) ? (float)glHeight : ImGui::GetIO().DisplaySize.y;
-
-    // Draw exact native-style LDG Button when player is in Airplane (3)
-    int pType = g_ActivePlayerUnitType.load();
-    if (pType == 3) {
-        float btnX = screenWidth * 0.0957f;
-        float btnY = screenHeight * 0.5348f;
-        float btnW = screenWidth * 0.0820f;
-        float btnH = screenHeight * 0.0870f;
-
-        bool isFlashing = (std::time(nullptr) <= g_GearButtonFlashTime.load());
-        ImU32 bgColor = isFlashing ? IM_COL32(180, 200, 230, 150) : IM_COL32(20, 25, 30, 95);
-        ImU32 borderColor = isFlashing ? IM_COL32(255, 255, 255, 255) : IM_COL32(230, 235, 240, 210);
-        ImU32 textColor = isFlashing ? IM_COL32(255, 255, 255, 255) : IM_COL32(245, 245, 250, 240);
-
-        // Rectangular box with thin outline (matching FILR, LDG, AOA+, TRK)
-        draw->AddRectFilled(ImVec2(btnX, btnY), ImVec2(btnX + btnW, btnY + btnH), bgColor, 0.0f);
-        draw->AddRect(ImVec2(btnX, btnY), ImVec2(btnX + btnW, btnY + btnH), borderColor, 0.0f, 0, 1.5f);
-
-        // Centered exact text "LDG"
-        ImVec2 textSize = ImGui::CalcTextSize("LDG");
-        float tx = btnX + (btnW - textSize.x) * 0.5f;
-        float ty = btnY + (btnH - textSize.y) * 0.5f;
-        draw->AddText(ImVec2(tx, ty), textColor, "LDG");
-    }
-
     int readIdx = g_ActiveBufferIdx.load();
     int count = g_TargetsCount[readIdx];
     if (count <= 0) return;
@@ -1499,6 +1510,7 @@ void* thread(void*) {
     // 10. Landing Gear & Screen/Input Pointers
     AircraftMio_ToggleLandingGear = (t_AircraftMio_ToggleLandingGear)(g_Il2CppBase + RVA_AIRCRAFTMIO_TOGGLEGEAR);
     HelicopterMio_ToggleLandingGear = (t_HelicopterMio_ToggleLandingGear)(g_Il2CppBase + RVA_HELICOPTERMIO_TOGGLEGEAR);
+    Object_Instantiate_Parent = (t_Object_Instantiate_Parent)(g_Il2CppBase + RVA_OBJECT_INSTANTIATE_PARENT);
     Input_GetMouseButtonDown = (t_Input_GetMouseButtonDown)(g_Il2CppBase + RVA_INPUT_GETMOUSEBUTTONDOWN);
     Input_get_mousePosition_Injected = (t_Input_get_mousePosition_Injected)(g_Il2CppBase + RVA_INPUT_GETMOUSEPOS_INJ);
     Screen_get_width = (t_Screen_get_width)(g_Il2CppBase + RVA_SCREEN_GETWIDTH);
@@ -1508,7 +1520,7 @@ void* thread(void*) {
     pthread_t sock_t;
     pthread_create(&sock_t, nullptr, socket_server_thread, nullptr);
 
-    LOGI("C-RAM v5.2 Hooks Installed: Cockpit Steering + Lead ESP + Economy Give + Heli Safety + Arcade Landing Gear Ready!");
+    LOGI("C-RAM v5.3 Hooks Installed: Cockpit Steering + Lead ESP + Economy Give + Heli Safety + Native Cloned Arcade Landing Gear Ready!");
     pthread_exit(nullptr);
 }
 
