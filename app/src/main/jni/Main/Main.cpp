@@ -336,7 +336,7 @@ void ApplyCockpitCursorSteering(void* seat, int cameraType) {
     // Helicopter & Non-airplane Safety: Check unit type
     int uType = 0;
     if (IUnit_GetUnitType) {
-        uType = IUnit_GetUnitType(unit, nullptr);
+        uType = IUnit_GetUnitType(unit);
     }
     // Only apply arcade airplane steering if it is strictly an Air unit (3)
     if (uType != 3) {
@@ -452,7 +452,7 @@ void hook_Airplane_FixedUpdate(void* self, void* method) {
     if (IsValidPtr(self)) {
         void* parentMio = *(void**)((uintptr_t)self + OFFSET_AIRPLANE_PARENT);
         if (IsValidPtr(parentMio)) {
-            int uType = IUnit_GetUnitType ? IUnit_GetUnitType(parentMio, nullptr) : 0;
+            int uType = IUnit_GetUnitType ? IUnit_GetUnitType(parentMio) : 0;
             if (uType == 3) { // Air only
                 int curCam = g_CurrentCameraType.load();
                 if (curCam == 0 && IsValidPtr(g_CameraManagerInstance)) {
@@ -484,13 +484,13 @@ void EnsureLandingGearButtonVisible(void* stageUI) {
     void* gearGO = Component_get_gameObject(gearBtn, nullptr);
     if (!IsValidPtr(gearGO)) return;
 
-    void* gearTr = Component_get_transform(gearGO, nullptr);
+    void* gearTr = Component_get_transform(gearGO);
     if (!IsValidPtr(gearTr)) return;
 
     // Reparent to mobileCommon (0x58) so it stays active across realistic and arcade modes
     void* mobileCommonGO = *(void**)((uintptr_t)stageUI + 0x58); // StageUI.mobileCommon
     if (IsValidPtr(mobileCommonGO) && Transform_SetParent && Transform_get_parent) {
-        void* mobileCommonTr = Component_get_transform(mobileCommonGO, nullptr);
+        void* mobileCommonTr = Component_get_transform(mobileCommonGO);
         void* currentParentTr = Transform_get_parent(gearTr, nullptr);
         if (IsValidPtr(mobileCommonTr) && currentParentTr != mobileCommonTr) {
             Transform_SetParent(gearTr, mobileCommonTr, true, nullptr); // worldPositionStays = true
@@ -501,7 +501,7 @@ void EnsureLandingGearButtonVisible(void* stageUI) {
     // Check player unit: show button if player is in an Airplane (3) or Heli (6)
     void* playerUnit = *(void**)((uintptr_t)stageUI + 0x2A0); // StageUI.playerUnit
     if (IsValidPtr(playerUnit)) {
-        int uType = IUnit_GetUnitType ? IUnit_GetUnitType(playerUnit, nullptr) : 0;
+        int uType = IUnit_GetUnitType ? IUnit_GetUnitType(playerUnit) : 0;
         if (uType == 3 || uType == 6) { // Air (3) or Heli (6)
             GameObject_SetActive(gearGO, true, nullptr);
         }
