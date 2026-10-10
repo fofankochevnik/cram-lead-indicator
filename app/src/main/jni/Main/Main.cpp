@@ -1,5 +1,5 @@
 //
-// C-RAM Air Target Lead Indicator & Universal Unit Spawner (v4.7 - Universal SpawnUnit)
+// C-RAM Mod v5.0: Cockpit Cursor Steering + Universal Lead Indicator + Economy Give + Universal Spawner
 //
 
 #include <pthread.h>
@@ -30,60 +30,83 @@
 #include "../Include/Logger.h"
 
 // -----------------------------------------------------------------------------
-// RVAs from script.json & dump.cs (Relative to libil2cpp.so base)
+// RVAs from script.json (Relative to libil2cpp.so base) - Verified for Update
 // -----------------------------------------------------------------------------
-#define RVA_CAMERA_MAIN          0x82D7D50
-#define RVA_CAMERA_W2S           0x82D72A4
-#define RVA_COMP_TRANSFORM       0x834A0F4
-#define RVA_GAMEOBJECT_TRANSFORM 0x834EBA0 // UnityEngine.GameObject.get_transform
-#define RVA_TRANS_POS            0x83601AC // UnityEngine.Transform.get_position
-#define RVA_TRANS_SETPOS         0x8360280 // UnityEngine.Transform.set_position
-#define RVA_TRANS_GETFORWARD     0x8360C08 // UnityEngine.Transform.get_forward
-#define RVA_UNIT_TYPE            0x3F54748
-#define RVA_PHYS_VEL             0x3EACAA4
-#define RVA_HUD_LATEUPDATE       0x3F16414 // GeneralHUD.LateUpdate
+#define RVA_CAMERA_MAIN                 0x7601668 // UnityEngine.Camera.get_main
+#define RVA_CAMERA_W2S                  0x7600BBC // UnityEngine.Camera.WorldToScreenPoint
+#define RVA_COMP_TRANSFORM              0x7675B08 // UnityEngine.Component.get_transform
+#define RVA_GAMEOBJECT_TRANSFORM        0x767AAD4 // UnityEngine.GameObject.get_transform
+#define RVA_TRANS_POS                   0x768C0D8 // UnityEngine.Transform.get_position
+#define RVA_TRANS_SETPOS                0x768C1AC // UnityEngine.Transform.set_position
+#define RVA_TRANS_GETFORWARD            0x768CB34 // UnityEngine.Transform.get_forward
+#define RVA_UNIT_TYPE                   0x3B38DB4 // IUnit.GetUnitType
+#define RVA_PHYS_VEL                    0x39DEC94 // PhysicsObject.get_Velocity
+#define RVA_HUD_LATEUPDATE              0x3ACF27C // GeneralHUD.LateUpdate
 
 // Multiplayer & UI Hooks
-#define RVA_EVENTSYSTEM_UPDATE   0x86BE318 // UnityEngine.EventSystems.EventSystem.Update
-#define RVA_MP_BOOTSTRAP         0x3E30D94 // MultiplayerService.Bootstrap
-#define RVA_MP_ENTRY_CLICKED     0x3E2A764 // MultiplayerEntryButton.OnClicked
+#define RVA_EVENTSYSTEM_UPDATE          0x79EC8B4 // UnityEngine.EventSystems.EventSystem.Update
+#define RVA_MP_BOOTSTRAP                0x397F9A8 // MultiplayerService.Bootstrap
+#define RVA_MP_ENTRY_CLICKED            0x3979048 // MultiplayerEntryButton.OnClicked
 
 // Button / Shop Hooks
-#define RVA_IAP_SHOP_ONENABLE    0x3DBD734 // IAPShopButton.OnEnable (Diamond icon in hangar)
-#define RVA_ICONS_SHOWSTORE      0x4267774 // CBS.UI.IconsPanel.ShowStore (Backup)
+#define RVA_IAP_SHOP_ONENABLE           0x3909188 // IAPShopButton.OnEnable (Diamond icon in hangar)
+#define RVA_ICONS_SHOWSTORE             0x3E46C1C // CBS.UI.IconsPanel.ShowStore (Backup)
 
 // Unit Spawning & Catalog
-#define RVA_ASSET_CATALOG_GET_PREFAB    0x3DA6210 // GameAssetCatalog.GetUnitPrefab(string idOrName)
-#define RVA_SPAWN_MANAGER_AWAKE         0x3EC39F4 // SpawnManager.Awake
-#define RVA_SPAWN_MANAGER_SPAWN_UNIT    0x3EC7308 // SpawnManager.SpawnUnit
-#define RVA_SPAWN_MANAGER_SPAWN_AIR     0x3EC78DC // SpawnManager.SpawnAirUnit
-#define RVA_SPAWN_MANAGER_SPAWN_GROUND  0x3EC7CBC // SpawnManager.SpawnGroundUnit
-#define RVA_SPAWN_MANAGER_SNAP_GROUND   0x3EC7E78 // SpawnManager.SnapGroundUnitToSurface
-#define RVA_OBJECT_INSTANTIATE          0x8356158 // UnityEngine.Object.Instantiate(Object original)
+#define RVA_ASSET_CATALOG_GET_PREFAB    0x38EE1D0 // GameAssetCatalog.GetUnitPrefab(string idOrName)
+#define RVA_SPAWN_MANAGER_AWAKE         0x3A1B264 // SpawnManager.Awake
+#define RVA_SPAWN_MANAGER_SPAWN_UNIT    0x3A1EA08 // SpawnManager.SpawnUnit
+#define RVA_SPAWN_MANAGER_SPAWN_AIR     0x3A1EFDC // SpawnManager.SpawnAirUnit
+#define RVA_SPAWN_MANAGER_SPAWN_GROUND  0x3A1F40C // SpawnManager.SpawnGroundUnit
+#define RVA_SPAWN_MANAGER_SNAP_GROUND   0x3A1F5C8 // SpawnManager.SnapGroundUnitToSurface
+#define RVA_OBJECT_INSTANTIATE          0x7681AD4 // UnityEngine.Object.Instantiate(Object original)
 
-// Ground Component Fixes (TrackDeformer & RotatingSensor NullReferenceException guards)
-#define RVA_TRACK_DEFORMER_UPDATE       0x3F68C20 // TrackDeformer.Update
-#define RVA_ROTATING_SENSOR_UPDATE      0x3FB20FC // RotatingSensor.Update
+// Ground Component Fixes
+#define RVA_TRACK_DEFORMER_UPDATE       0x3B50130 // TrackDeformer.Update
+#define RVA_ROTATING_SENSOR_UPDATE      0x3B8A240 // RotatingSensor.Update
+
+// Cockpit Cursor Steering & Control Hooks
+#define RVA_VEHICLESEAT_ONCAMERACHANGED 0x3B4979C // VehicleSeat.OnCameraChanged(GameCameraType cameraType)
+#define RVA_AIRPLANE_FIXEDUPDATE        0x3BB5FDC // Airplane.FixedUpdate
+#define RVA_AIRCRAFTMIO_SETCONTROLLER   0x3B26688 // AircraftMio.SetAirCraftControllerType(AircraftControllerType type)
+#define RVA_JOYSTICK_START              0x38976BC // Joystick.Start
+#define RVA_ULTIMATEJOYSTICK_DISABLE    0x3C85A7C // UltimateJoystick.DisableJoystick(string joystickName)
+#define RVA_GAMEOBJECT_SETACTIVE        0x767AF68 // UnityEngine.GameObject.SetActive(bool value)
+#define RVA_COMP_GET_GAMEOBJECT         0x7675CAC // UnityEngine.Component.get_gameObject
+
+// Economy / Give Currency Hooks
+#define RVA_INVENTORY_AWAKE             0x38EAB78 // InventoryWrapper.Awake
+#define RVA_INVENTORY_ADDCURRENCY       0x38EB6C4 // InventoryWrapper.AddCurrency(int amount)
 
 // -----------------------------------------------------------------------------
-// Field Offsets from dump.cs & il2cpp.h
+// Field Offsets from dump.cs & il2cpp.h (Updated for latest game version)
 // -----------------------------------------------------------------------------
-#define OFFSET_HUD_PARENTSEAT    0x20
-#define OFFSET_HUD_MAINCAMERA    0xE8
-#define OFFSET_HUD_ALLENEMIES    0x140
+#define OFFSET_HUD_PARENTSEAT           0x20
+#define OFFSET_HUD_MAINCAMERA           0xE8
+#define OFFSET_HUD_ALLENEMIES           0x140
 
-#define OFFSET_SEAT_AWS          0x28
+#define OFFSET_SEAT_AWS                 0x28
+#define OFFSET_SEAT_OBJECTS_POV_ONLY    0x70 // monoList<void*>
 
-#define OFFSET_AWS_ALWAYSREADY   0x28
-#define OFFSET_AWS_SELECTABLE    0x80
+#define OFFSET_AWS_ALWAYSREADY          0x28
+#define OFFSET_AWS_SELECTABLE           0x98 // Updated from 0x80 -> 0x98
 
-#define OFFSET_TURRET_MUZZLE     0xD8
-#define OFFSET_TURRET_AMMOCONFIG 0xC0
-#define OFFSET_TURRET_NOGRAVITY  0xFC
+#define OFFSET_TURRET_MUZZLE            0xD8
+#define OFFSET_TURRET_AMMOCONFIG        0xC0
+#define OFFSET_TURRET_NOGRAVITY         0xFC
 
-#define OFFSET_AMMO_SPEED        0x24
+#define OFFSET_AMMO_SPEED               0x24
 
-#define OFFSET_UNIT_ISALIVE      0xC4
+#define OFFSET_UNIT_ISALIVE             0xEC // Updated from 0xC4 -> 0xEC
+
+// Airplane & AircraftMio Offsets
+#define OFFSET_AIRPLANE_AIMRETICLE      0xB8
+#define OFFSET_AIRPLANE_CURSOR          0xC0
+#define OFFSET_AIRPLANE_CURSORSTEERING  0x100
+#define OFFSET_AIRPLANE_PARENT          0x30
+
+#define OFFSET_MIO_AIRPLANE             0x1A0
+#define OFFSET_MIO_CONTROLLERTYPE       0x1F0
 
 // -----------------------------------------------------------------------------
 // Function Pointer Types
@@ -119,6 +142,19 @@ typedef void* (*t_Object_Instantiate)(void* original, void* method);
 typedef void (*t_TrackDeformer_Update)(void* self);
 typedef void (*t_RotatingSensor_Update)(void* self);
 
+// Cockpit Steering & UI pointers
+typedef void (*t_VehicleSeat_OnCameraChanged)(void* self, int cameraType, void* method);
+typedef void (*t_Airplane_FixedUpdate)(void* self, void* method);
+typedef void (*t_AircraftMio_SetAirCraftControllerType)(void* self, int type, void* method);
+typedef void (*t_Joystick_Start)(void* self, void* method);
+typedef void (*t_UltimateJoystick_DisableJoystick)(void* joystickName, void* method);
+typedef void (*t_GameObject_SetActive)(void* self, bool value, void* method);
+typedef void* (*t_Component_get_gameObject)(void* self, void* method);
+
+// Economy pointers
+typedef void (*t_InventoryWrapper_Awake)(void* self, void* method);
+typedef void (*t_InventoryWrapper_AddCurrency)(void* self, int amount, void* method);
+
 static t_Camera_WorldToScreenPoint Camera_WorldToScreenPoint = nullptr;
 static t_Camera_get_main Camera_get_main = nullptr;
 static t_Component_get_transform Component_get_transform = nullptr;
@@ -148,17 +184,34 @@ static t_Object_Instantiate Object_Instantiate = nullptr;
 static t_TrackDeformer_Update orig_TrackDeformer_Update = nullptr;
 static t_RotatingSensor_Update orig_RotatingSensor_Update = nullptr;
 
+static t_VehicleSeat_OnCameraChanged orig_VehicleSeat_OnCameraChanged = nullptr;
+static t_Airplane_FixedUpdate orig_Airplane_FixedUpdate = nullptr;
+static t_AircraftMio_SetAirCraftControllerType AircraftMio_SetAirCraftControllerType = nullptr;
+static t_Joystick_Start orig_Joystick_Start = nullptr;
+static t_UltimateJoystick_DisableJoystick UltimateJoystick_DisableJoystick = nullptr;
+static t_GameObject_SetActive GameObject_SetActive = nullptr;
+static t_Component_get_gameObject Component_get_gameObject = nullptr;
+
+static t_InventoryWrapper_Awake orig_InventoryWrapper_Awake = nullptr;
+static t_InventoryWrapper_AddCurrency orig_InventoryWrapper_AddCurrency = nullptr;
+static t_InventoryWrapper_AddCurrency InventoryWrapper_AddCurrency = nullptr;
+
 // -----------------------------------------------------------------------------
 // Global State & Buffers
 // -----------------------------------------------------------------------------
 static uintptr_t g_Il2CppBase = 0;
 static void* g_SpawnManagerInstance = nullptr;
+static void* g_JoystickInstance = nullptr;
+static void* g_InventoryWrapperInstance = nullptr;
 
 static Vector3 g_PlayerVehiclePos(0, 0, 0);
 static std::atomic<bool> g_HasPlayerVehiclePos(false);
 
 static std::atomic<bool> g_OpenMultiplayerRequested(false);
 static uint64_t g_LastTriggerTime = 0;
+
+static std::atomic<int> g_CurrentCameraType(0);
+static std::atomic<int> g_PendingGiveAmount(0);
 
 struct SpawnRequest {
     std::string rawName;
@@ -212,13 +265,144 @@ inline Vector3 RotateVector(const Quaternion& q, const Vector3& v) {
 }
 
 // -----------------------------------------------------------------------------
+// Economy Hooks (InventoryWrapper)
+// -----------------------------------------------------------------------------
+void hook_InventoryWrapper_Awake(void* self, void* method) {
+    g_InventoryWrapperInstance = self;
+    LOGI("[C-RAM-MOD] InventoryWrapper::Awake captured! Instance: %p", self);
+    if (orig_InventoryWrapper_Awake) {
+        orig_InventoryWrapper_Awake(self, method);
+    }
+}
+
+void hook_InventoryWrapper_AddCurrency(void* self, int amount, void* method) {
+    g_InventoryWrapperInstance = self;
+    if (orig_InventoryWrapper_AddCurrency) {
+        orig_InventoryWrapper_AddCurrency(self, amount, method);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Joystick Hook (Captures active on-screen joystick)
+// -----------------------------------------------------------------------------
+void hook_Joystick_Start(void* self, void* method) {
+    g_JoystickInstance = self;
+    LOGI("[C-RAM-MOD] Joystick::Start captured! Instance: %p", self);
+    if (orig_Joystick_Start) {
+        orig_Joystick_Start(self, method);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Cockpit Cursor Steering & UI Hiding Hook (VehicleSeat.OnCameraChanged)
+// -----------------------------------------------------------------------------
+void hook_VehicleSeat_OnCameraChanged(void* self, int cameraType, void* method) {
+    g_CurrentCameraType.store(cameraType);
+    LOGI("[C-RAM-MOD] VehicleSeat::OnCameraChanged: cameraType=%d", cameraType);
+
+    if (orig_VehicleSeat_OnCameraChanged) {
+        orig_VehicleSeat_OnCameraChanged(self, cameraType, method);
+    }
+
+    if (!IsValidPtr(self)) return;
+
+    if (cameraType == 9) { // UNIT_FPS_POV (Cockpit View)
+        // 1. Resolve aircraft & airplane
+        void* parentSeatSys = *(void**)((uintptr_t)self + 0x20); // VehicleSeat.parent
+        if (IsValidPtr(parentSeatSys)) {
+            void* unit = *(void**)((uintptr_t)parentSeatSys + 0x20); // SeatSystem.parent (IUnit / AircraftMio)
+            if (IsValidPtr(unit)) {
+                // If it is an AircraftMio, set ArcadeCursor = 3
+                if (AircraftMio_SetAirCraftControllerType) {
+                    AircraftMio_SetAirCraftControllerType(unit, 3, nullptr);
+                    LOGI("[C-RAM-MOD] SetAirCraftControllerType(ArcadeCursor=3) applied in Cockpit POV!");
+                }
+                void* airplane = *(void**)((uintptr_t)unit + OFFSET_MIO_AIRPLANE); // AircraftMio.airplane
+                if (IsValidPtr(airplane)) {
+                    *(bool*)((uintptr_t)airplane + OFFSET_AIRPLANE_CURSORSTEERING) = true;
+                    LOGI("[C-RAM-MOD] airplane->cursorSteering forced to true in Cockpit POV!");
+
+                    // Ensure aimReticle and cursor GameObjects are active
+                    if (Component_get_gameObject && GameObject_SetActive) {
+                        void* reticle = *(void**)((uintptr_t)airplane + OFFSET_AIRPLANE_AIMRETICLE);
+                        if (IsValidPtr(reticle)) {
+                            void* reticleGO = Component_get_gameObject(reticle, nullptr);
+                            if (IsValidPtr(reticleGO)) GameObject_SetActive(reticleGO, true, nullptr);
+                        }
+                        void* cursor = *(void**)((uintptr_t)airplane + OFFSET_AIRPLANE_CURSOR);
+                        if (IsValidPtr(cursor)) {
+                            void* cursorGO = Component_get_gameObject(cursor, nullptr);
+                            if (IsValidPtr(cursorGO)) GameObject_SetActive(cursorGO, true, nullptr);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Hide joystick and roll slider in cockpit view
+        if (Component_get_gameObject && GameObject_SetActive) {
+            // Hide standard Joystick
+            if (IsValidPtr(g_JoystickInstance)) {
+                void* joystickGO = Component_get_gameObject(g_JoystickInstance, nullptr);
+                if (IsValidPtr(joystickGO)) {
+                    GameObject_SetActive(joystickGO, false, nullptr);
+                    LOGI("[C-RAM-MOD] Hidden Joystick in Cockpit POV");
+                }
+            }
+            // Hide objectsToShowOnlyInPOV (which vanilla uses for POV touch joystick/slider)
+            auto povOnlyList = *(monoList<void*>**)((uintptr_t)self + OFFSET_SEAT_OBJECTS_POV_ONLY);
+            if (IsValidPtr(povOnlyList) && IsValidPtr(povOnlyList->items)) {
+                int sz = povOnlyList->getSize();
+                for (int i = 0; i < sz && i < 16; i++) {
+                    void* obj = ((void**)povOnlyList->items->vector)[i];
+                    if (IsValidPtr(obj)) {
+                        GameObject_SetActive(obj, false, nullptr);
+                    }
+                }
+                LOGI("[C-RAM-MOD] Hidden %d POV controls (joystick/slider)", sz);
+            }
+        }
+        // Also disable UltimateJoystick if present
+        if (UltimateJoystick_DisableJoystick && il2cpp_string_new_fn) {
+            void* jsName = il2cpp_string_new_fn("FlightJoystick");
+            UltimateJoystick_DisableJoystick(jsName, nullptr);
+        }
+    } else {
+        // Outside cockpit view: restore joystick visibility
+        if (Component_get_gameObject && GameObject_SetActive && IsValidPtr(g_JoystickInstance)) {
+            void* joystickGO = Component_get_gameObject(g_JoystickInstance, nullptr);
+            if (IsValidPtr(joystickGO)) {
+                GameObject_SetActive(joystickGO, true, nullptr);
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Hook on Airplane.FixedUpdate (Keeps Cursor Steering Active in Cockpit POV)
+// -----------------------------------------------------------------------------
+void hook_Airplane_FixedUpdate(void* self, void* method) {
+    if (IsValidPtr(self)) {
+        if (g_CurrentCameraType.load() == 9) { // In Cockpit POV
+            *(bool*)((uintptr_t)self + OFFSET_AIRPLANE_CURSORSTEERING) = true;
+            void* parentMio = *(void**)((uintptr_t)self + OFFSET_AIRPLANE_PARENT);
+            if (IsValidPtr(parentMio)) {
+                *(int*)((uintptr_t)parentMio + OFFSET_MIO_CONTROLLERTYPE) = 3; // ArcadeCursor
+            }
+        }
+    }
+    if (orig_Airplane_FixedUpdate) {
+        orig_Airplane_FixedUpdate(self, method);
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Component Safety Guards (Eliminates NullReferenceExceptions on Ground Units)
 // -----------------------------------------------------------------------------
 void hook_TrackDeformer_Update(void* self) {
     if (!IsValidPtr(self)) return;
     void* initialVerts = *(void**)((uintptr_t)self + 0x40);
     void* currentVerts = *(void**)((uintptr_t)self + 0x58);
-    // If vertices are not properly allocated by prefab, skip updating to prevent NullReferenceException
     if (!IsValidPtr(initialVerts) || !IsValidPtr(currentVerts)) {
         return;
     }
@@ -231,7 +415,6 @@ void hook_RotatingSensor_Update(void* self) {
     if (!IsValidPtr(self)) return;
     void* rotatingObj = *(void**)((uintptr_t)self + 0x48);
     void* sensorMio = *(void**)((uintptr_t)self + 0x20);
-    // If target rotating object or sensor link is missing, skip updating
     if (!IsValidPtr(rotatingObj) || !IsValidPtr(sensorMio)) {
         return;
     }
@@ -319,10 +502,9 @@ std::string ResolveUnitAlias(const std::string& input) {
     if (s == "zu23") return "Zu-23-2-landed";
     if (s == "soldier" || s == "infantry") return "Soldier2";
 
-    return input; // return as-is
+    return input;
 }
 
-// Check if unit is an airborne target (Prefix check ensures DF-21D is NEVER classified as air)
 bool IsAirUnit(const std::string& name) {
     if (name.find("Spirit") != std::string::npos ||
         name.find("Shahed-136") != std::string::npos ||
@@ -343,7 +525,6 @@ bool IsAirUnit(const std::string& name) {
     return false;
 }
 
-// Check if unit is a stationary turret/launcher
 bool IsTurretOrStationary(const std::string& name) {
     if (name == "ShahedLauncher" ||
         name.find("Launcher") != std::string::npos ||
@@ -380,14 +561,12 @@ void ExecuteSpawn(const SpawnRequest& req) {
         prefab = GameAssetCatalog_GetUnitPrefab(strObj, nullptr);
     }
 
-    // Strict pointer validation: never crash on invalid/unloaded prefabs
     if (!prefab || !IsValidPtr(prefab)) {
         LOGE("[C-RAM-MOD] Prefab not found for '%s'!", canonical.c_str());
         return;
     }
 
     bool isAir = IsAirUnit(canonical);
-
     float defaultDist = isAir ? 400.0f : 25.0f;
     float defaultAlt = isAir ? 80.0f : 0.0f;
 
@@ -402,7 +581,6 @@ void ExecuteSpawn(const SpawnRequest& req) {
         void* camTr = Component_get_transform(cam);
         if (IsValidPtr(camTr)) {
             Vector3 cPos = Transform_get_position(camTr);
-
             Vector3 fwd(0, 0, 1);
             if (Transform_get_forward) {
                 fwd = Transform_get_forward(camTr, nullptr);
@@ -421,7 +599,6 @@ void ExecuteSpawn(const SpawnRequest& req) {
                 } else {
                     groundFwd = Vector3(0, 0, 1);
                 }
-                // Place vehicle in front of player at ground level
                 Vector3 basePos = cPos;
                 if (g_HasPlayerVehiclePos.load()) {
                     basePos = g_PlayerVehiclePos;
@@ -431,7 +608,6 @@ void ExecuteSpawn(const SpawnRequest& req) {
                 if (req.alt >= 0.0f) {
                     spawnPos.Y = req.alt;
                 }
-                // Face the vehicle towards the player
                 spawnRot = Quaternion::LookRotation(groundFwd * -1.0f);
             }
         }
@@ -458,7 +634,7 @@ void ExecuteSpawn(const SpawnRequest& req) {
             }
         }
     }
-    // 2. Ground Vehicles, Launchers & Turrets (DF-21D, ShahedLauncher, Tor, Tunguska, Pantsir, Abrams, etc.)
+    // 2. Ground Vehicles, Launchers & Turrets
     else {
         if (g_SpawnManagerInstance && SpawnManager_SpawnUnit) {
             try {
@@ -484,7 +660,7 @@ void ExecuteSpawn(const SpawnRequest& req) {
         }
     }
 
-    // Generic fallback ONLY if SpawnManager completely failed or was null
+    // Generic fallback ONLY if SpawnManager failed or was null
     if (!spawned && Object_Instantiate) {
         LOGI("[C-RAM-MOD] Spawning via Object.Instantiate fallback...");
         void* obj = Object_Instantiate(prefab, nullptr);
@@ -545,30 +721,32 @@ void hook_EventSystem_Update(void* self) {
     if (g_OpenMultiplayerRequested.load()) {
         g_OpenMultiplayerRequested.store(false);
         LOGI("[C-RAM-MOD] Launching Hidden Multiplayer on Unity Main Thread!");
-
-        if (MpBootstrap) {
-            MpBootstrap();
-        }
-
-        if (MpEntry_OnClicked) {
-            MpEntry_OnClicked(self);
-        }
-
+        if (MpBootstrap) MpBootstrap();
+        if (MpEntry_OnClicked) MpEntry_OnClicked(self);
         LOGI("[C-RAM-MOD] Multiplayer Screen Launched Successfully!");
     }
 
     // 2. Unit Spawning Trigger
     if (g_SpawnRequested.load()) {
         g_SpawnRequested.store(false);
-
         std::vector<SpawnRequest> toSpawn;
         {
             std::lock_guard<std::mutex> lock(g_SpawnMutex);
             toSpawn.swap(g_PendingSpawnQueue);
         }
-
         for (const auto& req : toSpawn) {
             ExecuteSpawn(req);
+        }
+    }
+
+    // 3. Economy / Give Currency Trigger
+    int giveAmt = g_PendingGiveAmount.exchange(0);
+    if (giveAmt > 0) {
+        if (g_InventoryWrapperInstance && InventoryWrapper_AddCurrency) {
+            InventoryWrapper_AddCurrency(g_InventoryWrapperInstance, giveAmt, nullptr);
+            LOGI("[C-RAM-MOD] Added %d currency via InventoryWrapper!", giveAmt);
+        } else {
+            LOGE("[C-RAM-MOD] InventoryWrapper instance or AddCurrency function not ready!");
         }
     }
 }
@@ -615,7 +793,6 @@ void* socket_server_thread(void*) {
             memset(buf, 0, sizeof(buf));
             int n = read(client_fd, buf, sizeof(buf) - 1);
             if (n > 0) {
-                // Trim trailing whitespaces / newlines
                 while (n > 0 && (buf[n - 1] == '\r' || buf[n - 1] == '\n' || buf[n - 1] == ' ')) {
                     buf[--n] = '\0';
                 }
@@ -624,7 +801,6 @@ void* socket_server_thread(void*) {
 
                 char reply[512];
 
-                // Deduplicate identical commands received within 500ms
                 uint64_t nowMs = getNowMs();
                 static std::string s_LastCmdStr = "";
                 static uint64_t s_LastCmdTime = 0;
@@ -639,11 +815,12 @@ void* socket_server_thread(void*) {
                 s_LastCmdTime = nowMs;
 
                 if (strcasecmp(buf, "ping") == 0) {
-                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v4.8 Online\n");
+                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v5.0 Online\n");
                 } else if (strcasecmp(buf, "help") == 0) {
                     snprintf(reply, sizeof(reply),
                              "Commands:\n"
                              "  ping\n"
+                             "  give <amount>\n"
                              "  spawn <unit> [noai] [dist <meters>] [alt <meters>]\n"
                              "  list\n"
                              "  mp\n");
@@ -654,6 +831,13 @@ void* socket_server_thread(void*) {
                              "  Air: su57, b2, shahed, ac130, su25, su27, mig29, f14, f15, f16, f18, f35, fpv\n"
                              "  Heli: ka52, mi28, mi24, apache, cobra\n"
                              "  Turrets: shahedlauncher, phalanx, kashtan, searam, goalkeeper\n");
+                } else if (strncasecmp(buf, "give", 4) == 0) {
+                    char* p = buf + 4;
+                    while (*p == ' ') p++;
+                    int amount = atoi(p);
+                    if (amount <= 0) amount = 10000;
+                    g_PendingGiveAmount.store(amount);
+                    snprintf(reply, sizeof(reply), "OK: Added %d currency queued\n", amount);
                 } else if (strncasecmp(buf, "spawn", 5) == 0) {
                     char* args = buf + 5;
                     while (*args == ' ') args++;
@@ -779,7 +963,6 @@ static bool CalculateLead(
     outFlightTime = t;
     outLeadPos = targetPos + targetVel * t;
 
-    // Ballistic drop compensation (game gravity = 9.0)
     if (!noGravity) {
         outLeadPos.Y += 0.5f * 9.0f * t * t;
     }
@@ -1038,7 +1221,7 @@ static uintptr_t getIl2CppBaseAddress() {
 // Hook Initialization Thread
 // -----------------------------------------------------------------------------
 void* thread(void*) {
-    LOGI("C-RAM Mod Thread Started (v4.8 - Ground Snapping & Deduplication)");
+    LOGI("C-RAM Mod Thread Started (v5.0 - Cockpit Steering + Lead + Give + Spawner)");
 
     initModMenu((void*)DrawMenu);
 
@@ -1057,7 +1240,7 @@ void* thread(void*) {
     LOGI("libil2cpp.so found at: %p", (void*)g_Il2CppBase);
     sleep(1);
 
-    // Battle pointers
+    // Battle & Core pointers
     Camera_get_main = (t_Camera_get_main)(g_Il2CppBase + RVA_CAMERA_MAIN);
     Camera_WorldToScreenPoint = (t_Camera_WorldToScreenPoint)(g_Il2CppBase + RVA_CAMERA_W2S);
     Component_get_transform = (t_Component_get_transform)(g_Il2CppBase + RVA_COMP_TRANSFORM);
@@ -1085,6 +1268,15 @@ void* thread(void*) {
     SpawnManager_SnapGroundUnitToSurface = (t_SpawnManager_SnapGroundUnitToSurface)(g_Il2CppBase + RVA_SPAWN_MANAGER_SNAP_GROUND);
     Object_Instantiate = (t_Object_Instantiate)(g_Il2CppBase + RVA_OBJECT_INSTANTIATE);
 
+    // Aircraft & Cockpit pointers
+    AircraftMio_SetAirCraftControllerType = (t_AircraftMio_SetAirCraftControllerType)(g_Il2CppBase + RVA_AIRCRAFTMIO_SETCONTROLLER);
+    UltimateJoystick_DisableJoystick = (t_UltimateJoystick_DisableJoystick)(g_Il2CppBase + RVA_ULTIMATEJOYSTICK_DISABLE);
+    GameObject_SetActive = (t_GameObject_SetActive)(g_Il2CppBase + RVA_GAMEOBJECT_SETACTIVE);
+    Component_get_gameObject = (t_Component_get_gameObject)(g_Il2CppBase + RVA_COMP_GET_GAMEOBJECT);
+
+    // Economy pointers
+    InventoryWrapper_AddCurrency = (t_InventoryWrapper_AddCurrency)(g_Il2CppBase + RVA_INVENTORY_ADDCURRENCY);
+
     // 1. Hook GeneralHUD.LateUpdate for Battle ESP (Lead Indicator)
     void* targetHUDMethod = (void*)(g_Il2CppBase + RVA_HUD_LATEUPDATE);
     DobbyHook(targetHUDMethod, (void*)hook_GeneralHUD_LateUpdate, (void**)&orig_GeneralHUD_LateUpdate);
@@ -1093,29 +1285,48 @@ void* thread(void*) {
     void* targetEventSystemMethod = (void*)(g_Il2CppBase + RVA_EVENTSYSTEM_UPDATE);
     DobbyHook(targetEventSystemMethod, (void*)hook_EventSystem_Update, (void**)&orig_EventSystem_Update);
 
-    // 3. Hook SpawnManager.Awake to capture active battle spawner
+    // 3. Hook VehicleSeat.OnCameraChanged for Cockpit Cursor Steering & Control Hiding
+    void* targetCameraChanged = (void*)(g_Il2CppBase + RVA_VEHICLESEAT_ONCAMERACHANGED);
+    DobbyHook(targetCameraChanged, (void*)hook_VehicleSeat_OnCameraChanged, (void**)&orig_VehicleSeat_OnCameraChanged);
+
+    // 4. Hook Airplane.FixedUpdate to guarantee 25G cursor physics in Cockpit POV
+    void* targetAirplaneFixedUpdate = (void*)(g_Il2CppBase + RVA_AIRPLANE_FIXEDUPDATE);
+    DobbyHook(targetAirplaneFixedUpdate, (void*)hook_Airplane_FixedUpdate, (void**)&orig_Airplane_FixedUpdate);
+
+    // 5. Hook Joystick.Start to capture screen joystick
+    void* targetJoystickStart = (void*)(g_Il2CppBase + RVA_JOYSTICK_START);
+    DobbyHook(targetJoystickStart, (void*)hook_Joystick_Start, (void**)&orig_Joystick_Start);
+
+    // 6. Hook InventoryWrapper for Economy Give Command
+    void* targetInvAwake = (void*)(g_Il2CppBase + RVA_INVENTORY_AWAKE);
+    DobbyHook(targetInvAwake, (void*)hook_InventoryWrapper_Awake, (void**)&orig_InventoryWrapper_Awake);
+
+    void* targetInvAdd = (void*)(g_Il2CppBase + RVA_INVENTORY_ADDCURRENCY);
+    DobbyHook(targetInvAdd, (void*)hook_InventoryWrapper_AddCurrency, (void**)&orig_InventoryWrapper_AddCurrency);
+
+    // 7. Hook SpawnManager.Awake to capture active battle spawner
     void* targetSpawnManagerAwake = (void*)(g_Il2CppBase + RVA_SPAWN_MANAGER_AWAKE);
     DobbyHook(targetSpawnManagerAwake, (void*)hook_SpawnManager_Awake, (void**)&orig_SpawnManager_Awake);
 
-    // 4. Hook IAPShopButton.OnEnable & IconsPanel.ShowStore (Diamond icon in hangar header)
+    // 8. Hook IAPShopButton.OnEnable & IconsPanel.ShowStore (Diamond icon in hangar header)
     void* targetIAPShop = (void*)(g_Il2CppBase + RVA_IAP_SHOP_ONENABLE);
     DobbyHook(targetIAPShop, (void*)hook_IAPShopButton_OnEnable, (void**)&orig_IAPShopButton_OnEnable);
 
     void* targetShowStore = (void*)(g_Il2CppBase + RVA_ICONS_SHOWSTORE);
     DobbyHook(targetShowStore, (void*)hook_IconsPanel_ShowStore, (void**)&orig_IconsPanel_ShowStore);
 
-    // 5. Component Guards: Eliminate NullReferenceExceptions on Ground Units & DF-21D
+    // 9. Component Guards: Eliminate NullReferenceExceptions on Ground Units & DF-21D
     void* targetTrackDeformer = (void*)(g_Il2CppBase + RVA_TRACK_DEFORMER_UPDATE);
     DobbyHook(targetTrackDeformer, (void*)hook_TrackDeformer_Update, (void**)&orig_TrackDeformer_Update);
 
     void* targetRotatingSensor = (void*)(g_Il2CppBase + RVA_ROTATING_SENSOR_UPDATE);
     DobbyHook(targetRotatingSensor, (void*)hook_RotatingSensor_Update, (void**)&orig_RotatingSensor_Update);
 
-    // 6. Start ADB Socket Listener Thread on 0.0.0.0:8888
+    // 10. Start ADB Socket Listener Thread on 0.0.0.0:8888
     pthread_t sock_t;
     pthread_create(&sock_t, nullptr, socket_server_thread, nullptr);
 
-    LOGI("C-RAM v4.8 Hooks Installed: Lead ESP + Crash Guards + Ground Snapping + TCP Server Ready!");
+    LOGI("C-RAM v5.0 Hooks Installed: Cockpit Steering + Lead ESP + Economy Give + TCP Server Ready!");
     pthread_exit(nullptr);
 }
 
