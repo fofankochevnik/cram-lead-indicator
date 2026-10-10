@@ -65,8 +65,10 @@
 #define RVA_TRACK_DEFORMER_UPDATE       0x3B50130 // TrackDeformer.Update
 #define RVA_ROTATING_SENSOR_UPDATE      0x3B8A240 // RotatingSensor.Update
 
-// Cockpit Cursor Steering & Control Hooks
-#define RVA_VEHICLESEAT_ONCAMERACHANGED 0x3B4979C // VehicleSeat.OnCameraChanged(GameCameraType cameraType)
+// CameraManager & Cockpit Cursor Steering Hooks
+#define RVA_CAMERAMANAGER_AWAKE         0x3EFA604 // CameraManager.Awake
+#define RVA_CAMERAMANAGER_SETCAMERABYTYPE 0x3EF815C // CameraManager.SetCameraByType(GameCameraType type)
+#define RVA_CAMERAMANAGER_SETCAMERA     0x3EFB430 // CameraManager.SetCamera(GameCameraType gameCameraType, VehicleSeat follow, UnitType unitType)
 #define RVA_AIRPLANE_FIXEDUPDATE        0x3BB5FDC // Airplane.FixedUpdate
 #define RVA_AIRCRAFTMIO_SETCONTROLLER   0x3B26688 // AircraftMio.SetAirCraftControllerType(AircraftControllerType type)
 #define RVA_JOYSTICK_START              0x38976BC // Joystick.Start
@@ -143,7 +145,9 @@ typedef void (*t_TrackDeformer_Update)(void* self);
 typedef void (*t_RotatingSensor_Update)(void* self);
 
 // Cockpit Steering & UI pointers
-typedef void (*t_VehicleSeat_OnCameraChanged)(void* self, int cameraType, void* method);
+typedef void (*t_CameraManager_Awake)(void* self, void* method);
+typedef void (*t_CameraManager_SetCameraByType)(void* self, int type, void* method);
+typedef void (*t_CameraManager_SetCamera)(void* self, int gameCameraType, void* follow, int unitType, void* method);
 typedef void (*t_Airplane_FixedUpdate)(void* self, void* method);
 typedef void (*t_AircraftMio_SetAirCraftControllerType)(void* self, int type, void* method);
 typedef void (*t_Joystick_Start)(void* self, void* method);
@@ -184,7 +188,10 @@ static t_Object_Instantiate Object_Instantiate = nullptr;
 static t_TrackDeformer_Update orig_TrackDeformer_Update = nullptr;
 static t_RotatingSensor_Update orig_RotatingSensor_Update = nullptr;
 
-static t_VehicleSeat_OnCameraChanged orig_VehicleSeat_OnCameraChanged = nullptr;
+static t_CameraManager_Awake orig_CameraManager_Awake = nullptr;
+static t_CameraManager_SetCameraByType orig_CameraManager_SetCameraByType = nullptr;
+static t_CameraManager_SetCamera orig_CameraManager_SetCamera = nullptr;
+static void* g_CameraManagerInstance = nullptr;
 static t_Airplane_FixedUpdate orig_Airplane_FixedUpdate = nullptr;
 static t_AircraftMio_SetAirCraftControllerType AircraftMio_SetAirCraftControllerType = nullptr;
 static t_Joystick_Start orig_Joystick_Start = nullptr;
@@ -294,21 +301,14 @@ void hook_Joystick_Start(void* self, void* method) {
 }
 
 // -----------------------------------------------------------------------------
-// Cockpit Cursor Steering & UI Hiding Hook (VehicleSeat.OnCameraChanged)
+// Cockpit Cursor Steering & UI Hiding via CameraManager
 // -----------------------------------------------------------------------------
-void hook_VehicleSeat_OnCameraChanged(void* self, int cameraType, void* method) {
-    g_CurrentCameraType.store(cameraType);
-    LOGI("[C-RAM-MOD] VehicleSeat::OnCameraChanged: cameraType=%d", cameraType);
-
-    if (orig_VehicleSeat_OnCameraChanged) {
-        orig_VehicleSeat_OnCameraChanged(self, cameraType, method);
-    }
-
-    if (!IsValidPtr(self)) return;
+void ApplyCockpitCursorSteering(void* seat, int cameraType) {
+    if (!IsValidPtr(seat)) return;
 
     if (cameraType == 9) { // UNIT_FPS_POV (Cockpit View)
         // 1. Resolve aircraft & airplane
-        void* parentSeatSys = *(void**)((uintptr_t)self + 0x20); // VehicleSeat.parent
+        void* parentSeatSys = *(void**)((uintptr_t)seat + 0x20); // VehicleSeat.parent
         if (IsValidPtr(parentSeatSys)) {
             void* unit = *(void**)((uintptr_t)parentSeatSys + 0x20); // SeatSystem.parent (IUnit / AircraftMio)
             if (IsValidPtr(unit)) {
@@ -350,22 +350,27 @@ void hook_VehicleSeat_OnCameraChanged(void* self, int cameraType, void* method) 
                 }
             }
             // Hide objectsToShowOnlyInPOV (which vanilla uses for POV touch joystick/slider)
-            auto povOnlyList = *(monoList<void*>**)((uintptr_t)self + OFFSET_SEAT_OBJECTS_POV_ONLY);
-            if (IsValidPtr(povOnlyList) && IsValidPtr(povOnlyList->items)) {
-                int sz = povOnlyList->getSize();
-                for (int i = 0; i < sz && i < 16; i++) {
-                    void* obj = ((void**)povOnlyList->items->vector)[i];
-                    if (IsValidPtr(obj)) {
-                        GameObject_SetActive(obj, false, nullptr);
+            void* listPtr = *(void**)((uintptr_t)seat + OFFSET_SEAT_OBJECTS_POV_ONLY);
+            if (IsValidPtr(listPtr)) {
+                monoList<void*>* povOnlyList = (monoList<void*>*)listPtr;
+                if (IsValidPtr(povOnlyList->items)) {
+                    int sz = povOnlyList->getSize();
+                    for (int i = 0; i < sz && i < 16; i++) {
+                        void* obj = ((void**)povOnlyList->items->vector)[i];
+                        if (IsValidPtr(obj)) {
+                            GameObject_SetActive(obj, false, nullptr);
+                        }
                     }
+                    LOGI("[C-RAM-MOD] Hidden %d POV controls (joystick/slider)", sz);
                 }
-                LOGI("[C-RAM-MOD] Hidden %d POV controls (joystick/slider)", sz);
             }
         }
         // Also disable UltimateJoystick if present
         if (UltimateJoystick_DisableJoystick && il2cpp_string_new_fn) {
             void* jsName = il2cpp_string_new_fn("FlightJoystick");
-            UltimateJoystick_DisableJoystick(jsName, nullptr);
+            if (IsValidPtr(jsName)) {
+                UltimateJoystick_DisableJoystick(jsName, nullptr);
+            }
         }
     } else {
         // Outside cockpit view: restore joystick visibility
@@ -378,12 +383,48 @@ void hook_VehicleSeat_OnCameraChanged(void* self, int cameraType, void* method) 
     }
 }
 
+void hook_CameraManager_Awake(void* self, void* method) {
+    g_CameraManagerInstance = self;
+    LOGI("[C-RAM-MOD] CameraManager::Awake captured! Instance: %p", self);
+    if (orig_CameraManager_Awake) {
+        orig_CameraManager_Awake(self, method);
+    }
+}
+
+void hook_CameraManager_SetCameraByType(void* self, int type, void* method) {
+    g_CameraManagerInstance = self;
+    g_CurrentCameraType.store(type);
+    LOGI("[C-RAM-MOD] CameraManager::SetCameraByType: type=%d", type);
+    if (orig_CameraManager_SetCameraByType) {
+        orig_CameraManager_SetCameraByType(self, type, method);
+    }
+    void* seat = nullptr;
+    if (IsValidPtr(self)) {
+        seat = *(void**)((uintptr_t)self + 0x1A0); // CameraManager.selectedSeat
+    }
+    ApplyCockpitCursorSteering(seat, type);
+}
+
+void hook_CameraManager_SetCamera(void* self, int gameCameraType, void* follow, int unitType, void* method) {
+    g_CameraManagerInstance = self;
+    g_CurrentCameraType.store(gameCameraType);
+    LOGI("[C-RAM-MOD] CameraManager::SetCamera: type=%d, follow=%p", gameCameraType, follow);
+    if (orig_CameraManager_SetCamera) {
+        orig_CameraManager_SetCamera(self, gameCameraType, follow, unitType, method);
+    }
+    ApplyCockpitCursorSteering(follow, gameCameraType);
+}
+
 // -----------------------------------------------------------------------------
 // Hook on Airplane.FixedUpdate (Keeps Cursor Steering Active in Cockpit POV)
 // -----------------------------------------------------------------------------
 void hook_Airplane_FixedUpdate(void* self, void* method) {
     if (IsValidPtr(self)) {
-        if (g_CurrentCameraType.load() == 9) { // In Cockpit POV
+        int curCam = g_CurrentCameraType.load();
+        if (curCam == 0 && IsValidPtr(g_CameraManagerInstance)) {
+            curCam = *(int*)((uintptr_t)g_CameraManagerInstance + 0x1B8);
+        }
+        if (curCam == 9) { // In Cockpit POV
             *(bool*)((uintptr_t)self + OFFSET_AIRPLANE_CURSORSTEERING) = true;
             void* parentMio = *(void**)((uintptr_t)self + OFFSET_AIRPLANE_PARENT);
             if (IsValidPtr(parentMio)) {
@@ -1285,9 +1326,15 @@ void* thread(void*) {
     void* targetEventSystemMethod = (void*)(g_Il2CppBase + RVA_EVENTSYSTEM_UPDATE);
     DobbyHook(targetEventSystemMethod, (void*)hook_EventSystem_Update, (void**)&orig_EventSystem_Update);
 
-    // 3. Hook VehicleSeat.OnCameraChanged for Cockpit Cursor Steering & Control Hiding
-    void* targetCameraChanged = (void*)(g_Il2CppBase + RVA_VEHICLESEAT_ONCAMERACHANGED);
-    DobbyHook(targetCameraChanged, (void*)hook_VehicleSeat_OnCameraChanged, (void**)&orig_VehicleSeat_OnCameraChanged);
+    // 3. Hook CameraManager for Cockpit Cursor Steering & Control Hiding
+    void* targetCameraAwake = (void*)(g_Il2CppBase + RVA_CAMERAMANAGER_AWAKE);
+    DobbyHook(targetCameraAwake, (void*)hook_CameraManager_Awake, (void**)&orig_CameraManager_Awake);
+
+    void* targetCameraByType = (void*)(g_Il2CppBase + RVA_CAMERAMANAGER_SETCAMERABYTYPE);
+    DobbyHook(targetCameraByType, (void*)hook_CameraManager_SetCameraByType, (void**)&orig_CameraManager_SetCameraByType);
+
+    void* targetCameraSet = (void*)(g_Il2CppBase + RVA_CAMERAMANAGER_SETCAMERA);
+    DobbyHook(targetCameraSet, (void*)hook_CameraManager_SetCamera, (void**)&orig_CameraManager_SetCamera);
 
     // 4. Hook Airplane.FixedUpdate to guarantee 25G cursor physics in Cockpit POV
     void* targetAirplaneFixedUpdate = (void*)(g_Il2CppBase + RVA_AIRPLANE_FIXEDUPDATE);
