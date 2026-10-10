@@ -84,6 +84,7 @@
 #define RVA_AIRCRAFTMIO_TOGGLEGEAR      0x3B24E7C // AircraftMio.ToggleLandingGear
 #define RVA_HELICOPTERMIO_TOGGLEGEAR    0x3B3559C // HelicopterMio.ToggleLandingGear
 #define RVA_STAGEUI_ONLANDINGGEAR       0x3B7CB54 // StageUI.OnLandingGearButtonClicked
+#define RVA_AIRCRAFT_SETGEARFORREPLAY   0x3EDEA28 // Aircraft.SetGearForReplay(bool down) / Aircraft.setGear
 #define RVA_BUTTON_FLASH                0x3B7E560 // ToggleOrHoldButton.Flash
 #define RVA_OBJECT_INSTANTIATE_PARENT   0x7682438  // UnityEngine.Object.Instantiate(Object original, Transform parent, bool instantiateInWorldSpace)
 #define RVA_INPUT_GETMOUSEBUTTONDOWN    0x7704724 // UnityEngine.Input.GetMouseButtonDown
@@ -174,6 +175,7 @@ typedef void (*t_InventoryWrapper_AddCurrency)(void* self, int amount, void* met
 typedef void (*t_AircraftMio_ToggleLandingGear)(void* self, void* method);
 typedef void (*t_HelicopterMio_ToggleLandingGear)(void* self, void* method);
 typedef void (*t_StageUI_OnLandingGearButtonClicked)(void* self, void* method);
+typedef void (*t_Aircraft_SetGearForReplay)(void* self, bool down, void* method);
 typedef void (*t_ToggleOrHoldButton_Flash)(void* self, void* method);
 typedef void* (*t_Object_Instantiate_Parent)(void* original, void* parent, bool instantiateInWorldSpace, void* method);
 typedef bool (*t_Input_GetMouseButtonDown)(int button, void* method);
@@ -250,6 +252,7 @@ static t_InventoryWrapper_AddCurrency InventoryWrapper_AddCurrency = nullptr;
 
 static t_AircraftMio_ToggleLandingGear AircraftMio_ToggleLandingGear = nullptr;
 static t_HelicopterMio_ToggleLandingGear HelicopterMio_ToggleLandingGear = nullptr;
+static t_Aircraft_SetGearForReplay Aircraft_SetGearForReplay = nullptr;
 static t_Input_GetMouseButtonDown Input_GetMouseButtonDown = nullptr;
 static t_Input_get_mousePosition_Injected Input_get_mousePosition_Injected = nullptr;
 static t_Screen_get_width Screen_get_width = nullptr;
@@ -1002,7 +1005,7 @@ void hook_EventSystem_Update(void* self) {
         s_PrevHeld = isHeld;
     }
 
-    if (shouldToggleGear && IsValidPtr(playerUnit)) {
+    if (shouldToggleGear && (IsValidPtr(playerUnit) || IsValidPtr(stageUI))) {
         uint64_t nowMs = 0;
         struct timespec ts;
         if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
@@ -1010,12 +1013,34 @@ void hook_EventSystem_Update(void* self) {
         }
         if (nowMs - s_LastGearToggleMs > 350) {
             s_LastGearToggleMs = nowMs;
-            if (playerUnitType == 3 && AircraftMio_ToggleLandingGear) {
-                AircraftMio_ToggleLandingGear(playerUnit, nullptr);
-                if (ToggleOrHoldButton_Flash && IsUnityObjectAlive(s_ClonedGearButtonComp)) {
-                    ToggleOrHoldButton_Flash(s_ClonedGearButtonComp, nullptr);
+            void* unitToUse = playerUnit;
+            if (!IsValidPtr(unitToUse) && IsValidPtr(stageUI)) {
+                unitToUse = *(void**)((uintptr_t)stageUI + 0x2A0);
+            }
+            if (IsValidPtr(unitToUse)) {
+                int unitType = playerUnitType;
+                if (unitType == 0 && IUnit_GetUnitType) {
+                    unitType = IUnit_GetUnitType(unitToUse);
                 }
-                LOGI("[C-RAM-MOD] Native LDG button tapped -> AircraftMio::ToggleLandingGear triggered!");
+                if (unitType == 3) {
+                    void* aircraftComp = *(void**)((uintptr_t)unitToUse + 0x1A8); // AircraftMio.aircraft
+                    if (IsValidPtr(aircraftComp)) {
+                        bool curDown = *(bool*)((uintptr_t)aircraftComp + 0x56); // Aircraft.isGearDown
+                        bool newDown = !curDown;
+                        if (Aircraft_SetGearForReplay) {
+                            Aircraft_SetGearForReplay(aircraftComp, newDown, nullptr);
+                        }
+                        *(bool*)((uintptr_t)aircraftComp + 0x56) = newDown;
+                        LOGI("[C-RAM-MOD] Aircraft gear toggled! newDown=%d (was %d)", (int)newDown, (int)curDown);
+                    }
+                    if (AircraftMio_ToggleLandingGear) {
+                        AircraftMio_ToggleLandingGear(unitToUse, nullptr);
+                    }
+                    if (ToggleOrHoldButton_Flash && IsUnityObjectAlive(s_ClonedGearButtonComp)) {
+                        ToggleOrHoldButton_Flash(s_ClonedGearButtonComp, nullptr);
+                    }
+                    LOGI("[C-RAM-MOD] Native LDG button tapped -> gear toggled!");
+                }
             }
         }
     }
@@ -1628,6 +1653,7 @@ void* thread(void*) {
     AircraftMio_ToggleLandingGear = (t_AircraftMio_ToggleLandingGear)(g_Il2CppBase + RVA_AIRCRAFTMIO_TOGGLEGEAR);
     HelicopterMio_ToggleLandingGear = (t_HelicopterMio_ToggleLandingGear)(g_Il2CppBase + RVA_HELICOPTERMIO_TOGGLEGEAR);
     StageUI_OnLandingGearButtonClicked = (t_StageUI_OnLandingGearButtonClicked)(g_Il2CppBase + RVA_STAGEUI_ONLANDINGGEAR);
+    Aircraft_SetGearForReplay = (t_Aircraft_SetGearForReplay)(g_Il2CppBase + RVA_AIRCRAFT_SETGEARFORREPLAY);
     ToggleOrHoldButton_Flash = (t_ToggleOrHoldButton_Flash)(g_Il2CppBase + RVA_BUTTON_FLASH);
     Object_Instantiate_Parent = (t_Object_Instantiate_Parent)(g_Il2CppBase + RVA_OBJECT_INSTANTIATE_PARENT);
     Input_GetMouseButtonDown = (t_Input_GetMouseButtonDown)(g_Il2CppBase + RVA_INPUT_GETMOUSEBUTTONDOWN);
