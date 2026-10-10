@@ -83,7 +83,8 @@
 // Landing Gear & Screen/Input RVAs
 #define RVA_AIRCRAFTMIO_TOGGLEGEAR      0x3B24E7C // AircraftMio.ToggleLandingGear
 #define RVA_HELICOPTERMIO_TOGGLEGEAR    0x3B3559C // HelicopterMio.ToggleLandingGear
-#define RVA_STAGEUI_TYPEINFO            0x08110330 // StageUI_TypeInfo (metadata class pointer)
+#define RVA_STAGEUI_ONLANDINGGEAR       0x3B7CB54 // StageUI.OnLandingGearButtonClicked
+#define RVA_BUTTON_FLASH                0x3B7E560 // ToggleOrHoldButton.Flash
 #define RVA_OBJECT_INSTANTIATE_PARENT   0x7682438  // UnityEngine.Object.Instantiate(Object original, Transform parent, bool instantiateInWorldSpace)
 #define RVA_INPUT_GETMOUSEBUTTONDOWN    0x7704724 // UnityEngine.Input.GetMouseButtonDown
 #define RVA_INPUT_GETMOUSEPOS_INJ       0x7704D94 // UnityEngine.Input.get_mousePosition_Injected
@@ -172,11 +173,35 @@ typedef void (*t_InventoryWrapper_AddCurrency)(void* self, int amount, void* met
 // Landing Gear & Screen/Input pointers
 typedef void (*t_AircraftMio_ToggleLandingGear)(void* self, void* method);
 typedef void (*t_HelicopterMio_ToggleLandingGear)(void* self, void* method);
+typedef void (*t_StageUI_OnLandingGearButtonClicked)(void* self, void* method);
+typedef void (*t_ToggleOrHoldButton_Flash)(void* self, void* method);
 typedef void* (*t_Object_Instantiate_Parent)(void* original, void* parent, bool instantiateInWorldSpace, void* method);
 typedef bool (*t_Input_GetMouseButtonDown)(int button, void* method);
 typedef void (*t_Input_get_mousePosition_Injected)(Vector3* ret);
 typedef int (*t_Screen_get_width)(void* method);
 typedef int (*t_Screen_get_height)(void* method);
+
+// IL2CPP Runtime API Pointers
+typedef void* (*t_il2cpp_domain_get)();
+typedef void** (*t_il2cpp_domain_get_assemblies)(void* domain, size_t* size);
+typedef void* (*t_il2cpp_assembly_get_image)(void* assembly);
+typedef const char* (*t_il2cpp_image_get_name)(void* image);
+typedef void* (*t_il2cpp_class_from_name)(void* image, const char* namespaze, const char* name);
+typedef void (*t_il2cpp_runtime_class_init)(void* klass);
+typedef void* (*t_il2cpp_class_get_field_from_name)(void* klass, const char* name);
+typedef void (*t_il2cpp_field_static_get_value)(void* field, void* value);
+
+static t_il2cpp_domain_get il2cpp_domain_get_fn = nullptr;
+static t_il2cpp_domain_get_assemblies il2cpp_domain_get_assemblies_fn = nullptr;
+static t_il2cpp_assembly_get_image il2cpp_assembly_get_image_fn = nullptr;
+static t_il2cpp_image_get_name il2cpp_image_get_name_fn = nullptr;
+static t_il2cpp_class_from_name il2cpp_class_from_name_fn = nullptr;
+static t_il2cpp_runtime_class_init il2cpp_runtime_class_init_fn = nullptr;
+static t_il2cpp_class_get_field_from_name il2cpp_class_get_field_from_name_fn = nullptr;
+static t_il2cpp_field_static_get_value il2cpp_field_static_get_value_fn = nullptr;
+
+static t_StageUI_OnLandingGearButtonClicked StageUI_OnLandingGearButtonClicked = nullptr;
+static t_ToggleOrHoldButton_Flash ToggleOrHoldButton_Flash = nullptr;
 
 static t_Object_Instantiate_Parent Object_Instantiate_Parent = nullptr;
 static t_Camera_WorldToScreenPoint Camera_WorldToScreenPoint = nullptr;
@@ -277,11 +302,69 @@ static ScreenLeadTarget g_TargetsBuffer[2][MAX_TARGETS];
 static int g_TargetsCount[2] = {0, 0};
 static std::atomic<int> g_ActiveBufferIdx(0);
 
-// Check if pointer looks like valid userspace memory on 64-bit Android
+// Check if pointer looks like valid userspace memory on 64-bit Android (ARM64)
 inline bool IsValidPtr(const void* ptr) {
     if (!ptr) return false;
     uintptr_t p = (uintptr_t)ptr & 0x00FFFFFFFFFFFFFFULL;
-    return p >= 0x100000ULL && p <= 0x00007FFFFFFFFFFFULL;
+    // User-space pointers on 64-bit Android are >= 4 GB (0x100000000ULL).
+    // This rejects 32-bit IL2CPP metadata tokens (e.g. 0x2001a5d9).
+    return p >= 0x100000000ULL && p <= 0x00007FFFFFFFFFFFULL;
+}
+
+inline bool IsUnityObjectAlive(const void* uObj) {
+    if (!IsValidPtr(uObj)) return false;
+    void* nativePtr = *(void**)((uintptr_t)uObj + 0x10); // UnityEngine.Object.m_CachedPtr
+    return IsValidPtr(nativePtr);
+}
+
+static void* s_StageUIField = nullptr;
+static bool s_StageUIResolved = false;
+
+static void* GetStageUIInstance() {
+    if (!s_StageUIResolved) {
+        if (!il2cpp_domain_get_fn || !il2cpp_domain_get_assemblies_fn ||
+            !il2cpp_assembly_get_image_fn || !il2cpp_image_get_name_fn ||
+            !il2cpp_class_from_name_fn || !il2cpp_class_get_field_from_name_fn) {
+            return nullptr;
+        }
+        void* domain = il2cpp_domain_get_fn();
+        if (!IsValidPtr(domain)) return nullptr;
+
+        size_t count = 0;
+        void** assemblies = il2cpp_domain_get_assemblies_fn(domain, &count);
+        if (!assemblies || count == 0) return nullptr;
+
+        void* stageUI_class = nullptr;
+        for (size_t i = 0; i < count; i++) {
+            if (!IsValidPtr(assemblies[i])) continue;
+            void* image = il2cpp_assembly_get_image_fn(assemblies[i]);
+            if (!IsValidPtr(image)) continue;
+            const char* imgName = il2cpp_image_get_name_fn(image);
+            if (imgName && strcmp(imgName, "Assembly-CSharp.dll") == 0) {
+                stageUI_class = il2cpp_class_from_name_fn(image, "", "StageUI");
+                break;
+            }
+        }
+        if (IsValidPtr(stageUI_class)) {
+            if (il2cpp_runtime_class_init_fn) {
+                il2cpp_runtime_class_init_fn(stageUI_class);
+            }
+            s_StageUIField = il2cpp_class_get_field_from_name_fn(stageUI_class, "instance");
+            if (s_StageUIField) {
+                s_StageUIResolved = true;
+                LOGI("[C-RAM-MOD] StageUI.instance FieldInfo resolved successfully: %p", s_StageUIField);
+            }
+        }
+    }
+
+    if (s_StageUIField && il2cpp_field_static_get_value_fn) {
+        void* stageUI = nullptr;
+        il2cpp_field_static_get_value_fn(s_StageUIField, &stageUI);
+        if (IsUnityObjectAlive(stageUI)) {
+            return stageUI;
+        }
+    }
+    return nullptr;
 }
 
 static inline uint64_t getNowMs() {
@@ -857,38 +940,47 @@ void hook_EventSystem_Update(void* self) {
     static void* s_LastStageUI = nullptr;
     static void* s_ClonedGearButtonComp = nullptr;
     static bool s_PrevHeld = false;
+    static bool s_PrevIsOn = false;
     static uint64_t s_LastGearToggleMs = 0;
 
-    void* stageUI = nullptr;
-    void** pStageUI_Class = (void**)(g_Il2CppBase + RVA_STAGEUI_TYPEINFO);
-    if (IsValidPtr(pStageUI_Class) && IsValidPtr(*pStageUI_Class)) {
-        void* klass = *pStageUI_Class;
-        void** pStatics = *(void***)((uintptr_t)klass + 0xB8); // StageUI_c.static_fields
-        if (IsValidPtr(pStatics)) {
-            stageUI = pStatics[0]; // StageUI.instance
-        }
-    }
+    void* stageUI = GetStageUIInstance();
 
-    // Reset when exiting match or entering a new match
-    if (stageUI != s_LastStageUI) {
+    // Reset when exiting match or entering a new match or if StageUI changed
+    if (stageUI != s_LastStageUI || !IsUnityObjectAlive(stageUI)) {
         s_LastStageUI = stageUI;
         s_ClonedGearButtonComp = nullptr;
         s_PrevHeld = false;
+        s_PrevIsOn = false;
     }
 
-    if (IsValidPtr(stageUI)) {
+    // Check if cloned button was destroyed
+    if (s_ClonedGearButtonComp != nullptr && !IsUnityObjectAlive(s_ClonedGearButtonComp)) {
+        s_ClonedGearButtonComp = nullptr;
+        s_PrevHeld = false;
+        s_PrevIsOn = false;
+    }
+
+    // ONLY clone if we are in a match with an AIRPLANE (playerUnitType == 3)
+    // Helicopters (type 6) and ground vehicles are strictly excluded!
+    if (IsUnityObjectAlive(stageUI) && playerUnitType == 3) {
         void* origLdgBtn = *(void**)((uintptr_t)stageUI + 0x1A8);      // StageUI.LandingGearButton (ToggleOrHoldButton)
         void* arcadeAircraftGO = *(void**)((uintptr_t)stageUI + 0x68); // StageUI.mobileArcadeAircraft (GameObject)
 
-        if (IsValidPtr(origLdgBtn) && IsValidPtr(arcadeAircraftGO) && s_ClonedGearButtonComp == nullptr) {
+        if (IsUnityObjectAlive(origLdgBtn) && IsUnityObjectAlive(arcadeAircraftGO) && s_ClonedGearButtonComp == nullptr) {
             if (GameObject_get_transform && Object_Instantiate_Parent) {
                 void* arcadeTr = GameObject_get_transform(arcadeAircraftGO);
                 if (IsValidPtr(arcadeTr)) {
                     // Instantiate exact clone of native LandingGearButton as child of mobileArcadeAircraft
                     // worldPositionStays = false preserves exact native RectTransform layout, sizing, and styling
                     void* clonedComp = Object_Instantiate_Parent(origLdgBtn, arcadeTr, false, nullptr);
-                    if (IsValidPtr(clonedComp)) {
+                    if (IsUnityObjectAlive(clonedComp)) {
                         s_ClonedGearButtonComp = clonedComp;
+                        if (Component_get_gameObject && GameObject_SetActive) {
+                            void* clonedGO = Component_get_gameObject(clonedComp, nullptr);
+                            if (IsValidPtr(clonedGO)) {
+                                GameObject_SetActive(clonedGO, true, nullptr);
+                            }
+                        }
                         LOGI("[C-RAM-MOD] Successfully cloned native LandingGearButton into mobileArcadeAircraft!");
                     }
                 }
@@ -899,11 +991,13 @@ void hook_EventSystem_Update(void* self) {
     // 6. Handle Landing Gear Toggle from Cloned Button Touch OR TCP Command
     bool shouldToggleGear = g_PendingGearToggle.exchange(false);
 
-    if (IsValidPtr(s_ClonedGearButtonComp)) {
-        // ToggleOrHoldButton._held is at offset 0x91
+    if (IsUnityObjectAlive(s_ClonedGearButtonComp)) {
+        // ToggleOrHoldButton._held is at offset 0x91, _isOn is at offset 0x90
         bool isHeld = *(bool*)((uintptr_t)s_ClonedGearButtonComp + 0x91);
-        if (isHeld && !s_PrevHeld) {
+        bool isOn = *(bool*)((uintptr_t)s_ClonedGearButtonComp + 0x90);
+        if ((isHeld && !s_PrevHeld) || (isOn != s_PrevIsOn)) {
             shouldToggleGear = true;
+            s_PrevIsOn = isOn;
         }
         s_PrevHeld = isHeld;
     }
@@ -918,10 +1012,10 @@ void hook_EventSystem_Update(void* self) {
             s_LastGearToggleMs = nowMs;
             if (playerUnitType == 3 && AircraftMio_ToggleLandingGear) {
                 AircraftMio_ToggleLandingGear(playerUnit, nullptr);
+                if (ToggleOrHoldButton_Flash && IsUnityObjectAlive(s_ClonedGearButtonComp)) {
+                    ToggleOrHoldButton_Flash(s_ClonedGearButtonComp, nullptr);
+                }
                 LOGI("[C-RAM-MOD] Native LDG button tapped -> AircraftMio::ToggleLandingGear triggered!");
-            } else if (playerUnitType == 6 && HelicopterMio_ToggleLandingGear) {
-                HelicopterMio_ToggleLandingGear(playerUnit, nullptr);
-                LOGI("[C-RAM-MOD] HelicopterMio::ToggleLandingGear triggered!");
             }
         }
     }
@@ -1078,7 +1172,7 @@ void* socket_server_thread(void*) {
                 } else if (strcasecmp(buf, "mp") == 0) {
                     g_OpenMultiplayerRequested.store(true);
                     snprintf(reply, sizeof(reply), "OK: Multiplayer Triggered\n");
-                } else if (strcasecmp(buf, "gear") == 0) {
+                } else if (strcasecmp(buf, "gear") == 0 || strcasecmp(buf, "ldg") == 0) {
                     g_PendingGearToggle.store(true);
                     snprintf(reply, sizeof(reply), "OK: Landing gear toggle requested\n");
                 } else {
@@ -1434,12 +1528,35 @@ void* thread(void*) {
     MpBootstrap = (t_MpBootstrap)(g_Il2CppBase + RVA_MP_BOOTSTRAP);
     MpEntry_OnClicked = (t_MpEntry_OnClicked)(g_Il2CppBase + RVA_MP_ENTRY_CLICKED);
 
-    // Spawning pointers
-    il2cpp_string_new_fn = (t_il2cpp_string_new)dlsym(RTLD_DEFAULT, "il2cpp_string_new");
-    if (!il2cpp_string_new_fn) {
-        void* h = dlopen("libil2cpp.so", RTLD_NOLOAD);
-        if (h) il2cpp_string_new_fn = (t_il2cpp_string_new)dlsym(h, "il2cpp_string_new");
-    }
+    // Spawning & IL2CPP runtime pointers
+    void* hIl2Cpp = dlopen("libil2cpp.so", RTLD_NOLOAD);
+    if (!hIl2Cpp) hIl2Cpp = RTLD_DEFAULT;
+
+    il2cpp_string_new_fn = (t_il2cpp_string_new)dlsym(hIl2Cpp, "il2cpp_string_new");
+
+    il2cpp_domain_get_fn = (t_il2cpp_domain_get)dlsym(hIl2Cpp, "il2cpp_domain_get");
+    if (!il2cpp_domain_get_fn) il2cpp_domain_get_fn = (t_il2cpp_domain_get)(g_Il2CppBase + 0x36ad8d4);
+
+    il2cpp_domain_get_assemblies_fn = (t_il2cpp_domain_get_assemblies)dlsym(hIl2Cpp, "il2cpp_domain_get_assemblies");
+    if (!il2cpp_domain_get_assemblies_fn) il2cpp_domain_get_assemblies_fn = (t_il2cpp_domain_get_assemblies)(g_Il2CppBase + 0x36ad8e0);
+
+    il2cpp_assembly_get_image_fn = (t_il2cpp_assembly_get_image)dlsym(hIl2Cpp, "il2cpp_assembly_get_image");
+    if (!il2cpp_assembly_get_image_fn) il2cpp_assembly_get_image_fn = (t_il2cpp_assembly_get_image)(g_Il2CppBase + 0x36ad3d8);
+
+    il2cpp_image_get_name_fn = (t_il2cpp_image_get_name)dlsym(hIl2Cpp, "il2cpp_image_get_name");
+    if (!il2cpp_image_get_name_fn) il2cpp_image_get_name_fn = (t_il2cpp_image_get_name)(g_Il2CppBase + 0x36adfac);
+
+    il2cpp_class_from_name_fn = (t_il2cpp_class_from_name)dlsym(hIl2Cpp, "il2cpp_class_from_name");
+    if (!il2cpp_class_from_name_fn) il2cpp_class_from_name_fn = (t_il2cpp_class_from_name)(g_Il2CppBase + 0x36ad410);
+
+    il2cpp_runtime_class_init_fn = (t_il2cpp_runtime_class_init)dlsym(hIl2Cpp, "il2cpp_runtime_class_init");
+    if (!il2cpp_runtime_class_init_fn) il2cpp_runtime_class_init_fn = (t_il2cpp_runtime_class_init)(g_Il2CppBase + 0x36adcfc);
+
+    il2cpp_class_get_field_from_name_fn = (t_il2cpp_class_get_field_from_name)dlsym(hIl2Cpp, "il2cpp_class_get_field_from_name");
+    if (!il2cpp_class_get_field_from_name_fn) il2cpp_class_get_field_from_name_fn = (t_il2cpp_class_get_field_from_name)(g_Il2CppBase + 0x36ad430);
+
+    il2cpp_field_static_get_value_fn = (t_il2cpp_field_static_get_value)dlsym(hIl2Cpp, "il2cpp_field_static_get_value");
+    if (!il2cpp_field_static_get_value_fn) il2cpp_field_static_get_value_fn = (t_il2cpp_field_static_get_value)(g_Il2CppBase + 0x36adac8);
     GameAssetCatalog_GetUnitPrefab = (t_GameAssetCatalog_GetUnitPrefab)(g_Il2CppBase + RVA_ASSET_CATALOG_GET_PREFAB);
     SpawnManager_SpawnUnit = (t_SpawnManager_SpawnUnit)(g_Il2CppBase + RVA_SPAWN_MANAGER_SPAWN_UNIT);
     SpawnManager_SpawnAirUnit = (t_SpawnManager_SpawnAirUnit)(g_Il2CppBase + RVA_SPAWN_MANAGER_SPAWN_AIR);
@@ -1510,6 +1627,8 @@ void* thread(void*) {
     // 10. Landing Gear & Screen/Input Pointers
     AircraftMio_ToggleLandingGear = (t_AircraftMio_ToggleLandingGear)(g_Il2CppBase + RVA_AIRCRAFTMIO_TOGGLEGEAR);
     HelicopterMio_ToggleLandingGear = (t_HelicopterMio_ToggleLandingGear)(g_Il2CppBase + RVA_HELICOPTERMIO_TOGGLEGEAR);
+    StageUI_OnLandingGearButtonClicked = (t_StageUI_OnLandingGearButtonClicked)(g_Il2CppBase + RVA_STAGEUI_ONLANDINGGEAR);
+    ToggleOrHoldButton_Flash = (t_ToggleOrHoldButton_Flash)(g_Il2CppBase + RVA_BUTTON_FLASH);
     Object_Instantiate_Parent = (t_Object_Instantiate_Parent)(g_Il2CppBase + RVA_OBJECT_INSTANTIATE_PARENT);
     Input_GetMouseButtonDown = (t_Input_GetMouseButtonDown)(g_Il2CppBase + RVA_INPUT_GETMOUSEBUTTONDOWN);
     Input_get_mousePosition_Injected = (t_Input_get_mousePosition_Injected)(g_Il2CppBase + RVA_INPUT_GETMOUSEPOS_INJ);
