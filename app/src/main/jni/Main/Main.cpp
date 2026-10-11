@@ -70,6 +70,7 @@
 #define RVA_CAMERAMANAGER_AWAKE         0x3EFA604 // CameraManager.Awake
 #define RVA_CAMERAMANAGER_SETCAMERABYTYPE 0x3EF815C // CameraManager.SetCameraByType(GameCameraType type)
 #define RVA_CAMERAMANAGER_SETCAMERA     0x3EFB430 // CameraManager.SetCamera(GameCameraType gameCameraType, VehicleSeat follow, UnitType unitType)
+#define RVA_VEHICLESEAT_INITIALIZEHUD   0x3B48D04 // VehicleSeat.InitializeHUD
 #define RVA_AIRPLANE_FIXEDUPDATE        0x3BB5FDC // Airplane.FixedUpdate
 #define RVA_AIRCRAFTMIO_SETCONTROLLER   0x3B26688 // AircraftMio.SetAirCraftControllerType(AircraftControllerType type)
 #define RVA_JOYSTICK_START              0x38976BC // Joystick.Start
@@ -167,6 +168,7 @@ typedef void (*t_RotatingSensor_Update)(void* self);
 typedef void (*t_CameraManager_Awake)(void* self, void* method);
 typedef void (*t_CameraManager_SetCameraByType)(void* self, int type, void* method);
 typedef void (*t_CameraManager_SetCamera)(void* self, int gameCameraType, void* follow, int unitType, void* method);
+typedef void (*t_VehicleSeat_InitializeHUD)(void* self);
 typedef void (*t_Airplane_FixedUpdate)(void* self, void* method);
 typedef void (*t_AircraftMio_SetAirCraftControllerType)(void* self, int type, void* method);
 typedef void (*t_Joystick_Start)(void* self, void* method);
@@ -254,6 +256,7 @@ static t_RotatingSensor_Update orig_RotatingSensor_Update = nullptr;
 static t_CameraManager_Awake orig_CameraManager_Awake = nullptr;
 static t_CameraManager_SetCameraByType orig_CameraManager_SetCameraByType = nullptr;
 static t_CameraManager_SetCamera orig_CameraManager_SetCamera = nullptr;
+static t_VehicleSeat_InitializeHUD VehicleSeat_InitializeHUD = nullptr;
 static void* g_CameraManagerInstance = nullptr;
 static t_Airplane_FixedUpdate orig_Airplane_FixedUpdate = nullptr;
 static t_AircraftMio_SetAirCraftControllerType AircraftMio_SetAirCraftControllerType = nullptr;
@@ -368,6 +371,10 @@ inline bool IsUnityObjectAlive(const void* uObj) {
     if (!IsValidPtr(uObj)) return false;
     void* nativePtr = *(void**)((uintptr_t)uObj + 0x10); // UnityEngine.Object.m_CachedPtr
     return IsValidPtr(nativePtr);
+}
+
+static inline void PatchDword(uintptr_t addr, uint32_t instruction) {
+    MemoryPatch(addr, &instruction, sizeof(instruction)).Modify();
 }
 
 static void* s_StageUIField = nullptr;
@@ -771,6 +778,36 @@ void ApplyCockpitCursorSteering(void* seat, int cameraType) {
     }
 }
 
+void EnsureSeatHUDActive(void* seat) {
+    if (!IsUnityObjectAlive(seat)) return;
+    void* hud = *(void**)((uintptr_t)seat + 0x58); // VehicleSeat.generalHUD
+    if (!IsUnityObjectAlive(hud) && VehicleSeat_InitializeHUD) {
+        LOGI("[C-RAM-MOD] Initializing missing generalHUD on seat %p", seat);
+        VehicleSeat_InitializeHUD(seat);
+        hud = *(void**)((uintptr_t)seat + 0x58);
+    }
+    if (IsUnityObjectAlive(hud)) {
+        // Ensure HUD's parentSeat is linked to this seat
+        *(void**)((uintptr_t)hud + OFFSET_HUD_PARENTSEAT) = seat;
+
+        // Ensure HUD's mainCamera is fresh active main camera
+        if (Camera_get_main) {
+            void* freshCam = Camera_get_main();
+            if (IsUnityObjectAlive(freshCam)) {
+                *(void**)((uintptr_t)hud + OFFSET_HUD_MAINCAMERA) = freshCam;
+            }
+        }
+
+        // Ensure HUD GameObject is active
+        if (Component_get_gameObject && GameObject_SetActive) {
+            void* go = Component_get_gameObject(hud, nullptr);
+            if (IsUnityObjectAlive(go)) {
+                GameObject_SetActive(go, true, nullptr);
+            }
+        }
+    }
+}
+
 void hook_CameraManager_Awake(void* self, void* method) {
     g_CameraManagerInstance = self;
     LOGI("[C-RAM-MOD] CameraManager::Awake captured! Instance: %p", self);
@@ -790,6 +827,7 @@ void hook_CameraManager_SetCameraByType(void* self, int type, void* method) {
     if (IsValidPtr(self)) {
         seat = *(void**)((uintptr_t)self + 0x1A0); // CameraManager.selectedSeat
     }
+    EnsureSeatHUDActive(seat);
     ApplyCockpitCursorSteering(seat, type);
 }
 
@@ -800,7 +838,12 @@ void hook_CameraManager_SetCamera(void* self, int gameCameraType, void* follow, 
     if (orig_CameraManager_SetCamera) {
         orig_CameraManager_SetCamera(self, gameCameraType, follow, unitType, method);
     }
-    ApplyCockpitCursorSteering(follow, gameCameraType);
+    void* seat = follow;
+    if (!IsUnityObjectAlive(seat) && IsValidPtr(self)) {
+        seat = *(void**)((uintptr_t)self + 0x1A0); // selectedSeat
+    }
+    EnsureSeatHUDActive(seat);
+    ApplyCockpitCursorSteering(seat, gameCameraType);
 }
 
 // -----------------------------------------------------------------------------
@@ -1738,6 +1781,24 @@ static bool CalculateLead(
 // Battle Hook (GeneralHUD.LateUpdate)
 // -----------------------------------------------------------------------------
 void hook_GeneralHUD_LateUpdate(void* self) {
+    if (IsUnityObjectAlive(self)) {
+        // 1. Critical Fix: Ensure HUD mainCamera is always valid and fresh BEFORE native code runs
+        void* cam = *(void**)((uintptr_t)self + OFFSET_HUD_MAINCAMERA);
+        void* freshCam = Camera_get_main ? Camera_get_main() : nullptr;
+        if (IsUnityObjectAlive(freshCam) && (!IsUnityObjectAlive(cam) || cam != freshCam)) {
+            *(void**)((uintptr_t)self + OFFSET_HUD_MAINCAMERA) = freshCam;
+        }
+
+        // 2. Critical Fix: Ensure parentSeat is linked if null or destroyed
+        void* seat = *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT);
+        if (!IsUnityObjectAlive(seat) && IsValidPtr(g_CameraManagerInstance)) {
+            void* selectedSeat = *(void**)((uintptr_t)g_CameraManagerInstance + 0x1A0);
+            if (IsUnityObjectAlive(selectedSeat)) {
+                *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT) = selectedSeat;
+            }
+        }
+    }
+
     if (orig_GeneralHUD_LateUpdate) {
         orig_GeneralHUD_LateUpdate(self);
     }
@@ -1751,16 +1812,16 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         g_ActiveBufferIdx.store(writeIdx);
     };
 
-    if (!IsValidPtr(self) || !Camera_WorldToScreenPoint || !Camera_get_main) {
+    if (!IsUnityObjectAlive(self) || !Camera_WorldToScreenPoint || !Camera_get_main) {
         clearTargets();
         return;
     }
 
     void* cam = *(void**)((uintptr_t)self + OFFSET_HUD_MAINCAMERA);
-    if (!IsValidPtr(cam)) {
+    if (!IsUnityObjectAlive(cam)) {
         cam = Camera_get_main();
     }
-    if (!IsValidPtr(cam)) {
+    if (!IsUnityObjectAlive(cam)) {
         clearTargets();
         return;
     }
@@ -1825,6 +1886,10 @@ void hook_GeneralHUD_LateUpdate(void* self) {
     }
 
     auto enemyList = *(monoList<void*>**)((uintptr_t)self + OFFSET_HUD_ALLENEMIES);
+    if (!IsValidPtr(enemyList) || !IsValidPtr(enemyList->items) || enemyList->getSize() <= 0) {
+        // Fallback: check allDetectedUnits (0x130) if allEnemyUnits is empty
+        enemyList = *(monoList<void*>**)((uintptr_t)self + 0x130);
+    }
     if (!IsValidPtr(enemyList) || !IsValidPtr(enemyList->items)) {
         clearTargets();
         return;
@@ -2117,6 +2182,7 @@ void* thread(void*) {
     UltimateJoystick_DisableJoystick = (t_UltimateJoystick_DisableJoystick)(g_Il2CppBase + RVA_ULTIMATEJOYSTICK_DISABLE);
     GameObject_SetActive = (t_GameObject_SetActive)(g_Il2CppBase + RVA_GAMEOBJECT_SETACTIVE);
     Component_get_gameObject = (t_Component_get_gameObject)(g_Il2CppBase + RVA_COMP_GET_GAMEOBJECT);
+    VehicleSeat_InitializeHUD = (t_VehicleSeat_InitializeHUD)(g_Il2CppBase + RVA_VEHICLESEAT_INITIALIZEHUD);
 
     // Economy pointers
     InventoryWrapper_AddCurrency = (t_InventoryWrapper_AddCurrency)(g_Il2CppBase + RVA_INVENTORY_ADDCURRENCY);
@@ -2199,6 +2265,24 @@ void* thread(void*) {
     DobbyHook((void*)(g_Il2CppBase + RVA_BUTTON_ONPOINTERUP), (void*)hook_ToggleOrHoldButton_OnPointerUp, (void**)&orig_ToggleOrHoldButton_OnPointerUp);
     DobbyHook((void*)(g_Il2CppBase + RVA_STAGEUI_ONLANDINGGEAR), (void*)hook_StageUI_OnLandingGearButtonClicked, (void**)&orig_StageUI_OnLandingGearButtonClicked);
     DobbyHook((void*)(g_Il2CppBase + RVA_AIRCRAFTMIO_TOGGLEGEAR), (void*)hook_AircraftMio_ToggleLandingGear, (void**)&orig_AircraftMio_ToggleLandingGear);
+
+    // 10b. Livery Editor Decal Limit Removal (Unlimited Decals: 50 -> 9999)
+    // 1. VehicleDecalPaintMode$$StartPlacement: NOP limit check (0x38C4808)
+    PatchDword(g_Il2CppBase + 0x38C4808, 0x1F2003D5);
+
+    // 2. VehicleDecalPaintMode$$DuplicateSelected: NOP limit check (0x38C53B4)
+    PatchDword(g_Il2CppBase + 0x38C53B4, 0x1F2003D5);
+
+    // 3. VehicleDecalPaintMode$$FitToEditorLimits: Branch over RemoveRange truncation (0x38C5DD0)
+    PatchDword(g_Il2CppBase + 0x38C5DD0, 0x14000009);
+
+    // 4. VehicleDecalPaintPanel$$RefreshHeader: movz w8, #9999 (Show '/ 9999') (0x38CFA6C)
+    PatchDword(g_Il2CppBase + 0x38CFA6C, 0x5284E1E8);
+
+    // 5. VehicleDecalPaintPanel$$RefreshHeader: Branch over red warning threshold (0x38CFAC4)
+    PatchDword(g_Il2CppBase + 0x38CFAC4, 0x1400000D);
+
+    LOGI("[C-RAM-MOD] Livery Decal Limit Patches applied successfully (Limit raised to 9999)");
 
     // 11. Start ADB Socket Listener Thread on 0.0.0.0:8888
     pthread_t sock_t;
