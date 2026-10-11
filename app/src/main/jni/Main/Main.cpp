@@ -774,11 +774,14 @@ void EnsureSeatHUDActive(void* seat) {
         hud = *(void**)((uintptr_t)seat + 0x58);
     }
     if (IsUnityObjectAlive(hud)) {
-        // Ensure HUD's parentSeat is linked to this seat
-        *(void**)((uintptr_t)hud + OFFSET_HUD_PARENTSEAT) = seat;
+        // Ensure HUD's parentSeat is linked to this seat if missing
+        if (!IsUnityObjectAlive(*(void**)((uintptr_t)hud + OFFSET_HUD_PARENTSEAT))) {
+            *(void**)((uintptr_t)hud + OFFSET_HUD_PARENTSEAT) = seat;
+        }
 
-        // Ensure HUD's mainCamera is fresh active main camera
-        if (Camera_get_main) {
+        // Ensure HUD's mainCamera is linked only if null (never overwrite active turret/seat camera!)
+        void* curCam = *(void**)((uintptr_t)hud + OFFSET_HUD_MAINCAMERA);
+        if (!IsUnityObjectAlive(curCam) && Camera_get_main) {
             void* freshCam = Camera_get_main();
             if (IsUnityObjectAlive(freshCam)) {
                 *(void**)((uintptr_t)hud + OFFSET_HUD_MAINCAMERA) = freshCam;
@@ -1772,24 +1775,6 @@ static bool CalculateLead(
 // Battle Hook (GeneralHUD.LateUpdate)
 // -----------------------------------------------------------------------------
 void hook_GeneralHUD_LateUpdate(void* self) {
-    if (IsUnityObjectAlive(self)) {
-        // 1. Critical Fix: Ensure HUD mainCamera is always valid and fresh BEFORE native code runs
-        void* cam = *(void**)((uintptr_t)self + OFFSET_HUD_MAINCAMERA);
-        void* freshCam = Camera_get_main ? Camera_get_main() : nullptr;
-        if (IsUnityObjectAlive(freshCam) && (!IsUnityObjectAlive(cam) || cam != freshCam)) {
-            *(void**)((uintptr_t)self + OFFSET_HUD_MAINCAMERA) = freshCam;
-        }
-
-        // 2. Critical Fix: Ensure parentSeat is linked if null or destroyed
-        void* seat = *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT);
-        if (!IsUnityObjectAlive(seat) && IsValidPtr(g_CameraManagerInstance)) {
-            void* selectedSeat = *(void**)((uintptr_t)g_CameraManagerInstance + 0x1A0);
-            if (IsUnityObjectAlive(selectedSeat)) {
-                *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT) = selectedSeat;
-            }
-        }
-    }
-
     if (orig_GeneralHUD_LateUpdate) {
         orig_GeneralHUD_LateUpdate(self);
     }
@@ -2293,7 +2278,7 @@ void* thread(void*) {
     pthread_t sock_t;
     pthread_create(&sock_t, nullptr, socket_server_thread, nullptr);
 
-    LOGI("C-RAM v6.4 Hooks Installed: AC-130 Recoil Dampener + Heli Rocket Fix + Screen-Camera Decoupled Lead Reticle Ready!");
+    LOGI("C-RAM v6.5 Hooks Installed: Restored Pure run_35334470385 Camera HUD + Network Filters + AC-130 & Rocket Fixes Ready!");
     pthread_exit(nullptr);
 }
 
