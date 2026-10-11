@@ -42,6 +42,7 @@
 #define RVA_UNIT_TYPE                   0x3B38DB4 // IUnit.GetUnitType
 #define RVA_PHYS_VEL                    0x39DEC94 // PhysicsObject.get_Velocity
 #define RVA_HUD_LATEUPDATE              0x3ACF27C // GeneralHUD.LateUpdate
+#define RVA_HUD_ONDISABLE               0x3ACEBA0 // GeneralHUD.OnDisable
 
 // Multiplayer & UI Hooks
 #define RVA_EVENTSYSTEM_UPDATE          0x79EC8B4 // UnityEngine.EventSystems.EventSystem.Update
@@ -135,6 +136,7 @@ typedef Vector3 (*t_Transform_get_forward)(void* transform, void* method);
 typedef int (*t_IUnit_GetUnitType)(void* unit);
 typedef Vector3 (*t_PhysicsObject_get_Velocity)(void* physicsObject);
 typedef void (*t_GeneralHUD_LateUpdate)(void* self);
+typedef void (*t_GeneralHUD_OnDisable)(void* self, void* method);
 
 typedef void (*t_EventSystem_Update)(void* self);
 typedef void (*t_MpBootstrap)();
@@ -218,6 +220,8 @@ static t_PhysicsObject_get_Velocity orig_PhysicsObject_get_Velocity = nullptr;
 static t_PhysicsObject_get_Velocity PhysicsObject_get_Velocity = nullptr;
 Vector3 hook_PhysicsObject_get_Velocity(void* self);
 static t_GeneralHUD_LateUpdate orig_GeneralHUD_LateUpdate = nullptr;
+static t_GeneralHUD_OnDisable orig_GeneralHUD_OnDisable = nullptr;
+void hook_GeneralHUD_OnDisable(void* self, void* method);
 
 static t_EventSystem_Update orig_EventSystem_Update = nullptr;
 static t_MpBootstrap MpBootstrap = nullptr;
@@ -328,6 +332,7 @@ struct ScreenLeadTarget {
 static ScreenLeadTarget g_TargetsBuffer[2][MAX_TARGETS];
 static int g_TargetsCount[2] = {0, 0};
 static std::atomic<int> g_ActiveBufferIdx(0);
+static std::atomic<uint64_t> g_LastHudUpdateMs{0};
 
 // Check if pointer looks like valid userspace memory on 64-bit Android (ARM64)
 inline bool IsValidPtr(const void* ptr) {
@@ -430,6 +435,17 @@ struct TargetVelocityFilter {
 #define MAX_TRACKED_TARGETS 64
 static TargetVelocityFilter g_TargetFilters[MAX_TRACKED_TARGETS];
 static std::mutex g_FilterMutex;
+
+static void ClearTargetFilters() {
+    std::lock_guard<std::mutex> lock(g_FilterMutex);
+    for (int i = 0; i < MAX_TRACKED_TARGETS; i++) {
+        g_TargetFilters[i].targetId = 0;
+        g_TargetFilters[i].isVelocityInit = false;
+        g_TargetFilters[i].isScreenInit = false;
+        g_TargetFilters[i].lastTimestampMs = 0;
+        g_TargetFilters[i].sampleCount = 0;
+    }
+}
 
 // Variant 1 & 2 & 4: Velocity Stabilization for Network Aircraft
 static Vector3 FilterVelocityForTarget(void* target, const Vector3& rawVel, uint64_t nowMs) {
@@ -1597,7 +1613,17 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         orig_GeneralHUD_LateUpdate(self);
     }
 
+    uint64_t nowMs = getNowMs();
+    g_LastHudUpdateMs.store(nowMs);
+
+    auto clearTargets = [&]() {
+        int writeIdx = 1 - g_ActiveBufferIdx.load();
+        g_TargetsCount[writeIdx] = 0;
+        g_ActiveBufferIdx.store(writeIdx);
+    };
+
     if (!IsValidPtr(self) || !Camera_WorldToScreenPoint || !Camera_get_main) {
+        clearTargets();
         return;
     }
 
@@ -1605,7 +1631,10 @@ void hook_GeneralHUD_LateUpdate(void* self) {
     if (!IsValidPtr(cam)) {
         cam = Camera_get_main();
     }
-    if (!IsValidPtr(cam)) return;
+    if (!IsValidPtr(cam)) {
+        clearTargets();
+        return;
+    }
 
     Vector3 gunPos(0, 0, 0);
     float bulletSpeed = 1050.0f;
@@ -1667,10 +1696,16 @@ void hook_GeneralHUD_LateUpdate(void* self) {
     }
 
     auto enemyList = *(monoList<void*>**)((uintptr_t)self + OFFSET_HUD_ALLENEMIES);
-    if (!IsValidPtr(enemyList) || !IsValidPtr(enemyList->items)) return;
+    if (!IsValidPtr(enemyList) || !IsValidPtr(enemyList->items)) {
+        clearTargets();
+        return;
+    }
 
     int enemyCount = enemyList->getSize();
-    if (enemyCount <= 0 || enemyCount > 256) return;
+    if (enemyCount <= 0 || enemyCount > 256) {
+        clearTargets();
+        return;
+    }
 
     int writeIdx = 1 - g_ActiveBufferIdx.load();
     int count = 0;
@@ -1750,6 +1785,20 @@ void hook_GeneralHUD_LateUpdate(void* self) {
 }
 
 // -----------------------------------------------------------------------------
+// Battle Hook: GeneralHUD.OnDisable (Instant Cleanup on Match Exit / Round End)
+// -----------------------------------------------------------------------------
+void hook_GeneralHUD_OnDisable(void* self, void* method) {
+    if (orig_GeneralHUD_OnDisable) {
+        orig_GeneralHUD_OnDisable(self, method);
+    }
+    g_TargetsCount[0] = 0;
+    g_TargetsCount[1] = 0;
+    g_ActiveBufferIdx.store(0);
+    g_LastHudUpdateMs.store(0);
+    ClearTargetFilters();
+}
+
+// -----------------------------------------------------------------------------
 // ESP Drawing Loop (Render Thread inside eglSwapBuffers)
 // -----------------------------------------------------------------------------
 void DrawMenu() {
@@ -1758,112 +1807,39 @@ void DrawMenu() {
 
     if (!g_LeadEspEnabled.load()) return;
 
-    int readIdx = g_ActiveBufferIdx.load();
-    int count = g_TargetsCount[readIdx];
-
-    float screenWidth = (glWidth > 0) ? (float)glWidth : ImGui::GetIO().DisplaySize.x;
-    if (screenWidth <= 0.0f) screenWidth = 1920.0f;
-
-    // 1. Stylish Top HUD Status Badge
-    if (g_LeadHudBadgeEnabled.load()) {
-        int mode = g_LeadStabilizerMode.load();
-        const char* modeNames[] = {
-            "RAW (OFF)",
-            "EMA LOW-PASS",
-            "ACCEL G-CLAMP",
-            "VISUAL DAMPING",
-            "ULTIMATE HYBRID (EMA+CLAMP+DAMP)"
-        };
-        char badgeBuf[160];
-        snprintf(badgeBuf, sizeof(badgeBuf), "C-RAM v6.0 | LEAD STABILIZER: %s | HOOK: %s | TARGETS: %d",
-                 modeNames[mode],
-                 g_GlobalVelocityHookEnabled.load() ? "ACTIVE" : "OFF",
-                 count);
-
-        ImVec2 textSize = ImGui::CalcTextSize(badgeBuf);
-        float badgeX = (screenWidth - textSize.x) * 0.5f;
-        float badgeY = 24.0f;
-        ImU32 borderColor = (mode == LEAD_MODE_OFF) ? IM_COL32(220, 50, 50, 190) : IM_COL32(0, 200, 255, 200);
-
-        draw->AddRectFilled(ImVec2(badgeX - 10.0f, badgeY - 4.0f),
-                            ImVec2(badgeX + textSize.x + 10.0f, badgeY + textSize.y + 4.0f),
-                            IM_COL32(10, 16, 26, 210), 4.0f);
-        draw->AddRect(ImVec2(badgeX - 10.0f, badgeY - 4.0f),
-                      ImVec2(badgeX + textSize.x + 10.0f, badgeY + textSize.y + 4.0f),
-                      borderColor, 4.0f, 0, 1.5f);
-        draw->AddText(ImVec2(badgeX, badgeY), IM_COL32(235, 245, 255, 250), badgeBuf);
+    uint64_t lastUpdate = g_LastHudUpdateMs.load();
+    if (lastUpdate == 0 || (getNowMs() - lastUpdate) > 200) {
+        return;
     }
 
+    int readIdx = g_ActiveBufferIdx.load();
+    int count = g_TargetsCount[readIdx];
     if (count <= 0) return;
 
     const float leadCircleRadius = 14.0f;
+    const ImU32 circleColor = IM_COL32(255, 45, 45, 240);
+    const ImU32 centerColor = IM_COL32(255, 255, 255, 255);
+    const ImU32 lineColor = IM_COL32(255, 210, 50, 170);
+    const ImU32 textColor = IM_COL32(255, 255, 255, 240);
 
     for (int i = 0; i < count; i++) {
         const ScreenLeadTarget& tgt = g_TargetsBuffer[readIdx][i];
         ImVec2 leadPoint(tgt.leadX, tgt.leadY);
 
-        // Dynamic tactical coloring:
-        // Green: In effective gun range (<= 1000m)
-        // Amber: Medium range (1000m - 2000m)
-        // Red: Long range (> 2000m)
-        ImU32 circleColor;
-        ImU32 centerColor = IM_COL32(255, 255, 255, 255);
-        ImU32 lineColor;
-
-        if (tgt.distance <= 1000.0f) {
-            circleColor = IM_COL32(0, 255, 140, 240); // Emerald Green
-            lineColor = IM_COL32(0, 255, 180, 170);
-        } else if (tgt.distance <= 2000.0f) {
-            circleColor = IM_COL32(255, 200, 30, 240); // Amber
-            lineColor = IM_COL32(255, 210, 50, 160);
-        } else {
-            circleColor = IM_COL32(255, 50, 50, 230); // Crimson
-            lineColor = IM_COL32(255, 80, 80, 140);
-        }
-
-        // Draw tactical outer circle + center dot
-        draw->AddCircle(leadPoint, leadCircleRadius, circleColor, 28, 2.5f);
+        draw->AddCircle(leadPoint, leadCircleRadius, circleColor, 24, 2.5f);
         draw->AddCircleFilled(leadPoint, 2.5f, centerColor);
 
-        // Reticle ticks (military aviation HUD crosshair)
-        float cross = leadCircleRadius * 0.55f;
+        float cross = leadCircleRadius * 0.5f;
         draw->AddLine(ImVec2(leadPoint.x - cross, leadPoint.y), ImVec2(leadPoint.x + cross, leadPoint.y), circleColor, 1.5f);
         draw->AddLine(ImVec2(leadPoint.x, leadPoint.y - cross), ImVec2(leadPoint.x, leadPoint.y + cross), circleColor, 1.5f);
 
-        // Tactical Target Brackets when in close range (<= 1000m)
-        if (tgt.distance <= 1000.0f) {
-            float bSize = 6.0f;
-            float r = leadCircleRadius + 3.0f;
-            // Top-left bracket
-            draw->AddLine(ImVec2(leadPoint.x - r, leadPoint.y - r), ImVec2(leadPoint.x - r + bSize, leadPoint.y - r), circleColor, 2.0f);
-            draw->AddLine(ImVec2(leadPoint.x - r, leadPoint.y - r), ImVec2(leadPoint.x - r, leadPoint.y - r + bSize), circleColor, 2.0f);
-            // Top-right bracket
-            draw->AddLine(ImVec2(leadPoint.x + r, leadPoint.y - r), ImVec2(leadPoint.x + r - bSize, leadPoint.y - r), circleColor, 2.0f);
-            draw->AddLine(ImVec2(leadPoint.x + r, leadPoint.y - r), ImVec2(leadPoint.x + r, leadPoint.y - r + bSize), circleColor, 2.0f);
-            // Bottom-left bracket
-            draw->AddLine(ImVec2(leadPoint.x - r, leadPoint.y + r), ImVec2(leadPoint.x - r + bSize, leadPoint.y + r), circleColor, 2.0f);
-            draw->AddLine(ImVec2(leadPoint.x - r, leadPoint.y + r), ImVec2(leadPoint.x - r, leadPoint.y + r + bSize), circleColor, 2.0f);
-            // Bottom-right bracket
-            draw->AddLine(ImVec2(leadPoint.x + r, leadPoint.y + r), ImVec2(leadPoint.x + r - bSize, leadPoint.y + r), circleColor, 2.0f);
-            draw->AddLine(ImVec2(leadPoint.x + r, leadPoint.y + r), ImVec2(leadPoint.x + r, leadPoint.y + r - bSize), circleColor, 2.0f);
-        }
-
-        // Target lead line
         if (tgt.hasTargetLine) {
             draw->AddLine(ImVec2(tgt.targetX, tgt.targetY), leadPoint, lineColor, 1.5f);
         }
 
-        // Informative HUD Readout
-        char textBuf[96];
-        snprintf(textBuf, sizeof(textBuf), "%.0fm (%.1fs) | %.0f km/h", tgt.distance, tgt.flightTime, tgt.targetSpeedKmh);
-
-        // Background for text for crystal clear contrast against sky/clouds
-        ImVec2 tSize = ImGui::CalcTextSize(textBuf);
-        ImVec2 tPos(leadPoint.x + leadCircleRadius + 8.0f, leadPoint.y - tSize.y * 0.5f);
-        draw->AddRectFilled(ImVec2(tPos.x - 3.0f, tPos.y - 2.0f),
-                            ImVec2(tPos.x + tSize.x + 3.0f, tPos.y + tSize.y + 2.0f),
-                            IM_COL32(10, 15, 20, 180), 2.0f);
-        draw->AddText(tPos, circleColor, textBuf);
+        char textBuf[64];
+        snprintf(textBuf, sizeof(textBuf), "%.0fm (%.1fs)", tgt.distance, tgt.flightTime);
+        draw->AddText(ImVec2(leadPoint.x + leadCircleRadius + 5, leadPoint.y - 8), textColor, textBuf);
     }
 }
 
@@ -2014,9 +1990,12 @@ void* thread(void*) {
     // Economy pointers
     InventoryWrapper_AddCurrency = (t_InventoryWrapper_AddCurrency)(g_Il2CppBase + RVA_INVENTORY_ADDCURRENCY);
 
-    // 1. Hook GeneralHUD.LateUpdate for Battle ESP (Lead Indicator)
+    // 1. Hook GeneralHUD.LateUpdate & OnDisable for Battle Lead Indicator
     void* targetHUDMethod = (void*)(g_Il2CppBase + RVA_HUD_LATEUPDATE);
     DobbyHook(targetHUDMethod, (void*)hook_GeneralHUD_LateUpdate, (void**)&orig_GeneralHUD_LateUpdate);
+
+    void* targetHUDOnDisable = (void*)(g_Il2CppBase + RVA_HUD_ONDISABLE);
+    DobbyHook(targetHUDOnDisable, (void*)hook_GeneralHUD_OnDisable, (void**)&orig_GeneralHUD_OnDisable);
 
     // 1b. Hook PhysicsObject.get_Velocity for global multiplayer ghost velocity stabilization
     void* targetPhysVel = (void*)(g_Il2CppBase + RVA_PHYS_VEL);
