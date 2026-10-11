@@ -99,6 +99,10 @@
 #define RVA_SCREEN_GETWIDTH             0x7614088 // UnityEngine.Screen.get_width
 #define RVA_SCREEN_GETHEIGHT            0x76140B0 // UnityEngine.Screen.get_height
 
+// AC-130 & Turret Stabilization RVAs
+#define RVA_TURRET_FIXEDUPDATE          0x3B41EAC // Turret.FixedUpdate
+#define RVA_CAMERA_SHAKE_GUNFIRE        0x3F019FC // CameraShakeManager.GunfireAt
+
 // -----------------------------------------------------------------------------
 // Field Offsets from dump.cs & il2cpp.h (Updated for latest game version)
 // -----------------------------------------------------------------------------
@@ -143,6 +147,8 @@ typedef int (*t_IUnit_GetUnitType)(void* unit);
 typedef Vector3 (*t_PhysicsObject_get_Velocity)(void* physicsObject);
 typedef void (*t_GeneralHUD_LateUpdate)(void* self);
 typedef void (*t_GeneralHUD_OnDisable)(void* self, void* method);
+typedef void (*t_Turret_FixedUpdate)(void* self);
+typedef void (*t_CameraShakeManager_GunfireAt)(Vector3 position, float magnitude);
 
 typedef void (*t_EventSystem_Update)(void* self);
 typedef void (*t_MpBootstrap)();
@@ -234,6 +240,10 @@ Vector3 hook_PhysicsObject_get_Velocity(void* self);
 static t_GeneralHUD_LateUpdate orig_GeneralHUD_LateUpdate = nullptr;
 static t_GeneralHUD_OnDisable orig_GeneralHUD_OnDisable = nullptr;
 void hook_GeneralHUD_OnDisable(void* self, void* method);
+static t_Turret_FixedUpdate orig_Turret_FixedUpdate = nullptr;
+static t_CameraShakeManager_GunfireAt orig_CameraShakeManager_GunfireAt = nullptr;
+void hook_Turret_FixedUpdate(void* self);
+void hook_CameraShakeManager_GunfireAt(Vector3 position, float magnitude);
 
 static t_EventSystem_Update orig_EventSystem_Update = nullptr;
 static t_MpBootstrap MpBootstrap = nullptr;
@@ -337,7 +347,7 @@ static std::atomic<int> g_LeadStabilizerMode{LEAD_MODE_ULTIMATE};
 static std::atomic<float> g_LeadEmaFactor{12.0f};          // 1/s (typical 8.0 - 20.0)
 static std::atomic<float> g_LeadMaxAccelG{9.0f};           // Max allowable acceleration in G (9.0G = 88.3 m/s^2)
 static std::atomic<float> g_LeadVisualDampFactor{16.0f};   // Screen spring stiffness (10.0 - 25.0)
-static std::atomic<bool> g_GlobalVelocityHookEnabled{true}; // Intercept PhysicsObject.get_Velocity for game engines
+static std::atomic<bool> g_GlobalVelocityHookEnabled{false}; // Disabled by default: preserves 100% native rocket and game physics!
 static std::atomic<bool> g_LeadEspEnabled{true};           // Draw custom ImGui lead HUD
 static std::atomic<bool> g_LeadHudBadgeEnabled{true};      // Draw top status badge
 
@@ -581,79 +591,56 @@ static Vector3 FilterVelocityForTarget(void* target, const Vector3& rawVel, uint
     return state.smoothedVelocity;
 }
 
-// Variant 3 & 4: Adaptive Screen-Space Lead Reticle Damping (Deadzone + Adaptive Lerp)
+// Screen-Space Lead Reticle Filtering:
+// DISABLED/BYPASSED! Instantaneous world-to-screen projection guarantees zero camera lag/swinging when rotating turrets.
 static void FilterScreenLeadPosition(void* target, float rawScreenX, float rawScreenY, float& outScreenX, float& outScreenY, uint64_t nowMs) {
-    int mode = g_LeadStabilizerMode.load();
-    if (mode != LEAD_MODE_VISUAL_DAMPING && mode != LEAD_MODE_ULTIMATE) {
-        outScreenX = rawScreenX;
-        outScreenY = rawScreenY;
-        return;
-    }
-
-    uintptr_t targetId = (uintptr_t)target;
-    std::lock_guard<std::mutex> lock(g_FilterMutex);
-
-    int slot = -1;
-    for (int i = 0; i < MAX_TRACKED_TARGETS; i++) {
-        if (g_TargetFilters[i].targetId == targetId) {
-            slot = i;
-            break;
-        }
-    }
-
-    if (slot == -1) {
-        outScreenX = rawScreenX;
-        outScreenY = rawScreenY;
-        return;
-    }
-
-    TargetVelocityFilter& state = g_TargetFilters[slot];
-    if (!state.isScreenInit) {
-        state.lastScreenX = rawScreenX;
-        state.lastScreenY = rawScreenY;
-        state.isScreenInit = true;
-        outScreenX = rawScreenX;
-        outScreenY = rawScreenY;
-        return;
-    }
-
-    float dx = rawScreenX - state.lastScreenX;
-    float dy = rawScreenY - state.lastScreenY;
-    float distPx = sqrtf(dx * dx + dy * dy);
-
-    // Deadzone against micro-pixel jitter
-    if (distPx < 1.2f) {
-        outScreenX = state.lastScreenX;
-        outScreenY = state.lastScreenY;
-        return;
-    }
-
-    // Adaptive damping: smooth when steady, responsive during rapid breaks/maneuvers
-    float baseFactor = g_LeadVisualDampFactor.load(); // default 16.0
-    float adaptiveFactor = baseFactor + fminf(distPx * 0.35f, 45.0f);
-    float dt = 0.016f; // approx 60 FPS LateUpdate frame time
-    float alpha = 1.0f - expf(-adaptiveFactor * dt);
-    if (alpha > 1.0f) alpha = 1.0f;
-    if (alpha < 0.05f) alpha = 0.05f;
-
-    state.lastScreenX = state.lastScreenX + dx * alpha;
-    state.lastScreenY = state.lastScreenY + dy * alpha;
-
-    outScreenX = state.lastScreenX;
-    outScreenY = state.lastScreenY;
+    outScreenX = rawScreenX;
+    outScreenY = rawScreenY;
 }
 
-// Global Hook for PhysicsObject.get_Velocity (Intercepts both native game autocannons & mod)
+// -----------------------------------------------------------------------------
+// AC-130 Gunship Turret Recoil & Camera Shake Stabilization Hooks
+// -----------------------------------------------------------------------------
+// Neutralizes cumulative recoil impulse on the airframe when firing AC-130 cannons (20mm, 40mm, 105mm),
+// preventing airframe rolling/capsizing, autopilot drift, and camera detachment/inversion.
+void hook_Turret_FixedUpdate(void* self) {
+    if (IsValidPtr(self)) {
+        void* aws = *(void**)((uintptr_t)self + 0x30); // WeaponSystem.parent
+        if (IsValidPtr(aws)) {
+            void* parentUnit = *(void**)((uintptr_t)aws + 0x20); // AWS.parent (IUnit)
+            if (IsValidPtr(parentUnit) && IUnit_GetUnitType) {
+                int uType = IUnit_GetUnitType(parentUnit);
+                if (uType == 3) { // Air unit (including AC-130 gunship)
+                    // Zero out physical recoil impulse on aircraft airframe to prevent rolling/capsizing
+                    *(float*)((uintptr_t)self + 0x148) = 0.0f; // _recoilImpulsePending = 0
+                    *(float*)((uintptr_t)self + 0x14C) = 0.0f; // _recoilTimeRemaining = 0
+                }
+            }
+        }
+    }
+    if (orig_Turret_FixedUpdate) {
+        orig_Turret_FixedUpdate(self);
+    }
+}
+
+// Suppresses violent gunfire impulse shaking in AC130_OPERATOR camera (type 22)
+// to maintain a rock-solid gyro-stabilized FLIR targeting pod view and prevent camera clipping/breakage.
+void hook_CameraShakeManager_GunfireAt(Vector3 position, float magnitude) {
+    int curCam = g_CurrentCameraType.load();
+    if (curCam == 22) { // GameCameraType.AC130_OPERATOR
+        return;
+    }
+    if (orig_CameraShakeManager_GunfireAt) {
+        orig_CameraShakeManager_GunfireAt(position, magnitude);
+    }
+}
+
+// Stub for PhysicsObject.get_Velocity (keeps native physics 100% unhindered)
 Vector3 hook_PhysicsObject_get_Velocity(void* self) {
     if (!orig_PhysicsObject_get_Velocity) {
         return Vector3(0, 0, 0);
     }
-    Vector3 rawVel = orig_PhysicsObject_get_Velocity(self);
-    if (!g_GlobalVelocityHookEnabled.load() || !IsValidPtr(self)) {
-        return rawVel;
-    }
-    uint64_t nowMs = getNowMs();
-    return FilterVelocityForTarget(self, rawVel, nowMs);
+    return orig_PhysicsObject_get_Velocity(self);
 }
 
 
@@ -1722,12 +1709,13 @@ void* socket_server_thread(void*) {
 }
 
 // -----------------------------------------------------------------------------
-// Lead Math Solver (Exact Quadratic Ballistic Solver)
+// Lead Math Solver (Exact Quadratic Ballistic Solver with Relative Shooter Velocity)
 // -----------------------------------------------------------------------------
 static bool CalculateLead(
     const Vector3& targetPos,
     const Vector3& targetVel,
     const Vector3& gunPos,
+    const Vector3& playerVel,
     float bulletSpeed,
     bool noGravity,
     Vector3& outLeadPos,
@@ -1740,10 +1728,13 @@ static bool CalculateLead(
         return false;
     }
 
-    float vSqr = Vector3::Dot(targetVel, targetVel);
+    // Relative target velocity in the shooter's moving frame of reference
+    Vector3 relVel = targetVel - playerVel;
+
+    float vSqr = Vector3::Dot(relVel, relVel);
     float bSqr = bulletSpeed * bulletSpeed;
     float a = vSqr - bSqr;
-    float b = 2.0f * Vector3::Dot(rel, targetVel);
+    float b = 2.0f * Vector3::Dot(rel, relVel);
     float c = Vector3::Dot(rel, rel);
 
     float t = -1.0f;
@@ -1768,7 +1759,7 @@ static bool CalculateLead(
     }
 
     outFlightTime = t;
-    outLeadPos = targetPos + targetVel * t;
+    outLeadPos = targetPos + relVel * t;
 
     if (!noGravity) {
         outLeadPos.Y += 0.5f * 9.0f * t * t;
@@ -1827,12 +1818,25 @@ void hook_GeneralHUD_LateUpdate(void* self) {
     }
 
     Vector3 gunPos(0, 0, 0);
+    Vector3 playerVel(0, 0, 0);
     float bulletSpeed = 1050.0f;
     bool noGravity = false;
     bool foundTurret = false;
 
     void* seat = *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT);
+    if (!IsValidPtr(seat) && IsValidPtr(g_CameraManagerInstance)) {
+        seat = *(void**)((uintptr_t)g_CameraManagerInstance + 0x1A0);
+    }
+
     if (IsValidPtr(seat)) {
+        void* seatSys = *(void**)((uintptr_t)seat + 0x20); // VehicleSeat.parent (SeatSystem)
+        if (IsValidPtr(seatSys)) {
+            void* playerUnit = *(void**)((uintptr_t)seatSys + 0x20); // SeatSystem.parent (IUnit)
+            if (IsValidPtr(playerUnit) && PhysicsObject_get_Velocity) {
+                playerVel = PhysicsObject_get_Velocity(playerUnit);
+            }
+        }
+
         if (Component_get_transform && Transform_get_position) {
             void* seatTr = Component_get_transform(seat);
             if (IsValidPtr(seatTr)) {
@@ -1936,7 +1940,7 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         float flightTime = 0.0f;
         float distance = 0.0f;
 
-        if (!CalculateLead(targetPos, targetVel, gunPos, bulletSpeed, noGravity, leadPos, flightTime, distance)) {
+        if (!CalculateLead(targetPos, targetVel, gunPos, playerVel, bulletSpeed, noGravity, leadPos, flightTime, distance)) {
             continue;
         }
 
@@ -1948,11 +1952,9 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         float rawLeadScreenX = leadScreen.X;
         float rawLeadScreenY = screenHeight - leadScreen.Y;
 
+        // Instantaneous world-to-screen projection: zero camera lag/swinging when panning
         float smoothLeadScreenX = rawLeadScreenX;
         float smoothLeadScreenY = rawLeadScreenY;
-
-        // Variant 3 & 4: Adaptive Screen-Space Lead Reticle Damping
-        FilterScreenLeadPosition(target, rawLeadScreenX, rawLeadScreenY, smoothLeadScreenX, smoothLeadScreenY, nowMs);
 
         ScreenLeadTarget& entry = g_TargetsBuffer[writeIdx][count];
         entry.leadX = smoothLeadScreenX;
@@ -2194,9 +2196,12 @@ void* thread(void*) {
     void* targetHUDOnDisable = (void*)(g_Il2CppBase + RVA_HUD_ONDISABLE);
     DobbyHook(targetHUDOnDisable, (void*)hook_GeneralHUD_OnDisable, (void**)&orig_GeneralHUD_OnDisable);
 
-    // 1b. Hook PhysicsObject.get_Velocity for global multiplayer ghost velocity stabilization
-    void* targetPhysVel = (void*)(g_Il2CppBase + RVA_PHYS_VEL);
-    DobbyHook(targetPhysVel, (void*)hook_PhysicsObject_get_Velocity, (void**)&orig_PhysicsObject_get_Velocity);
+    // 1b. AC-130 Recoil Suppression & Camera Shake Protection
+    void* targetTurretFixedUpdate = (void*)(g_Il2CppBase + RVA_TURRET_FIXEDUPDATE);
+    DobbyHook(targetTurretFixedUpdate, (void*)hook_Turret_FixedUpdate, (void**)&orig_Turret_FixedUpdate);
+
+    void* targetCameraShakeGunfire = (void*)(g_Il2CppBase + RVA_CAMERA_SHAKE_GUNFIRE);
+    DobbyHook(targetCameraShakeGunfire, (void*)hook_CameraShakeManager_GunfireAt, (void**)&orig_CameraShakeManager_GunfireAt);
 
     // 2. Hook EventSystem.Update for safe execution on Unity Main Thread
     void* targetEventSystemMethod = (void*)(g_Il2CppBase + RVA_EVENTSYSTEM_UPDATE);
@@ -2288,7 +2293,7 @@ void* thread(void*) {
     pthread_t sock_t;
     pthread_create(&sock_t, nullptr, socket_server_thread, nullptr);
 
-    LOGI("C-RAM v6.2 Hooks Installed: Arcade Landing Gear Toggle + Persistent Lighting + Clean Lead Stabilizer Ready!");
+    LOGI("C-RAM v6.4 Hooks Installed: AC-130 Recoil Dampener + Heli Rocket Fix + Screen-Camera Decoupled Lead Reticle Ready!");
     pthread_exit(nullptr);
 }
 
