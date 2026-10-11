@@ -1684,9 +1684,10 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         bool isAlive = *(bool*)((uintptr_t)target + OFFSET_UNIT_ISALIVE);
         if (!isAlive) continue;
 
+        int targetType = 3;
         if (IUnit_GetUnitType) {
-            int unitType = IUnit_GetUnitType(target);
-            if (unitType != 3 && unitType != 6 && unitType != 7 && unitType != 5) {
+            targetType = IUnit_GetUnitType(target);
+            if (targetType != 3 && targetType != 6 && targetType != 7 && targetType != 5) {
                 continue;
             }
         }
@@ -1729,7 +1730,7 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         entry.leadY = smoothLeadScreenY;
         entry.distance = distance;
         entry.flightTime = flightTime;
-        entry.targetType = unitType;
+        entry.targetType = targetType;
         entry.targetSpeedKmh = Vector3::Magnitude(targetVel) * 3.6f;
         entry.stabilizerMode = g_LeadStabilizerMode.load();
 
