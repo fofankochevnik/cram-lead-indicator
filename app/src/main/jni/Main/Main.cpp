@@ -1,5 +1,5 @@
 //
-// C-RAM Mod v5.0: Cockpit Cursor Steering + Universal Lead Indicator + Economy Give + Universal Spawner
+// C-RAM Mod v6.0: Cockpit Cursor Steering + Multi-Stage Combat Lead Stabilizer (Anti-Jitter Edition)
 //
 
 #include <pthread.h>
@@ -214,7 +214,9 @@ static t_Transform_get_position Transform_get_position = nullptr;
 static t_Transform_set_position Transform_set_position = nullptr;
 static t_Transform_get_forward Transform_get_forward = nullptr;
 static t_IUnit_GetUnitType IUnit_GetUnitType = nullptr;
+static t_PhysicsObject_get_Velocity orig_PhysicsObject_get_Velocity = nullptr;
 static t_PhysicsObject_get_Velocity PhysicsObject_get_Velocity = nullptr;
+Vector3 hook_PhysicsObject_get_Velocity(void* self);
 static t_GeneralHUD_LateUpdate orig_GeneralHUD_LateUpdate = nullptr;
 
 static t_EventSystem_Update orig_EventSystem_Update = nullptr;
@@ -292,12 +294,34 @@ static std::mutex g_SpawnMutex;
 static std::vector<SpawnRequest> g_PendingSpawnQueue;
 static std::atomic<bool> g_SpawnRequested(false);
 
+// -----------------------------------------------------------------------------
+// Multi-Stage Combat Lead Stabilizer (v6.0 - Anti-Jitter Engine)
+// -----------------------------------------------------------------------------
+enum LeadStabilizerMode {
+    LEAD_MODE_OFF = 0,               // Variant 0: Off (Raw network derivative)
+    LEAD_MODE_EMA = 1,               // Variant 1: Low-Pass Exponential Moving Average (EMA)
+    LEAD_MODE_ACCEL_CLAMP = 2,       // Variant 2: Kinematic Acceleration Clamping (Physical G-Limiter)
+    LEAD_MODE_VISUAL_DAMPING = 3,    // Variant 3: Adaptive Spring-Damper Screen Smoothing
+    LEAD_MODE_ULTIMATE = 4           // Variant 4: Ultimate Combined Hybrid (All 3 Tiers Active)
+};
+
+static std::atomic<int> g_LeadStabilizerMode{LEAD_MODE_ULTIMATE};
+static std::atomic<float> g_LeadEmaFactor{12.0f};          // 1/s (typical 8.0 - 20.0)
+static std::atomic<float> g_LeadMaxAccelG{9.0f};           // Max allowable acceleration in G (9.0G = 88.3 m/s^2)
+static std::atomic<float> g_LeadVisualDampFactor{16.0f};   // Screen spring stiffness (10.0 - 25.0)
+static std::atomic<bool> g_GlobalVelocityHookEnabled{true}; // Intercept PhysicsObject.get_Velocity for game engines
+static std::atomic<bool> g_LeadEspEnabled{true};           // Draw custom ImGui lead HUD
+static std::atomic<bool> g_LeadHudBadgeEnabled{true};      // Draw top status badge
+
 struct ScreenLeadTarget {
     float leadX, leadY;
     float targetX, targetY;
     float distance;
     float flightTime;
     bool hasTargetLine;
+    int targetType;
+    float targetSpeedKmh;
+    int stabilizerMode;
 };
 
 #define MAX_TARGETS 128
@@ -387,6 +411,207 @@ inline Vector3 RotateVector(const Quaternion& q, const Vector3& v) {
     Vector3 u_uxv = Vector3::Cross(u, uxv);
     return v + (uxv * (2.0f * s)) + (u_uxv * 2.0f);
 }
+
+// -----------------------------------------------------------------------------
+// Multi-Stage Combat Lead Stabilizer Engine (v6.0 Anti-Jitter Filter Core)
+// -----------------------------------------------------------------------------
+struct TargetVelocityFilter {
+    uintptr_t targetId = 0;
+    Vector3 lastRawVelocity{0, 0, 0};
+    Vector3 smoothedVelocity{0, 0, 0};
+    uint64_t lastTimestampMs = 0;
+    float lastScreenX = 0.0f;
+    float lastScreenY = 0.0f;
+    bool isScreenInit = false;
+    bool isVelocityInit = false;
+    uint32_t sampleCount = 0;
+};
+
+#define MAX_TRACKED_TARGETS 64
+static TargetVelocityFilter g_TargetFilters[MAX_TRACKED_TARGETS];
+static std::mutex g_FilterMutex;
+
+// Variant 1 & 2 & 4: Velocity Stabilization for Network Aircraft
+static Vector3 FilterVelocityForTarget(void* target, const Vector3& rawVel, uint64_t nowMs) {
+    if (!IsValidPtr(target)) return rawVel;
+    int mode = g_LeadStabilizerMode.load();
+    if (mode == LEAD_MODE_OFF) return rawVel;
+
+    // Check if target has isNetworkGhost enabled (offset 0xA0 in IUnit)
+    bool isGhost = false;
+    if (IsValidPtr((void*)((uintptr_t)target + 0xA0))) {
+        isGhost = *(bool*)((uintptr_t)target + 0xA0);
+    }
+
+    // In Mode 1, 2, 4 we filter all network ghosts, and in Ultimate mode we filter any target
+    if (!isGhost && mode != LEAD_MODE_ULTIMATE) {
+        return rawVel;
+    }
+
+    uintptr_t targetId = (uintptr_t)target;
+    std::lock_guard<std::mutex> lock(g_FilterMutex);
+
+    int bestSlot = -1;
+    for (int i = 0; i < MAX_TRACKED_TARGETS; i++) {
+        if (g_TargetFilters[i].targetId == targetId) {
+            bestSlot = i;
+            break;
+        }
+        if (g_TargetFilters[i].targetId == 0 && bestSlot == -1) {
+            bestSlot = i;
+        }
+    }
+
+    // LRU timeout eviction if table full (> 2000ms stale)
+    if (bestSlot == -1) {
+        for (int i = 0; i < MAX_TRACKED_TARGETS; i++) {
+            if (nowMs - g_TargetFilters[i].lastTimestampMs > 2000) {
+                bestSlot = i;
+                g_TargetFilters[i].isVelocityInit = false;
+                g_TargetFilters[i].isScreenInit = false;
+                break;
+            }
+        }
+        if (bestSlot == -1) return rawVel;
+    }
+
+    TargetVelocityFilter& state = g_TargetFilters[bestSlot];
+    if (state.targetId != targetId || !state.isVelocityInit) {
+        state.targetId = targetId;
+        state.lastRawVelocity = rawVel;
+        state.smoothedVelocity = rawVel;
+        state.lastTimestampMs = nowMs;
+        state.isVelocityInit = true;
+        state.sampleCount = 1;
+        return rawVel;
+    }
+
+    // Same frame caching (prevents over-filtering on multiple calls per frame)
+    if (nowMs <= state.lastTimestampMs) {
+        return state.smoothedVelocity;
+    }
+
+    float dt = (float)(nowMs - state.lastTimestampMs) / 1000.0f;
+    state.lastTimestampMs = nowMs;
+    state.sampleCount++;
+
+    // Clamp dt to reasonable bounds (1ms to 350ms)
+    if (dt > 0.35f) {
+        // Discontinuity / Teleport: reset filter baseline
+        state.smoothedVelocity = rawVel;
+        state.lastRawVelocity = rawVel;
+        return rawVel;
+    }
+    if (dt < 0.001f) dt = 0.001f;
+
+    Vector3 workingVel = rawVel;
+
+    // --- Variant 2: Kinematic Acceleration Clamping (Physical G-Limiter) ---
+    if (mode == LEAD_MODE_ACCEL_CLAMP || mode == LEAD_MODE_ULTIMATE) {
+        float maxG = g_LeadMaxAccelG.load();
+        float maxA = maxG * 9.80665f; // e.g. 9.0G = 88.26 m/s^2
+        float maxDeltaV = maxA * dt;
+
+        Vector3 deltaV = workingVel - state.smoothedVelocity;
+        float deltaVMag = Vector3::Magnitude(deltaV);
+
+        if (deltaVMag > maxDeltaV && deltaVMag > 0.0001f) {
+            float clampScale = maxDeltaV / deltaVMag;
+            workingVel = state.smoothedVelocity + deltaV * clampScale;
+        }
+    }
+
+    // --- Variant 1: Low-Pass Exponential Moving Average (EMA) ---
+    if (mode == LEAD_MODE_EMA || mode == LEAD_MODE_ULTIMATE) {
+        float lambda = g_LeadEmaFactor.load(); // e.g. 12.0 1/s
+        float alpha = 1.0f - expf(-lambda * dt);
+        if (alpha > 1.0f) alpha = 1.0f;
+        if (alpha < 0.01f) alpha = 0.01f;
+
+        state.smoothedVelocity = Vector3::Lerp(state.smoothedVelocity, workingVel, alpha);
+    } else {
+        state.smoothedVelocity = workingVel;
+    }
+
+    state.lastRawVelocity = rawVel;
+    return state.smoothedVelocity;
+}
+
+// Variant 3 & 4: Adaptive Screen-Space Lead Reticle Damping (Deadzone + Adaptive Lerp)
+static void FilterScreenLeadPosition(void* target, float rawScreenX, float rawScreenY, float& outScreenX, float& outScreenY, uint64_t nowMs) {
+    int mode = g_LeadStabilizerMode.load();
+    if (mode != LEAD_MODE_VISUAL_DAMPING && mode != LEAD_MODE_ULTIMATE) {
+        outScreenX = rawScreenX;
+        outScreenY = rawScreenY;
+        return;
+    }
+
+    uintptr_t targetId = (uintptr_t)target;
+    std::lock_guard<std::mutex> lock(g_FilterMutex);
+
+    int slot = -1;
+    for (int i = 0; i < MAX_TRACKED_TARGETS; i++) {
+        if (g_TargetFilters[i].targetId == targetId) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot == -1) {
+        outScreenX = rawScreenX;
+        outScreenY = rawScreenY;
+        return;
+    }
+
+    TargetVelocityFilter& state = g_TargetFilters[slot];
+    if (!state.isScreenInit) {
+        state.lastScreenX = rawScreenX;
+        state.lastScreenY = rawScreenY;
+        state.isScreenInit = true;
+        outScreenX = rawScreenX;
+        outScreenY = rawScreenY;
+        return;
+    }
+
+    float dx = rawScreenX - state.lastScreenX;
+    float dy = rawScreenY - state.lastScreenY;
+    float distPx = sqrtf(dx * dx + dy * dy);
+
+    // Deadzone against micro-pixel jitter
+    if (distPx < 1.2f) {
+        outScreenX = state.lastScreenX;
+        outScreenY = state.lastScreenY;
+        return;
+    }
+
+    // Adaptive damping: smooth when steady, responsive during rapid breaks/maneuvers
+    float baseFactor = g_LeadVisualDampFactor.load(); // default 16.0
+    float adaptiveFactor = baseFactor + fminf(distPx * 0.35f, 45.0f);
+    float dt = 0.016f; // approx 60 FPS LateUpdate frame time
+    float alpha = 1.0f - expf(-adaptiveFactor * dt);
+    if (alpha > 1.0f) alpha = 1.0f;
+    if (alpha < 0.05f) alpha = 0.05f;
+
+    state.lastScreenX = state.lastScreenX + dx * alpha;
+    state.lastScreenY = state.lastScreenY + dy * alpha;
+
+    outScreenX = state.lastScreenX;
+    outScreenY = state.lastScreenY;
+}
+
+// Global Hook for PhysicsObject.get_Velocity (Intercepts both native game autocannons & mod)
+Vector3 hook_PhysicsObject_get_Velocity(void* self) {
+    if (!orig_PhysicsObject_get_Velocity) {
+        return Vector3(0, 0, 0);
+    }
+    Vector3 rawVel = orig_PhysicsObject_get_Velocity(self);
+    if (!g_GlobalVelocityHookEnabled.load() || !IsValidPtr(self)) {
+        return rawVel;
+    }
+    uint64_t nowMs = getNowMs();
+    return FilterVelocityForTarget(self, rawVel, nowMs);
+}
+
 
 // -----------------------------------------------------------------------------
 // Economy Hooks (InventoryWrapper)
@@ -1110,15 +1335,17 @@ void* socket_server_thread(void*) {
                 s_LastCmdTime = nowMs;
 
                 if (strcasecmp(buf, "ping") == 0) {
-                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v5.0 Online\n");
+                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v6.0 Online\n");
                 } else if (strcasecmp(buf, "help") == 0) {
                     snprintf(reply, sizeof(reply),
                              "Commands:\n"
                              "  ping\n"
                              "  give <amount>\n"
                              "  spawn <unit> [noai] [dist <meters>] [alt <meters>]\n"
+                             "  lead [status|mode <0-4>|smooth <f>|clamp <G>|damp <f>|hook <0|1>|esp <0|1>]\n"
                              "  list\n"
-                             "  mp\n");
+                             "  mp\n"
+                             "  gear\n");
                 } else if (strcasecmp(buf, "list") == 0) {
                     snprintf(reply, sizeof(reply),
                              "Units Available:\n"
@@ -1200,6 +1427,100 @@ void* socket_server_thread(void*) {
                 } else if (strcasecmp(buf, "gear") == 0 || strcasecmp(buf, "ldg") == 0) {
                     g_PendingGearToggle.store(true);
                     snprintf(reply, sizeof(reply), "OK: Landing gear toggle requested\n");
+                } else if (strncasecmp(buf, "lead", 4) == 0) {
+                    char* args = buf + 4;
+                    while (*args == ' ') args++;
+                    if (strncasecmp(args, "mode", 4) == 0) {
+                        char* valStr = args + 4;
+                        while (*valStr == ' ') valStr++;
+                        int m = atoi(valStr);
+                        if (m < 0) m = 0;
+                        if (m > 4) m = 4;
+                        g_LeadStabilizerMode.store(m);
+                        const char* modeNames[] = {
+                            "0: OFF (Raw Network Output)",
+                            "1: EMA Low-Pass Filter",
+                            "2: Kinematic Acceleration Clamping (G-Limiter)",
+                            "3: Adaptive Visual Screen Damping",
+                            "4: Ultimate Combined Hybrid (All 3 Tiers Active)"
+                        };
+                        snprintf(reply, sizeof(reply), "OK: Lead Stabilizer Mode set to [%s]\n", modeNames[m]);
+                    } else if (strncasecmp(args, "smooth", 6) == 0) {
+                        char* valStr = args + 6;
+                        while (*valStr == ' ') valStr++;
+                        float factor = (float)atof(valStr);
+                        if (factor < 1.0f) factor = 1.0f;
+                        if (factor > 50.0f) factor = 50.0f;
+                        g_LeadEmaFactor.store(factor);
+                        snprintf(reply, sizeof(reply), "OK: Lead EMA Smoothing Factor set to %.1f (1/s)\n", factor);
+                    } else if (strncasecmp(args, "clamp", 5) == 0) {
+                        char* valStr = args + 5;
+                        while (*valStr == ' ') valStr++;
+                        float g = (float)atof(valStr);
+                        if (g < 1.0f) g = 1.0f;
+                        if (g > 30.0f) g = 30.0f;
+                        g_LeadMaxAccelG.store(g);
+                        snprintf(reply, sizeof(reply), "OK: Lead Max Accel G-Clamp set to %.1f G (%.1f m/s^2)\n", g, g * 9.80665f);
+                    } else if (strncasecmp(args, "damp", 4) == 0) {
+                        char* valStr = args + 4;
+                        while (*valStr == ' ') valStr++;
+                        float d = (float)atof(valStr);
+                        if (d < 1.0f) d = 1.0f;
+                        if (d > 50.0f) d = 50.0f;
+                        g_LeadVisualDampFactor.store(d);
+                        snprintf(reply, sizeof(reply), "OK: Lead Visual Damping Factor set to %.1f\n", d);
+                    } else if (strncasecmp(args, "hook", 4) == 0) {
+                        char* valStr = args + 4;
+                        while (*valStr == ' ') valStr++;
+                        bool en = (atoi(valStr) != 0);
+                        g_GlobalVelocityHookEnabled.store(en);
+                        snprintf(reply, sizeof(reply), "OK: Global PhysicsObject.get_Velocity Hook is now %s\n", en ? "ENABLED" : "DISABLED");
+                    } else if (strncasecmp(args, "esp", 3) == 0) {
+                        char* valStr = args + 3;
+                        while (*valStr == ' ') valStr++;
+                        bool en = (atoi(valStr) != 0);
+                        g_LeadEspEnabled.store(en);
+                        snprintf(reply, sizeof(reply), "OK: Lead ESP Reticle is now %s\n", en ? "ENABLED" : "DISABLED");
+                    } else if (strncasecmp(args, "badge", 5) == 0) {
+                        char* valStr = args + 5;
+                        while (*valStr == ' ') valStr++;
+                        bool en = (atoi(valStr) != 0);
+                        g_LeadHudBadgeEnabled.store(en);
+                        snprintf(reply, sizeof(reply), "OK: Lead HUD Status Badge is now %s\n", en ? "ENABLED" : "DISABLED");
+                    } else {
+                        int curMode = g_LeadStabilizerMode.load();
+                        const char* modeNames[] = {
+                            "0: OFF (Raw)",
+                            "1: EMA Low-Pass Filter",
+                            "2: Kinematic Accel G-Clamp",
+                            "3: Adaptive Visual Damping",
+                            "4: Ultimate Combined Hybrid"
+                        };
+                        snprintf(reply, sizeof(reply),
+                                 "Lead Stabilizer Status (v6.0):\n"
+                                 "  Mode:           [%s]\n"
+                                 "  EMA Factor:     %.1f /s\n"
+                                 "  G-Clamp Limit:  %.1f G (%.1f m/s^2)\n"
+                                 "  Visual Damping: %.1f\n"
+                                 "  Global Hook:    %s\n"
+                                 "  ImGui ESP:      %s\n"
+                                 "  HUD Badge:      %s\n"
+                                 "Commands:\n"
+                                 "  lead mode <0-4>\n"
+                                 "  lead smooth <factor>\n"
+                                 "  lead clamp <G>\n"
+                                 "  lead damp <factor>\n"
+                                 "  lead hook <0|1>\n"
+                                 "  lead esp <0|1>\n"
+                                 "  lead badge <0|1>\n",
+                                 modeNames[curMode],
+                                 g_LeadEmaFactor.load(),
+                                 g_LeadMaxAccelG.load(), g_LeadMaxAccelG.load() * 9.80665f,
+                                 g_LeadVisualDampFactor.load(),
+                                 g_GlobalVelocityHookEnabled.load() ? "ON" : "OFF",
+                                 g_LeadEspEnabled.load() ? "ON" : "OFF",
+                                 g_LeadHudBadgeEnabled.load() ? "ON" : "OFF");
+                    }
                 } else {
                     snprintf(reply, sizeof(reply), "UNKNOWN COMMAND: '%s'. Type 'help' or 'list'\n", buf);
                 }
@@ -1375,8 +1696,10 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         Vector3 targetPos = Transform_get_position(tr);
 
         Vector3 targetVel(0, 0, 0);
+        uint64_t nowMs = getNowMs();
         if (PhysicsObject_get_Velocity) {
-            targetVel = PhysicsObject_get_Velocity(target);
+            Vector3 rawVel = PhysicsObject_get_Velocity(target);
+            targetVel = FilterVelocityForTarget(target, rawVel, nowMs);
         }
 
         Vector3 leadPos(0, 0, 0);
@@ -1392,11 +1715,23 @@ void hook_GeneralHUD_LateUpdate(void* self) {
 
         Vector3 targetScreen = Camera_WorldToScreenPoint(cam, targetPos);
 
+        float rawLeadScreenX = leadScreen.X;
+        float rawLeadScreenY = screenHeight - leadScreen.Y;
+
+        float smoothLeadScreenX = rawLeadScreenX;
+        float smoothLeadScreenY = rawLeadScreenY;
+
+        // Variant 3 & 4: Adaptive Screen-Space Lead Reticle Damping
+        FilterScreenLeadPosition(target, rawLeadScreenX, rawLeadScreenY, smoothLeadScreenX, smoothLeadScreenY, nowMs);
+
         ScreenLeadTarget& entry = g_TargetsBuffer[writeIdx][count];
-        entry.leadX = leadScreen.X;
-        entry.leadY = screenHeight - leadScreen.Y;
+        entry.leadX = smoothLeadScreenX;
+        entry.leadY = smoothLeadScreenY;
         entry.distance = distance;
         entry.flightTime = flightTime;
+        entry.targetType = unitType;
+        entry.targetSpeedKmh = Vector3::Magnitude(targetVel) * 3.6f;
+        entry.stabilizerMode = g_LeadStabilizerMode.load();
 
         if (targetScreen.Z > 0.0f) {
             entry.hasTargetLine = true;
@@ -1420,34 +1755,114 @@ void DrawMenu() {
     ImDrawList* draw = ImGui::GetBackgroundDrawList();
     if (!draw) return;
 
+    if (!g_LeadEspEnabled.load()) return;
+
     int readIdx = g_ActiveBufferIdx.load();
     int count = g_TargetsCount[readIdx];
+
+    float screenWidth = (glWidth > 0) ? (float)glWidth : ImGui::GetIO().DisplaySize.x;
+    if (screenWidth <= 0.0f) screenWidth = 1920.0f;
+
+    // 1. Stylish Top HUD Status Badge
+    if (g_LeadHudBadgeEnabled.load()) {
+        int mode = g_LeadStabilizerMode.load();
+        const char* modeNames[] = {
+            "RAW (OFF)",
+            "EMA LOW-PASS",
+            "ACCEL G-CLAMP",
+            "VISUAL DAMPING",
+            "ULTIMATE HYBRID (EMA+CLAMP+DAMP)"
+        };
+        char badgeBuf[160];
+        snprintf(badgeBuf, sizeof(badgeBuf), "C-RAM v6.0 | LEAD STABILIZER: %s | HOOK: %s | TARGETS: %d",
+                 modeNames[mode],
+                 g_GlobalVelocityHookEnabled.load() ? "ACTIVE" : "OFF",
+                 count);
+
+        ImVec2 textSize = ImGui::CalcTextSize(badgeBuf);
+        float badgeX = (screenWidth - textSize.x) * 0.5f;
+        float badgeY = 24.0f;
+        ImU32 borderColor = (mode == LEAD_MODE_OFF) ? IM_COL32(220, 50, 50, 190) : IM_COL32(0, 200, 255, 200);
+
+        draw->AddRectFilled(ImVec2(badgeX - 10.0f, badgeY - 4.0f),
+                            ImVec2(badgeX + textSize.x + 10.0f, badgeY + textSize.y + 4.0f),
+                            IM_COL32(10, 16, 26, 210), 4.0f);
+        draw->AddRect(ImVec2(badgeX - 10.0f, badgeY - 4.0f),
+                      ImVec2(badgeX + textSize.x + 10.0f, badgeY + textSize.y + 4.0f),
+                      borderColor, 4.0f, 0, 1.5f);
+        draw->AddText(ImVec2(badgeX, badgeY), IM_COL32(235, 245, 255, 250), badgeBuf);
+    }
+
     if (count <= 0) return;
 
     const float leadCircleRadius = 14.0f;
-    const ImU32 circleColor = IM_COL32(255, 45, 45, 240);
-    const ImU32 centerColor = IM_COL32(255, 255, 255, 255);
-    const ImU32 lineColor = IM_COL32(255, 210, 50, 170);
-    const ImU32 textColor = IM_COL32(255, 255, 255, 240);
 
     for (int i = 0; i < count; i++) {
         const ScreenLeadTarget& tgt = g_TargetsBuffer[readIdx][i];
         ImVec2 leadPoint(tgt.leadX, tgt.leadY);
 
-        draw->AddCircle(leadPoint, leadCircleRadius, circleColor, 24, 2.5f);
+        // Dynamic tactical coloring:
+        // Green: In effective gun range (<= 1000m)
+        // Amber: Medium range (1000m - 2000m)
+        // Red: Long range (> 2000m)
+        ImU32 circleColor;
+        ImU32 centerColor = IM_COL32(255, 255, 255, 255);
+        ImU32 lineColor;
+
+        if (tgt.distance <= 1000.0f) {
+            circleColor = IM_COL32(0, 255, 140, 240); // Emerald Green
+            lineColor = IM_COL32(0, 255, 180, 170);
+        } else if (tgt.distance <= 2000.0f) {
+            circleColor = IM_COL32(255, 200, 30, 240); // Amber
+            lineColor = IM_COL32(255, 210, 50, 160);
+        } else {
+            circleColor = IM_COL32(255, 50, 50, 230); // Crimson
+            lineColor = IM_COL32(255, 80, 80, 140);
+        }
+
+        // Draw tactical outer circle + center dot
+        draw->AddCircle(leadPoint, leadCircleRadius, circleColor, 28, 2.5f);
         draw->AddCircleFilled(leadPoint, 2.5f, centerColor);
 
-        float cross = leadCircleRadius * 0.5f;
+        // Reticle ticks (military aviation HUD crosshair)
+        float cross = leadCircleRadius * 0.55f;
         draw->AddLine(ImVec2(leadPoint.x - cross, leadPoint.y), ImVec2(leadPoint.x + cross, leadPoint.y), circleColor, 1.5f);
         draw->AddLine(ImVec2(leadPoint.x, leadPoint.y - cross), ImVec2(leadPoint.x, leadPoint.y + cross), circleColor, 1.5f);
 
+        // Tactical Target Brackets when in close range (<= 1000m)
+        if (tgt.distance <= 1000.0f) {
+            float bSize = 6.0f;
+            float r = leadCircleRadius + 3.0f;
+            // Top-left bracket
+            draw->AddLine(ImVec2(leadPoint.x - r, leadPoint.y - r), ImVec2(leadPoint.x - r + bSize, leadPoint.y - r), circleColor, 2.0f);
+            draw->AddLine(ImVec2(leadPoint.x - r, leadPoint.y - r), ImVec2(leadPoint.x - r, leadPoint.y - r + bSize), circleColor, 2.0f);
+            // Top-right bracket
+            draw->AddLine(ImVec2(leadPoint.x + r, leadPoint.y - r), ImVec2(leadPoint.x + r - bSize, leadPoint.y - r), circleColor, 2.0f);
+            draw->AddLine(ImVec2(leadPoint.x + r, leadPoint.y - r), ImVec2(leadPoint.x + r, leadPoint.y - r + bSize), circleColor, 2.0f);
+            // Bottom-left bracket
+            draw->AddLine(ImVec2(leadPoint.x - r, leadPoint.y + r), ImVec2(leadPoint.x - r + bSize, leadPoint.y + r), circleColor, 2.0f);
+            draw->AddLine(ImVec2(leadPoint.x - r, leadPoint.y + r), ImVec2(leadPoint.x - r, leadPoint.y + r + bSize), circleColor, 2.0f);
+            // Bottom-right bracket
+            draw->AddLine(ImVec2(leadPoint.x + r, leadPoint.y + r), ImVec2(leadPoint.x + r - bSize, leadPoint.y + r), circleColor, 2.0f);
+            draw->AddLine(ImVec2(leadPoint.x + r, leadPoint.y + r), ImVec2(leadPoint.x + r, leadPoint.y + r - bSize), circleColor, 2.0f);
+        }
+
+        // Target lead line
         if (tgt.hasTargetLine) {
             draw->AddLine(ImVec2(tgt.targetX, tgt.targetY), leadPoint, lineColor, 1.5f);
         }
 
-        char textBuf[64];
-        snprintf(textBuf, sizeof(textBuf), "%.0fm (%.1fs)", tgt.distance, tgt.flightTime);
-        draw->AddText(ImVec2(leadPoint.x + leadCircleRadius + 5, leadPoint.y - 8), textColor, textBuf);
+        // Informative HUD Readout
+        char textBuf[96];
+        snprintf(textBuf, sizeof(textBuf), "%.0fm (%.1fs) | %.0f km/h", tgt.distance, tgt.flightTime, tgt.targetSpeedKmh);
+
+        // Background for text for crystal clear contrast against sky/clouds
+        ImVec2 tSize = ImGui::CalcTextSize(textBuf);
+        ImVec2 tPos(leadPoint.x + leadCircleRadius + 8.0f, leadPoint.y - tSize.y * 0.5f);
+        draw->AddRectFilled(ImVec2(tPos.x - 3.0f, tPos.y - 2.0f),
+                            ImVec2(tPos.x + tSize.x + 3.0f, tPos.y + tSize.y + 2.0f),
+                            IM_COL32(10, 15, 20, 180), 2.0f);
+        draw->AddText(tPos, circleColor, textBuf);
     }
 }
 
@@ -1602,6 +2017,10 @@ void* thread(void*) {
     void* targetHUDMethod = (void*)(g_Il2CppBase + RVA_HUD_LATEUPDATE);
     DobbyHook(targetHUDMethod, (void*)hook_GeneralHUD_LateUpdate, (void**)&orig_GeneralHUD_LateUpdate);
 
+    // 1b. Hook PhysicsObject.get_Velocity for global multiplayer ghost velocity stabilization
+    void* targetPhysVel = (void*)(g_Il2CppBase + RVA_PHYS_VEL);
+    DobbyHook(targetPhysVel, (void*)hook_PhysicsObject_get_Velocity, (void**)&orig_PhysicsObject_get_Velocity);
+
     // 2. Hook EventSystem.Update for safe execution on Unity Main Thread
     void* targetEventSystemMethod = (void*)(g_Il2CppBase + RVA_EVENTSYSTEM_UPDATE);
     DobbyHook(targetEventSystemMethod, (void*)hook_EventSystem_Update, (void**)&orig_EventSystem_Update);
@@ -1665,7 +2084,7 @@ void* thread(void*) {
     pthread_t sock_t;
     pthread_create(&sock_t, nullptr, socket_server_thread, nullptr);
 
-    LOGI("C-RAM v5.3 Hooks Installed: Cockpit Steering + Lead ESP + Economy Give + Heli Safety + Native Cloned Arcade Landing Gear Ready!");
+    LOGI("C-RAM v6.0 Hooks Installed: Multi-Stage Combat Lead Stabilizer (Anti-Jitter Edition) + Cockpit Steering + Economy Give + Heli Safety Ready!");
     pthread_exit(nullptr);
 }
 
