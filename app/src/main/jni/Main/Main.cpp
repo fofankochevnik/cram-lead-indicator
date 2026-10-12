@@ -76,6 +76,8 @@
 #define RVA_ULTIMATEJOYSTICK_DISABLE    0x3C85A7C // UltimateJoystick.DisableJoystick(string joystickName)
 #define RVA_GAMEOBJECT_SETACTIVE        0x767AF68 // UnityEngine.GameObject.SetActive(bool value)
 #define RVA_COMP_GET_GAMEOBJECT         0x7675CAC // UnityEngine.Component.get_gameObject
+#define RVA_HUD_START                   0x3ACEC64 // GeneralHUD.Start
+#define RVA_HUDPARENT_REFRESHALL        0x38FF7D0 // HUDParent.RefreshAll
 
 // Economy / Give Currency Hooks
 #define RVA_INVENTORY_AWAKE             0x38EAB78 // InventoryWrapper.Awake
@@ -179,6 +181,8 @@ typedef void (*t_Joystick_Start)(void* self, void* method);
 typedef void (*t_UltimateJoystick_DisableJoystick)(void* joystickName, void* method);
 typedef void (*t_GameObject_SetActive)(void* self, bool value, void* method);
 typedef void* (*t_Component_get_gameObject)(void* self, void* method);
+typedef void (*t_GeneralHUD_Start)(void* self, void* method);
+typedef void (*t_HUDParent_RefreshAll)(void* method);
 
 // Economy pointers
 typedef void (*t_InventoryWrapper_Awake)(void* self, void* method);
@@ -270,6 +274,8 @@ static t_Joystick_Start orig_Joystick_Start = nullptr;
 static t_UltimateJoystick_DisableJoystick UltimateJoystick_DisableJoystick = nullptr;
 static t_GameObject_SetActive GameObject_SetActive = nullptr;
 static t_Component_get_gameObject Component_get_gameObject = nullptr;
+static t_GeneralHUD_Start GeneralHUD_Start = nullptr;
+static t_HUDParent_RefreshAll HUDParent_RefreshAll = nullptr;
 
 static t_InventoryWrapper_Awake orig_InventoryWrapper_Awake = nullptr;
 static t_InventoryWrapper_AddCurrency orig_InventoryWrapper_AddCurrency = nullptr;
@@ -735,6 +741,10 @@ void EnsureSeatHUD(void* seat) {
     }
 
     if (IsUnityObjectAlive(currentHUD)) {
+        void* cam = *(void**)((uintptr_t)currentHUD + OFFSET_HUD_MAINCAMERA);
+        if (!IsUnityObjectAlive(cam) && Camera_get_main) {
+            *(void**)((uintptr_t)currentHUD + OFFSET_HUD_MAINCAMERA) = Camera_get_main();
+        }
         return; // Seat already has an alive HUD!
     }
 
@@ -746,6 +756,7 @@ void EnsureSeatHUD(void* seat) {
         currentHUD = *(void**)((uintptr_t)seat + 0x58);
         if (IsUnityObjectAlive(currentHUD)) {
             LOGI("[C-RAM-HUD] EnsureSeatHUD: Native InitializeHUD succeeded! generalHUD=%p", currentHUD);
+            if (HUDParent_RefreshAll) HUDParent_RefreshAll(nullptr);
             return;
         }
     }
@@ -757,11 +768,22 @@ void EnsureSeatHUD(void* seat) {
 
     if (IsUnityObjectAlive(prefab) && Object_Instantiate) {
         LOGI("[C-RAM-HUD] EnsureSeatHUD: Instantiating generalHUD from prefab %p...", prefab);
+        void* mainCam = Camera_get_main ? Camera_get_main() : nullptr;
+
+        // Pre-configure prefab fields so that GeneralHUD.Start() doesn't throw NullReferenceException!
+        *(void**)((uintptr_t)prefab + OFFSET_HUD_PARENTSEAT) = seat;
+        if (IsUnityObjectAlive(mainCam)) {
+            *(void**)((uintptr_t)prefab + OFFSET_HUD_MAINCAMERA) = mainCam;
+        }
+
         void* newHUD = Object_Instantiate(prefab, nullptr);
+
+        // Reset prefab field
+        *(void**)((uintptr_t)prefab + OFFSET_HUD_PARENTSEAT) = nullptr;
+
         if (IsUnityObjectAlive(newHUD)) {
             *(void**)((uintptr_t)seat + 0x58) = newHUD;
             *(void**)((uintptr_t)newHUD + OFFSET_HUD_PARENTSEAT) = seat;
-            void* mainCam = Camera_get_main ? Camera_get_main() : nullptr;
             if (IsUnityObjectAlive(mainCam)) {
                 *(void**)((uintptr_t)newHUD + OFFSET_HUD_MAINCAMERA) = mainCam;
             }
@@ -771,7 +793,14 @@ void EnsureSeatHUD(void* seat) {
                     GameObject_SetActive(hudGO, true, nullptr);
                 }
             }
-            LOGI("[C-RAM-HUD] EnsureSeatHUD: Cloned and configured GeneralHUD %p for seat %p!", newHUD, seat);
+            if (GeneralHUD_Start) {
+                GeneralHUD_Start(newHUD, nullptr);
+                LOGI("[C-RAM-HUD] EnsureSeatHUD: GeneralHUD.Start called on newHUD %p", newHUD);
+            }
+            if (HUDParent_RefreshAll) {
+                HUDParent_RefreshAll(nullptr);
+            }
+            LOGI("[C-RAM-HUD] EnsureSeatHUD: Cloned and fully configured GeneralHUD %p for seat %p!", newHUD, seat);
         }
     } else {
         LOGW("[C-RAM-HUD] EnsureSeatHUD: prefab %p not alive or Object_Instantiate null!", prefab);
@@ -1776,18 +1805,41 @@ static bool CalculateLead(
 // Battle Hook (GeneralHUD.LateUpdate)
 // -----------------------------------------------------------------------------
 void hook_GeneralHUD_LateUpdate(void* self) {
-    if (orig_GeneralHUD_LateUpdate) {
-        orig_GeneralHUD_LateUpdate(self);
-    }
-
     if (!IsUnityObjectAlive(self) || !Camera_WorldToScreenPoint || !Camera_get_main) {
         return;
     }
 
-    uint64_t nowMs = getNowMs();
-    g_LastHudUpdateMs.store(nowMs);
+    // Resolve current active seat from CameraManager
+    void* activeSeat = nullptr;
+    if (IsValidPtr(g_CameraManagerInstance)) {
+        activeSeat = *(void**)((uintptr_t)g_CameraManagerInstance + 0x1A0); // CameraManager.selectedSeat
+    }
 
-    // Ensure HUD has a valid, alive Camera assigned (vanilla UpdateIndicatorPositions needs this!)
+    void* seat = *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT);
+
+    // ZOMBIE CHECK:
+    // If an active seat exists and this HUD belongs to a different seat, it's a zombie from a dead plane!
+    if (IsUnityObjectAlive(activeSeat) && seat != activeSeat) {
+        if (Component_get_gameObject && GameObject_SetActive) {
+            void* hudGO = Component_get_gameObject(self, nullptr);
+            if (IsUnityObjectAlive(hudGO)) {
+                GameObject_SetActive(hudGO, false, nullptr);
+            }
+        }
+        return; // NEVER call orig_GeneralHUD_LateUpdate on a zombie!
+    }
+
+    // Ensure seat is valid
+    if (!IsUnityObjectAlive(seat)) {
+        if (IsUnityObjectAlive(activeSeat)) {
+            *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT) = activeSeat;
+            seat = activeSeat;
+        } else {
+            return;
+        }
+    }
+
+    // Ensure HUD has a valid, alive Camera assigned BEFORE calling vanilla LateUpdate!
     void* cam = *(void**)((uintptr_t)self + OFFSET_HUD_MAINCAMERA);
     if (!IsUnityObjectAlive(cam)) {
         cam = Camera_get_main();
@@ -1799,21 +1851,13 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         return;
     }
 
-    // Ensure HUD parentSeat is alive. If this seat belongs to a dead/destroyed plane, recover from CameraManager
-    void* seat = *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT);
-    if (!IsUnityObjectAlive(seat) && IsValidPtr(g_CameraManagerInstance)) {
-        void* activeSeat = *(void**)((uintptr_t)g_CameraManagerInstance + 0x1A0); // CameraManager.selectedSeat
-        if (IsUnityObjectAlive(activeSeat)) {
-            *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT) = activeSeat;
-            seat = activeSeat;
-            LOGI("[C-RAM-HUD] Restored dead parentSeat -> activeSeat=%p", activeSeat);
-        }
+    // Run vanilla LateUpdate ONLY for the active HUD!
+    if (orig_GeneralHUD_LateUpdate) {
+        orig_GeneralHUD_LateUpdate(self);
     }
 
-    // If seat is still not alive, this HUD belongs to a dead plane wreckage; do not wipe active targets!
-    if (!IsUnityObjectAlive(seat)) {
-        return;
-    }
+    uint64_t nowMs = getNowMs();
+    g_LastHudUpdateMs.store(nowMs);
 
     Vector3 gunPos(0, 0, 0);
     Vector3 playerVel(0, 0, 0);
@@ -2172,6 +2216,8 @@ void* thread(void*) {
     GameObject_SetActive = (t_GameObject_SetActive)(g_Il2CppBase + RVA_GAMEOBJECT_SETACTIVE);
     Component_get_gameObject = (t_Component_get_gameObject)(g_Il2CppBase + RVA_COMP_GET_GAMEOBJECT);
     VehicleSeat_InitializeHUD = (t_VehicleSeat_InitializeHUD)(g_Il2CppBase + RVA_VEHICLESEAT_INITIALIZEHUD);
+    GeneralHUD_Start = (t_GeneralHUD_Start)(g_Il2CppBase + RVA_HUD_START);
+    HUDParent_RefreshAll = (t_HUDParent_RefreshAll)(g_Il2CppBase + RVA_HUDPARENT_REFRESHALL);
 
     // Economy pointers
     InventoryWrapper_AddCurrency = (t_InventoryWrapper_AddCurrency)(g_Il2CppBase + RVA_INVENTORY_ADDCURRENCY);
