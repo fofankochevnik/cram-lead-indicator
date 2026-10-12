@@ -717,53 +717,12 @@ void ApplyCockpitCursorSteering(void* seat, int cameraType) {
             }
         }
 
-        // 2. Hide joystick and roll slider in cockpit view
-        if (Component_get_gameObject && GameObject_SetActive) {
-            // Hide standard Joystick
-            if (IsValidPtr(g_JoystickInstance)) {
-                void* joystickGO = Component_get_gameObject(g_JoystickInstance, nullptr);
-                if (IsValidPtr(joystickGO)) {
-                    GameObject_SetActive(joystickGO, false, nullptr);
-                    LOGI("[C-RAM-MOD] Hidden Joystick in Cockpit POV");
-                }
-            }
-            // Hide objectsToShowOnlyInPOV (which vanilla uses for POV touch joystick/slider)
-            void* listPtr = *(void**)((uintptr_t)seat + OFFSET_SEAT_OBJECTS_POV_ONLY);
-            if (IsValidPtr(listPtr)) {
-                monoList<void*>* povOnlyList = (monoList<void*>*)listPtr;
-                if (IsValidPtr(povOnlyList->items)) {
-                    int sz = povOnlyList->getSize();
-                    for (int i = 0; i < sz && i < 16; i++) {
-                        void* obj = ((void**)povOnlyList->items->vector)[i];
-                        if (IsValidPtr(obj)) {
-                            GameObject_SetActive(obj, false, nullptr);
-                        }
-                    }
-                    LOGI("[C-RAM-MOD] Hidden %d POV controls (joystick/slider)", sz);
-                }
-            }
-        }
-        // Also disable UltimateJoystick if present
-        if (UltimateJoystick_DisableJoystick && il2cpp_string_new_fn) {
-            void* jsName = il2cpp_string_new_fn("FlightJoystick");
-            if (IsValidPtr(jsName)) {
-                UltimateJoystick_DisableJoystick(jsName, nullptr);
-            }
-        }
-    } else {
-        // Outside cockpit view: restore joystick visibility
-        if (Component_get_gameObject && GameObject_SetActive && IsValidPtr(g_JoystickInstance)) {
-            void* joystickGO = Component_get_gameObject(g_JoystickInstance, nullptr);
-            if (IsValidPtr(joystickGO)) {
-                GameObject_SetActive(joystickGO, true, nullptr);
-            }
-        }
     }
 }
 
 void hook_CameraManager_Awake(void* self, void* method) {
     g_CameraManagerInstance = self;
-    LOGI("[C-RAM-MOD] CameraManager::Awake captured! Instance: %p", self);
+    LOGI("[C-RAM-CAM] CameraManager::Awake captured! Instance: %p", self);
     if (orig_CameraManager_Awake) {
         orig_CameraManager_Awake(self, method);
     }
@@ -772,13 +731,13 @@ void hook_CameraManager_Awake(void* self, void* method) {
 void hook_CameraManager_SetCameraByType(void* self, int type, void* method) {
     g_CameraManagerInstance = self;
     g_CurrentCameraType.store(type);
-    LOGI("[C-RAM-MOD] CameraManager::SetCameraByType: type=%d", type);
-    if (orig_CameraManager_SetCameraByType) {
-        orig_CameraManager_SetCameraByType(self, type, method);
-    }
     void* seat = nullptr;
     if (IsValidPtr(self)) {
         seat = *(void**)((uintptr_t)self + 0x1A0); // CameraManager.selectedSeat
+    }
+    LOGI("[C-RAM-CAM] SetCameraByType: type=%d, selectedSeat=%p, camMgr=%p", type, seat, self);
+    if (orig_CameraManager_SetCameraByType) {
+        orig_CameraManager_SetCameraByType(self, type, method);
     }
     ApplyCockpitCursorSteering(seat, type);
 }
@@ -786,7 +745,7 @@ void hook_CameraManager_SetCameraByType(void* self, int type, void* method) {
 void hook_CameraManager_SetCamera(void* self, int gameCameraType, void* follow, int unitType, void* method) {
     g_CameraManagerInstance = self;
     g_CurrentCameraType.store(gameCameraType);
-    LOGI("[C-RAM-MOD] CameraManager::SetCamera: type=%d, follow=%p", gameCameraType, follow);
+    LOGI("[C-RAM-CAM] SetCamera: type=%d, followSeat=%p, unitType=%d, camMgr=%p", gameCameraType, follow, unitType, self);
     if (orig_CameraManager_SetCamera) {
         orig_CameraManager_SetCamera(self, gameCameraType, follow, unitType, method);
     }
@@ -1736,26 +1695,38 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         orig_GeneralHUD_LateUpdate(self);
     }
 
-    uint64_t nowMs = getNowMs();
-    g_LastHudUpdateMs.store(nowMs);
-
-    auto clearTargets = [&]() {
-        int writeIdx = 1 - g_ActiveBufferIdx.load();
-        g_TargetsCount[writeIdx] = 0;
-        g_ActiveBufferIdx.store(writeIdx);
-    };
-
     if (!IsUnityObjectAlive(self) || !Camera_WorldToScreenPoint || !Camera_get_main) {
-        clearTargets();
         return;
     }
 
+    uint64_t nowMs = getNowMs();
+    g_LastHudUpdateMs.store(nowMs);
+
+    // Ensure HUD has a valid, alive Camera assigned (vanilla UpdateIndicatorPositions needs this!)
     void* cam = *(void**)((uintptr_t)self + OFFSET_HUD_MAINCAMERA);
     if (!IsUnityObjectAlive(cam)) {
         cam = Camera_get_main();
+        if (IsUnityObjectAlive(cam)) {
+            *(void**)((uintptr_t)self + OFFSET_HUD_MAINCAMERA) = cam;
+        }
     }
     if (!IsUnityObjectAlive(cam)) {
-        clearTargets();
+        return;
+    }
+
+    // Ensure HUD parentSeat is alive. If this seat belongs to a dead/destroyed plane, recover from CameraManager
+    void* seat = *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT);
+    if (!IsUnityObjectAlive(seat) && IsValidPtr(g_CameraManagerInstance)) {
+        void* activeSeat = *(void**)((uintptr_t)g_CameraManagerInstance + 0x1A0); // CameraManager.selectedSeat
+        if (IsUnityObjectAlive(activeSeat)) {
+            *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT) = activeSeat;
+            seat = activeSeat;
+            LOGI("[C-RAM-HUD] Restored dead parentSeat -> activeSeat=%p", activeSeat);
+        }
+    }
+
+    // If seat is still not alive, this HUD belongs to a dead plane wreckage; do not wipe active targets!
+    if (!IsUnityObjectAlive(seat)) {
         return;
     }
 
@@ -1764,8 +1735,6 @@ void hook_GeneralHUD_LateUpdate(void* self) {
     float bulletSpeed = 1050.0f;
     bool noGravity = false;
     bool foundTurret = false;
-
-    void* seat = *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT);
 
     if (IsValidPtr(seat)) {
         void* seatSys = *(void**)((uintptr_t)seat + 0x20); // VehicleSeat.parent (SeatSystem)
@@ -1829,18 +1798,21 @@ void hook_GeneralHUD_LateUpdate(void* self) {
     }
 
     auto enemyList = *(monoList<void*>**)((uintptr_t)self + OFFSET_HUD_ALLENEMIES);
-    if (!IsValidPtr(enemyList) || !IsValidPtr(enemyList->items) || enemyList->getSize() <= 0) {
+    int enemyCount = (IsValidPtr(enemyList) && IsValidPtr(enemyList->items)) ? enemyList->getSize() : 0;
+    if (enemyCount <= 0) {
         // Fallback: check allDetectedUnits (0x130) if allEnemyUnits is empty
         enemyList = *(monoList<void*>**)((uintptr_t)self + 0x130);
-    }
-    if (!IsValidPtr(enemyList) || !IsValidPtr(enemyList->items)) {
-        clearTargets();
-        return;
+        enemyCount = (IsValidPtr(enemyList) && IsValidPtr(enemyList->items)) ? enemyList->getSize() : 0;
     }
 
-    int enemyCount = enemyList->getSize();
-    if (enemyCount <= 0 || enemyCount > 256) {
-        clearTargets();
+    static uint64_t lastHudLogMs = 0;
+    if (nowMs - lastHudLogMs > 2000) {
+        lastHudLogMs = nowMs;
+        LOGI("[C-RAM-HUD] HUD=%p, seat=%p, cam=%p, rawEnemies=%d",
+             self, seat, cam, enemyCount);
+    }
+
+    if (!IsValidPtr(enemyList) || !IsValidPtr(enemyList->items) || enemyCount <= 0 || enemyCount > 256) {
         return;
     }
 
@@ -1917,6 +1889,12 @@ void hook_GeneralHUD_LateUpdate(void* self) {
 
     g_TargetsCount[writeIdx] = count;
     g_ActiveBufferIdx.store(writeIdx);
+
+    static int lastLoggedCount = -1;
+    if (count != lastLoggedCount) {
+        lastLoggedCount = count;
+        LOGI("[C-RAM-HUD] Lead targets updated: count=%d (activeBuffer=%d)", count, writeIdx);
+    }
 }
 
 
