@@ -172,7 +172,7 @@ typedef void (*t_RotatingSensor_Update)(void* self);
 typedef void (*t_CameraManager_Awake)(void* self, void* method);
 typedef void (*t_CameraManager_SetCameraByType)(void* self, int type, void* method);
 typedef void (*t_CameraManager_SetCamera)(void* self, int gameCameraType, void* follow, int unitType, void* method);
-typedef void (*t_VehicleSeat_InitializeHUD)(void* self);
+typedef void (*t_VehicleSeat_InitializeHUD)(void* self, void* method);
 typedef void (*t_Airplane_FixedUpdate)(void* self, void* method);
 typedef void (*t_AircraftMio_SetAirCraftControllerType)(void* self, int type, void* method);
 typedef void (*t_Joystick_Start)(void* self, void* method);
@@ -720,6 +720,64 @@ void ApplyCockpitCursorSteering(void* seat, int cameraType) {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Seat HUD Watchdog: Guarantee that active plane always has an instantiated GeneralHUD
+// -----------------------------------------------------------------------------
+static void* s_CachedHUDPrefab = nullptr;
+
+void EnsureSeatHUD(void* seat) {
+    if (!IsUnityObjectAlive(seat)) return;
+
+    void* currentHUD = *(void**)((uintptr_t)seat + 0x58); // VehicleSeat.generalHUD
+    void* prefab = *(void**)((uintptr_t)seat + 0x50); // VehicleSeat.generalHUDPrefab
+    if (IsUnityObjectAlive(prefab)) {
+        s_CachedHUDPrefab = prefab;
+    }
+
+    if (IsUnityObjectAlive(currentHUD)) {
+        return; // Seat already has an alive HUD!
+    }
+
+    LOGI("[C-RAM-HUD] EnsureSeatHUD: Seat %p has NO alive generalHUD! Initializing...", seat);
+
+    // 1. Try native VehicleSeat.InitializeHUD
+    if (VehicleSeat_InitializeHUD) {
+        VehicleSeat_InitializeHUD(seat, nullptr);
+        currentHUD = *(void**)((uintptr_t)seat + 0x58);
+        if (IsUnityObjectAlive(currentHUD)) {
+            LOGI("[C-RAM-HUD] EnsureSeatHUD: Native InitializeHUD succeeded! generalHUD=%p", currentHUD);
+            return;
+        }
+    }
+
+    // 2. Fallback: Instantiate directly from generalHUDPrefab (0x50) or cached prefab
+    if (!IsUnityObjectAlive(prefab)) {
+        prefab = s_CachedHUDPrefab;
+    }
+
+    if (IsUnityObjectAlive(prefab) && Object_Instantiate) {
+        LOGI("[C-RAM-HUD] EnsureSeatHUD: Instantiating generalHUD from prefab %p...", prefab);
+        void* newHUD = Object_Instantiate(prefab, nullptr);
+        if (IsUnityObjectAlive(newHUD)) {
+            *(void**)((uintptr_t)seat + 0x58) = newHUD;
+            *(void**)((uintptr_t)newHUD + OFFSET_HUD_PARENTSEAT) = seat;
+            void* mainCam = Camera_get_main ? Camera_get_main() : nullptr;
+            if (IsUnityObjectAlive(mainCam)) {
+                *(void**)((uintptr_t)newHUD + OFFSET_HUD_MAINCAMERA) = mainCam;
+            }
+            if (Component_get_gameObject && GameObject_SetActive) {
+                void* hudGO = Component_get_gameObject(newHUD, nullptr);
+                if (IsUnityObjectAlive(hudGO)) {
+                    GameObject_SetActive(hudGO, true, nullptr);
+                }
+            }
+            LOGI("[C-RAM-HUD] EnsureSeatHUD: Cloned and configured GeneralHUD %p for seat %p!", newHUD, seat);
+        }
+    } else {
+        LOGW("[C-RAM-HUD] EnsureSeatHUD: prefab %p not alive or Object_Instantiate null!", prefab);
+    }
+}
+
 void hook_CameraManager_Awake(void* self, void* method) {
     g_CameraManagerInstance = self;
     LOGI("[C-RAM-CAM] CameraManager::Awake captured! Instance: %p", self);
@@ -739,6 +797,11 @@ void hook_CameraManager_SetCameraByType(void* self, int type, void* method) {
     if (orig_CameraManager_SetCameraByType) {
         orig_CameraManager_SetCameraByType(self, type, method);
     }
+    if (IsValidPtr(self)) {
+        void* updatedSeat = *(void**)((uintptr_t)self + 0x1A0);
+        if (IsUnityObjectAlive(updatedSeat)) seat = updatedSeat;
+    }
+    EnsureSeatHUD(seat);
     ApplyCockpitCursorSteering(seat, type);
 }
 
@@ -749,7 +812,12 @@ void hook_CameraManager_SetCamera(void* self, int gameCameraType, void* follow, 
     if (orig_CameraManager_SetCamera) {
         orig_CameraManager_SetCamera(self, gameCameraType, follow, unitType, method);
     }
-    ApplyCockpitCursorSteering(follow, gameCameraType);
+    void* seatToEnsure = follow;
+    if (!IsUnityObjectAlive(seatToEnsure) && IsValidPtr(self)) {
+        seatToEnsure = *(void**)((uintptr_t)self + 0x1A0);
+    }
+    EnsureSeatHUD(seatToEnsure);
+    ApplyCockpitCursorSteering(seatToEnsure, gameCameraType);
 }
 
 // -----------------------------------------------------------------------------
@@ -768,6 +836,10 @@ void hook_Airplane_FixedUpdate(void* self, void* method) {
                 if (curCam == 9) { // In Cockpit POV
                     *(bool*)((uintptr_t)self + OFFSET_AIRPLANE_CURSORSTEERING) = true;
                     *(int*)((uintptr_t)parentMio + OFFSET_MIO_CONTROLLERTYPE) = 3; // ArcadeCursor
+                }
+                if (IsValidPtr(g_CameraManagerInstance)) {
+                    void* curSeat = *(void**)((uintptr_t)g_CameraManagerInstance + 0x1A0);
+                    EnsureSeatHUD(curSeat);
                 }
             }
         }
@@ -1286,6 +1358,19 @@ void hook_EventSystem_Update(void* self) {
     }
 
     g_ActivePlayerUnitType.store(playerUnitType);
+
+    // Periodic HUD Watchdog: Guarantee that active aircraft always has an alive GeneralHUD
+    static uint64_t lastHudWatchdogMs = 0;
+    uint64_t nowEvMs = getNowMs();
+    if (nowEvMs - lastHudWatchdogMs > 250) {
+        lastHudWatchdogMs = nowEvMs;
+        if (IsValidPtr(g_CameraManagerInstance)) {
+            void* curSeat = *(void**)((uintptr_t)g_CameraManagerInstance + 0x1A0);
+            if (IsUnityObjectAlive(curSeat)) {
+                EnsureSeatHUD(curSeat);
+            }
+        }
+    }
 
     // 5. StageUI: Clone native LandingGearButton into mobileArcadeAircraft for Arcade (Simplified) Airplane Mode
     void* stageUI = GetStageUIInstance();
