@@ -42,7 +42,6 @@
 #define RVA_UNIT_TYPE                   0x3B38DB4 // IUnit.GetUnitType
 #define RVA_PHYS_VEL                    0x39DEC94 // PhysicsObject.get_Velocity
 #define RVA_HUD_LATEUPDATE              0x3ACF27C // GeneralHUD.LateUpdate
-#define RVA_HUD_ONDISABLE               0x3ACEBA0 // GeneralHUD.OnDisable
 
 // Multiplayer & UI Hooks
 #define RVA_EVENTSYSTEM_UPDATE          0x79EC8B4 // UnityEngine.EventSystems.EventSystem.Update
@@ -146,7 +145,6 @@ typedef Vector3 (*t_Transform_get_forward)(void* transform, void* method);
 typedef int (*t_IUnit_GetUnitType)(void* unit);
 typedef Vector3 (*t_PhysicsObject_get_Velocity)(void* physicsObject);
 typedef void (*t_GeneralHUD_LateUpdate)(void* self);
-typedef void (*t_GeneralHUD_OnDisable)(void* self, void* method);
 typedef void (*t_Turret_FixedUpdate)(void* self);
 typedef void (*t_CameraShakeManager_GunfireAt)(Vector3 position, float magnitude);
 
@@ -238,8 +236,6 @@ static t_PhysicsObject_get_Velocity orig_PhysicsObject_get_Velocity = nullptr;
 static t_PhysicsObject_get_Velocity PhysicsObject_get_Velocity = nullptr;
 Vector3 hook_PhysicsObject_get_Velocity(void* self);
 static t_GeneralHUD_LateUpdate orig_GeneralHUD_LateUpdate = nullptr;
-static t_GeneralHUD_OnDisable orig_GeneralHUD_OnDisable = nullptr;
-void hook_GeneralHUD_OnDisable(void* self, void* method);
 static t_Turret_FixedUpdate orig_Turret_FixedUpdate = nullptr;
 static t_CameraShakeManager_GunfireAt orig_CameraShakeManager_GunfireAt = nullptr;
 void hook_Turret_FixedUpdate(void* self);
@@ -765,39 +761,6 @@ void ApplyCockpitCursorSteering(void* seat, int cameraType) {
     }
 }
 
-void EnsureSeatHUDActive(void* seat) {
-    if (!IsUnityObjectAlive(seat)) return;
-    void* hud = *(void**)((uintptr_t)seat + 0x58); // VehicleSeat.generalHUD
-    if (!IsUnityObjectAlive(hud) && VehicleSeat_InitializeHUD) {
-        LOGI("[C-RAM-MOD] Initializing missing generalHUD on seat %p", seat);
-        VehicleSeat_InitializeHUD(seat);
-        hud = *(void**)((uintptr_t)seat + 0x58);
-    }
-    if (IsUnityObjectAlive(hud)) {
-        // Ensure HUD's parentSeat is linked to this seat if missing
-        if (!IsUnityObjectAlive(*(void**)((uintptr_t)hud + OFFSET_HUD_PARENTSEAT))) {
-            *(void**)((uintptr_t)hud + OFFSET_HUD_PARENTSEAT) = seat;
-        }
-
-        // Ensure HUD's mainCamera is linked only if null (never overwrite active turret/seat camera!)
-        void* curCam = *(void**)((uintptr_t)hud + OFFSET_HUD_MAINCAMERA);
-        if (!IsUnityObjectAlive(curCam) && Camera_get_main) {
-            void* freshCam = Camera_get_main();
-            if (IsUnityObjectAlive(freshCam)) {
-                *(void**)((uintptr_t)hud + OFFSET_HUD_MAINCAMERA) = freshCam;
-            }
-        }
-
-        // Ensure HUD GameObject is active
-        if (Component_get_gameObject && GameObject_SetActive) {
-            void* go = Component_get_gameObject(hud, nullptr);
-            if (IsUnityObjectAlive(go)) {
-                GameObject_SetActive(go, true, nullptr);
-            }
-        }
-    }
-}
-
 void hook_CameraManager_Awake(void* self, void* method) {
     g_CameraManagerInstance = self;
     LOGI("[C-RAM-MOD] CameraManager::Awake captured! Instance: %p", self);
@@ -817,7 +780,6 @@ void hook_CameraManager_SetCameraByType(void* self, int type, void* method) {
     if (IsValidPtr(self)) {
         seat = *(void**)((uintptr_t)self + 0x1A0); // CameraManager.selectedSeat
     }
-    EnsureSeatHUDActive(seat);
     ApplyCockpitCursorSteering(seat, type);
 }
 
@@ -828,12 +790,7 @@ void hook_CameraManager_SetCamera(void* self, int gameCameraType, void* follow, 
     if (orig_CameraManager_SetCamera) {
         orig_CameraManager_SetCamera(self, gameCameraType, follow, unitType, method);
     }
-    void* seat = follow;
-    if (!IsUnityObjectAlive(seat) && IsValidPtr(self)) {
-        seat = *(void**)((uintptr_t)self + 0x1A0); // selectedSeat
-    }
-    EnsureSeatHUDActive(seat);
-    ApplyCockpitCursorSteering(seat, gameCameraType);
+    ApplyCockpitCursorSteering(follow, gameCameraType);
 }
 
 // -----------------------------------------------------------------------------
@@ -1809,9 +1766,6 @@ void hook_GeneralHUD_LateUpdate(void* self) {
     bool foundTurret = false;
 
     void* seat = *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT);
-    if (!IsValidPtr(seat) && IsValidPtr(g_CameraManagerInstance)) {
-        seat = *(void**)((uintptr_t)g_CameraManagerInstance + 0x1A0);
-    }
 
     if (IsValidPtr(seat)) {
         void* seatSys = *(void**)((uintptr_t)seat + 0x20); // VehicleSeat.parent (SeatSystem)
@@ -1965,21 +1919,6 @@ void hook_GeneralHUD_LateUpdate(void* self) {
     g_ActiveBufferIdx.store(writeIdx);
 }
 
-// -----------------------------------------------------------------------------
-// Battle Hook: GeneralHUD.OnDisable (Instant Cleanup on Match Exit / Round End)
-// -----------------------------------------------------------------------------
-void hook_GeneralHUD_OnDisable(void* self, void* method) {
-    if (orig_GeneralHUD_OnDisable) {
-        orig_GeneralHUD_OnDisable(self, method);
-    }
-    g_TargetsCount[0] = 0;
-    g_TargetsCount[1] = 0;
-    g_ActiveBufferIdx.store(0);
-    g_LastHudUpdateMs.store(0);
-    ClearTargetFilters();
-    s_ClonedGearButtonComp = nullptr;
-    s_LastStageUI = nullptr;
-}
 
 // -----------------------------------------------------------------------------
 // ESP Drawing Loop (Render Thread inside eglSwapBuffers)
@@ -2174,12 +2113,9 @@ void* thread(void*) {
     // Economy pointers
     InventoryWrapper_AddCurrency = (t_InventoryWrapper_AddCurrency)(g_Il2CppBase + RVA_INVENTORY_ADDCURRENCY);
 
-    // 1. Hook GeneralHUD.LateUpdate & OnDisable for Battle Lead Indicator
+    // 1. Hook GeneralHUD.LateUpdate for Battle Lead Indicator
     void* targetHUDMethod = (void*)(g_Il2CppBase + RVA_HUD_LATEUPDATE);
     DobbyHook(targetHUDMethod, (void*)hook_GeneralHUD_LateUpdate, (void**)&orig_GeneralHUD_LateUpdate);
-
-    void* targetHUDOnDisable = (void*)(g_Il2CppBase + RVA_HUD_ONDISABLE);
-    DobbyHook(targetHUDOnDisable, (void*)hook_GeneralHUD_OnDisable, (void**)&orig_GeneralHUD_OnDisable);
 
     // 1b. AC-130 Recoil Suppression & Camera Shake Protection
     void* targetTurretFixedUpdate = (void*)(g_Il2CppBase + RVA_TURRET_FIXEDUPDATE);
@@ -2278,7 +2214,7 @@ void* thread(void*) {
     pthread_t sock_t;
     pthread_create(&sock_t, nullptr, socket_server_thread, nullptr);
 
-    LOGI("C-RAM v6.5 Hooks Installed: Restored Pure run_35334470385 Camera HUD + Network Filters + AC-130 & Rocket Fixes Ready!");
+    LOGI("C-RAM v6.6 Hooks Installed: Pure v5.5 HUD Lifecycle & Respawn Safety + Anti-Jitter Filters + AC-130 & Rocket Fixes Ready!");
     pthread_exit(nullptr);
 }
 
