@@ -358,10 +358,12 @@ struct ScreenLeadTarget {
     float targetX, targetY;
     float distance;
     float flightTime;
-    bool hasTargetLine;
+    bool hasTarget;
+    bool hasLead;
     int targetType;
     float targetSpeedKmh;
     int stabilizerMode;
+    char targetName[32];
 };
 
 #define MAX_TARGETS 128
@@ -383,6 +385,28 @@ inline bool IsUnityObjectAlive(const void* uObj) {
     if (!IsValidPtr(uObj)) return false;
     void* nativePtr = *(void**)((uintptr_t)uObj + 0x10); // UnityEngine.Object.m_CachedPtr
     return IsValidPtr(nativePtr);
+}
+
+static void ReadMonoString(void* monoStr, char* outBuf, size_t outSize) {
+    if (!outBuf || outSize == 0) return;
+    outBuf[0] = '\0';
+    if (!IsValidPtr(monoStr)) return;
+    int32_t len = *(int32_t*)((uintptr_t)monoStr + 0x10);
+    if (len <= 0 || len > 128) return;
+    const uint16_t* utf16 = (const uint16_t*)((uintptr_t)monoStr + 0x14);
+    size_t written = 0;
+    for (int i = 0; i < len && written + 1 < outSize; i++) {
+        uint16_t c = utf16[i];
+        if (c >= 32 && c < 127) {
+            outBuf[written++] = (char)c;
+        } else if (c >= 0x0410 && c <= 0x044F) {
+            if (written + 2 < outSize) {
+                outBuf[written++] = (char)(0xD0 | ((c >> 6) & 0x1F));
+                outBuf[written++] = (char)(0x80 | (c & 0x3F));
+            }
+        }
+    }
+    outBuf[written] = '\0';
 }
 
 static inline void PatchDword(uintptr_t addr, uint32_t instruction) {
@@ -605,8 +629,11 @@ static void FilterScreenLeadPosition(void* target, float rawScreenX, float rawSc
 // -----------------------------------------------------------------------------
 // Neutralizes cumulative recoil impulse on the airframe when firing AC-130 cannons (20mm, 40mm, 105mm),
 // preventing airframe rolling/capsizing, autopilot drift, and camera detachment/inversion.
+static void* s_LastTurretInstance = nullptr;
+
 void hook_Turret_FixedUpdate(void* self) {
     if (IsValidPtr(self)) {
+        s_LastTurretInstance = self;
         void* aws = *(void**)((uintptr_t)self + 0x30); // WeaponSystem.parent
         if (IsValidPtr(aws)) {
             void* parentUnit = *(void**)((uintptr_t)aws + 0x20); // AWS.parent (IUnit)
@@ -1809,36 +1836,6 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         return;
     }
 
-    // Resolve current active seat from CameraManager
-    void* activeSeat = nullptr;
-    if (IsValidPtr(g_CameraManagerInstance)) {
-        activeSeat = *(void**)((uintptr_t)g_CameraManagerInstance + 0x1A0); // CameraManager.selectedSeat
-    }
-
-    void* seat = *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT);
-
-    // ZOMBIE CHECK:
-    // If an active seat exists and this HUD belongs to a different seat, it's a zombie from a dead plane!
-    if (IsUnityObjectAlive(activeSeat) && seat != activeSeat) {
-        if (Component_get_gameObject && GameObject_SetActive) {
-            void* hudGO = Component_get_gameObject(self, nullptr);
-            if (IsUnityObjectAlive(hudGO)) {
-                GameObject_SetActive(hudGO, false, nullptr);
-            }
-        }
-        return; // NEVER call orig_GeneralHUD_LateUpdate on a zombie!
-    }
-
-    // Ensure seat is valid
-    if (!IsUnityObjectAlive(seat)) {
-        if (IsUnityObjectAlive(activeSeat)) {
-            *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT) = activeSeat;
-            seat = activeSeat;
-        } else {
-            return;
-        }
-    }
-
     // Ensure HUD has a valid, alive Camera assigned BEFORE calling vanilla LateUpdate!
     void* cam = *(void**)((uintptr_t)self + OFFSET_HUD_MAINCAMERA);
     if (!IsUnityObjectAlive(cam)) {
@@ -1851,13 +1848,25 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         return;
     }
 
-    // Run vanilla LateUpdate ONLY for the active HUD!
+    // Run vanilla LateUpdate unconditionally so internal Unity states are preserved!
     if (orig_GeneralHUD_LateUpdate) {
         orig_GeneralHUD_LateUpdate(self);
     }
 
     uint64_t nowMs = getNowMs();
     g_LastHudUpdateMs.store(nowMs);
+
+    // Resolve current active seat from CameraManager if available
+    void* activeSeat = nullptr;
+    if (IsValidPtr(g_CameraManagerInstance)) {
+        activeSeat = *(void**)((uintptr_t)g_CameraManagerInstance + 0x1A0); // CameraManager.selectedSeat
+    }
+
+    void* seat = *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT);
+    if (!IsUnityObjectAlive(seat) && IsUnityObjectAlive(activeSeat)) {
+        *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT) = activeSeat;
+        seat = activeSeat;
+    }
 
     Vector3 gunPos(0, 0, 0);
     Vector3 playerVel(0, 0, 0);
@@ -1919,6 +1928,24 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         }
     }
 
+    // CIWS / Air Defense / Ground Turret fallback
+    if (!foundTurret && IsValidPtr(s_LastTurretInstance)) {
+        void* muzzle = *(void**)((uintptr_t)s_LastTurretInstance + OFFSET_TURRET_MUZZLE);
+        if (IsValidPtr(muzzle) && Component_get_transform && Transform_get_position) {
+            void* muzzleTr = Component_get_transform(muzzle);
+            if (IsValidPtr(muzzleTr)) {
+                gunPos = Transform_get_position(muzzleTr);
+                foundTurret = true;
+            }
+        }
+        void* ammoConfig = *(void**)((uintptr_t)s_LastTurretInstance + OFFSET_TURRET_AMMOCONFIG);
+        if (IsValidPtr(ammoConfig)) {
+            float spd = *(float*)((uintptr_t)ammoConfig + OFFSET_AMMO_SPEED);
+            if (spd > 50.0f) bulletSpeed = spd;
+        }
+        noGravity = *(bool*)((uintptr_t)s_LastTurretInstance + OFFSET_TURRET_NOGRAVITY);
+    }
+
     if (!foundTurret && Component_get_transform && Transform_get_position) {
         void* camTr = Component_get_transform(cam);
         if (IsValidPtr(camTr)) {
@@ -1960,7 +1987,7 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         int targetType = 3;
         if (IUnit_GetUnitType) {
             targetType = IUnit_GetUnitType(target);
-            if (targetType != 3 && targetType != 6 && targetType != 7 && targetType != 5) {
+            if (targetType != 3 && targetType != 6 && targetType != 7 && targetType != 5 && targetType != 1 && targetType != 2) {
                 continue;
             }
         }
@@ -1970,47 +1997,68 @@ void hook_GeneralHUD_LateUpdate(void* self) {
         Vector3 targetPos = Transform_get_position(tr);
 
         Vector3 targetVel(0, 0, 0);
-        uint64_t nowMs = getNowMs();
+        uint64_t nowMsTarget = getNowMs();
         if (PhysicsObject_get_Velocity) {
             Vector3 rawVel = PhysicsObject_get_Velocity(target);
-            targetVel = FilterVelocityForTarget(target, rawVel, nowMs);
+            targetVel = FilterVelocityForTarget(target, rawVel, nowMsTarget);
         }
+
+        Vector3 rel = targetPos - gunPos;
+        float distance = Vector3::Magnitude(rel);
+
+        Vector3 targetScreen = Camera_WorldToScreenPoint(cam, targetPos);
+        bool isTargetOnScreen = (targetScreen.Z > 0.0f);
 
         Vector3 leadPos(0, 0, 0);
         float flightTime = 0.0f;
-        float distance = 0.0f;
+        float calcDist = distance;
+        bool hasLead = CalculateLead(targetPos, targetVel, gunPos, playerVel, bulletSpeed, noGravity, leadPos, flightTime, calcDist);
 
-        if (!CalculateLead(targetPos, targetVel, gunPos, playerVel, bulletSpeed, noGravity, leadPos, flightTime, distance)) {
+        bool hasLeadOnScreen = false;
+        Vector3 leadScreen(0, 0, 0);
+        if (hasLead) {
+            leadScreen = Camera_WorldToScreenPoint(cam, leadPos);
+            if (leadScreen.Z > 0.0f) {
+                hasLeadOnScreen = true;
+            }
+        }
+
+        if (!isTargetOnScreen && !hasLeadOnScreen) {
             continue;
         }
 
-        Vector3 leadScreen = Camera_WorldToScreenPoint(cam, leadPos);
-        if (leadScreen.Z <= 0.0f) continue;
-
-        Vector3 targetScreen = Camera_WorldToScreenPoint(cam, targetPos);
-
-        float rawLeadScreenX = leadScreen.X;
-        float rawLeadScreenY = screenHeight - leadScreen.Y;
-
-        // Instantaneous world-to-screen projection: zero camera lag/swinging when panning
-        float smoothLeadScreenX = rawLeadScreenX;
-        float smoothLeadScreenY = rawLeadScreenY;
-
         ScreenLeadTarget& entry = g_TargetsBuffer[writeIdx][count];
-        entry.leadX = smoothLeadScreenX;
-        entry.leadY = smoothLeadScreenY;
         entry.distance = distance;
         entry.flightTime = flightTime;
         entry.targetType = targetType;
         entry.targetSpeedKmh = Vector3::Magnitude(targetVel) * 3.6f;
         entry.stabilizerMode = g_LeadStabilizerMode.load();
 
-        if (targetScreen.Z > 0.0f) {
-            entry.hasTargetLine = true;
+        entry.hasTarget = isTargetOnScreen;
+        if (isTargetOnScreen) {
             entry.targetX = targetScreen.X;
             entry.targetY = screenHeight - targetScreen.Y;
         } else {
-            entry.hasTargetLine = false;
+            entry.targetX = 0;
+            entry.targetY = 0;
+        }
+
+        entry.hasLead = hasLeadOnScreen;
+        if (hasLeadOnScreen) {
+            entry.leadX = leadScreen.X;
+            entry.leadY = screenHeight - leadScreen.Y;
+        } else {
+            entry.leadX = 0;
+            entry.leadY = 0;
+        }
+
+        // Read target name (mpPlayerName or UnitName)
+        entry.targetName[0] = '\0';
+        void* mpNameObj = *(void**)((uintptr_t)target + 0x90);
+        ReadMonoString(mpNameObj, entry.targetName, sizeof(entry.targetName));
+        if (entry.targetName[0] == '\0') {
+            void* unitNameObj = *(void**)((uintptr_t)target + 0x88);
+            ReadMonoString(unitNameObj, entry.targetName, sizeof(entry.targetName));
         }
 
         count++;
@@ -2037,7 +2085,7 @@ void DrawMenu() {
     if (!g_LeadEspEnabled.load()) return;
 
     uint64_t lastUpdate = g_LastHudUpdateMs.load();
-    if (lastUpdate == 0 || (getNowMs() - lastUpdate) > 200) {
+    if (lastUpdate == 0 || (getNowMs() - lastUpdate) > 500) {
         return;
     }
 
@@ -2048,27 +2096,75 @@ void DrawMenu() {
     const float leadCircleRadius = 14.0f;
     const ImU32 circleColor = IM_COL32(255, 45, 45, 240);
     const ImU32 centerColor = IM_COL32(255, 255, 255, 255);
-    const ImU32 lineColor = IM_COL32(255, 210, 50, 170);
-    const ImU32 textColor = IM_COL32(255, 255, 255, 240);
+    const ImU32 lineColor   = IM_COL32(255, 210, 50, 180);
+    const ImU32 textColor   = IM_COL32(255, 255, 255, 240);
+
+    const float r = 14.0f; // Target diamond / square half-size
+    const ImU32 diamondColor = IM_COL32(40, 240, 80, 245); // Military HUD green
+    const ImU32 diamondFill  = IM_COL32(40, 240, 80, 35);  // Transparent HUD green
 
     for (int i = 0; i < count; i++) {
         const ScreenLeadTarget& tgt = g_TargetsBuffer[readIdx][i];
-        ImVec2 leadPoint(tgt.leadX, tgt.leadY);
 
-        draw->AddCircle(leadPoint, leadCircleRadius, circleColor, 24, 2.5f);
-        draw->AddCircleFilled(leadPoint, 2.5f, centerColor);
+        // 1. Target Indicator (Diamond for Air, Square for Ground)
+        if (tgt.hasTarget) {
+            if (tgt.targetType == 3 || tgt.targetType == 6 || tgt.targetType == 7) {
+                // Air unit (Plane/Heli/Drone): Diamond (зеленый ромбик)
+                ImVec2 pts[4] = {
+                    ImVec2(tgt.targetX, tgt.targetY - r),
+                    ImVec2(tgt.targetX + r, tgt.targetY),
+                    ImVec2(tgt.targetX, tgt.targetY + r),
+                    ImVec2(tgt.targetX - r, tgt.targetY)
+                };
+                draw->AddConvexPolyFilled(pts, 4, diamondFill);
+                draw->AddPolyline(pts, 4, diamondColor, ImDrawFlags_Closed, 2.0f);
+            } else {
+                // Ground unit / Vehicle: Square (квадрат)
+                ImVec2 pMin(tgt.targetX - r, tgt.targetY - r);
+                ImVec2 pMax(tgt.targetX + r, tgt.targetY + r);
+                draw->AddRectFilled(pMin, pMax, diamondFill);
+                draw->AddRect(pMin, pMax, diamondColor, 0.0f, 0, 2.0f);
+            }
 
-        float cross = leadCircleRadius * 0.5f;
-        draw->AddLine(ImVec2(leadPoint.x - cross, leadPoint.y), ImVec2(leadPoint.x + cross, leadPoint.y), circleColor, 1.5f);
-        draw->AddLine(ImVec2(leadPoint.x, leadPoint.y - cross), ImVec2(leadPoint.x, leadPoint.y + cross), circleColor, 1.5f);
-
-        if (tgt.hasTargetLine) {
-            draw->AddLine(ImVec2(tgt.targetX, tgt.targetY), leadPoint, lineColor, 1.5f);
+            // Target Name and Distance Text below the indicator
+            char labelBuf[64];
+            if (tgt.targetName[0] != '\0') {
+                if (tgt.distance >= 1000.0f) {
+                    snprintf(labelBuf, sizeof(labelBuf), "%s\n%.1fkm", tgt.targetName, tgt.distance / 1000.0f);
+                } else {
+                    snprintf(labelBuf, sizeof(labelBuf), "%s\n%.0fm", tgt.targetName, tgt.distance);
+                }
+            } else {
+                if (tgt.distance >= 1000.0f) {
+                    snprintf(labelBuf, sizeof(labelBuf), "%.1fkm", tgt.distance / 1000.0f);
+                } else {
+                    snprintf(labelBuf, sizeof(labelBuf), "%.0fm", tgt.distance);
+                }
+            }
+            draw->AddText(ImVec2(tgt.targetX - r, tgt.targetY + r + 3.0f), diamondColor, labelBuf);
         }
 
-        char textBuf[64];
-        snprintf(textBuf, sizeof(textBuf), "%.0fm (%.1fs)", tgt.distance, tgt.flightTime);
-        draw->AddText(ImVec2(leadPoint.x + leadCircleRadius + 5, leadPoint.y - 8), textColor, textBuf);
+        // 2. Lead Point Reticle (Точка упреждения)
+        if (tgt.hasLead) {
+            ImVec2 leadPoint(tgt.leadX, tgt.leadY);
+
+            draw->AddCircle(leadPoint, leadCircleRadius, circleColor, 24, 2.5f);
+            draw->AddCircleFilled(leadPoint, 2.5f, centerColor);
+
+            float cross = leadCircleRadius * 0.5f;
+            draw->AddLine(ImVec2(leadPoint.x - cross, leadPoint.y), ImVec2(leadPoint.x + cross, leadPoint.y), circleColor, 1.5f);
+            draw->AddLine(ImVec2(leadPoint.x, leadPoint.y - cross), ImVec2(leadPoint.x, leadPoint.y + cross), circleColor, 1.5f);
+
+            // Lead distance / flight time text next to lead circle
+            char leadBuf[32];
+            snprintf(leadBuf, sizeof(leadBuf), "%.0fm (%.1fs)", tgt.distance, tgt.flightTime);
+            draw->AddText(ImVec2(leadPoint.x + leadCircleRadius + 5.0f, leadPoint.y - 8.0f), textColor, leadBuf);
+
+            // 3. Guidance line from target to lead
+            if (tgt.hasTarget) {
+                draw->AddLine(ImVec2(tgt.targetX, tgt.targetY), leadPoint, lineColor, 1.5f);
+            }
+        }
     }
 }
 
