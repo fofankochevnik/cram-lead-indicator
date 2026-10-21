@@ -1,5 +1,5 @@
 //
-// C-RAM Mod v6.0: Cockpit Cursor Steering + Multi-Stage Combat Lead Stabilizer (Anti-Jitter Edition)
+// C-RAM Mod v7.1
 //
 
 #include <pthread.h>
@@ -69,15 +69,13 @@
 #define RVA_CAMERAMANAGER_AWAKE         0x3EFA604 // CameraManager.Awake
 #define RVA_CAMERAMANAGER_SETCAMERABYTYPE 0x3EF815C // CameraManager.SetCameraByType(GameCameraType type)
 #define RVA_CAMERAMANAGER_SETCAMERA     0x3EFB430 // CameraManager.SetCamera(GameCameraType gameCameraType, VehicleSeat follow, UnitType unitType)
-#define RVA_VEHICLESEAT_INITIALIZEHUD   0x3B48D04 // VehicleSeat.InitializeHUD
 #define RVA_AIRPLANE_FIXEDUPDATE        0x3BB5FDC // Airplane.FixedUpdate
 #define RVA_AIRCRAFTMIO_SETCONTROLLER   0x3B26688 // AircraftMio.SetAirCraftControllerType(AircraftControllerType type)
 #define RVA_JOYSTICK_START              0x38976BC // Joystick.Start
 #define RVA_ULTIMATEJOYSTICK_DISABLE    0x3C85A7C // UltimateJoystick.DisableJoystick(string joystickName)
 #define RVA_GAMEOBJECT_SETACTIVE        0x767AF68 // UnityEngine.GameObject.SetActive(bool value)
 #define RVA_COMP_GET_GAMEOBJECT         0x7675CAC // UnityEngine.Component.get_gameObject
-#define RVA_HUD_START                   0x3ACEC64 // GeneralHUD.Start
-#define RVA_HUDPARENT_REFRESHALL        0x38FF7D0 // HUDParent.RefreshAll
+#define RVA_STAGEUI_REFRESHUI           0x3B77A74
 
 // Economy / Give Currency Hooks
 #define RVA_INVENTORY_AWAKE             0x38EAB78 // InventoryWrapper.Awake
@@ -120,6 +118,17 @@
 #define OFFSET_TURRET_MUZZLE            0xD8
 #define OFFSET_TURRET_AMMOCONFIG        0xC0
 #define OFFSET_TURRET_NOGRAVITY         0xFC
+#define OFFSET_TURRET_RECOIL_PENDING    0x148
+#define OFFSET_TURRET_RECOIL_TIME       0x14C
+#define OFFSET_WEAPON_PARENT_AWS        0x30
+#define OFFSET_AWS_PARENT_SEAT          0x20
+#define OFFSET_SEAT_PARENT_SYS          0x20
+#define OFFSET_SEAT_GENERALHUD          0x58
+#define OFFSET_SEATSYS_PARENT_UNIT      0x20
+#define OFFSET_STAGEUI_PLAYERSEAT       0x2A8
+#define OFFSET_CAMMGR_SELECTEDSEAT      0x1A0
+#define OFFSET_CAMMGR_MAINCAMERA        0x220
+#define OFFSET_HUD_UNITINDICATORS       0xD0
 
 #define OFFSET_AMMO_SPEED               0x24
 
@@ -174,15 +183,13 @@ typedef void (*t_RotatingSensor_Update)(void* self);
 typedef void (*t_CameraManager_Awake)(void* self, void* method);
 typedef void (*t_CameraManager_SetCameraByType)(void* self, int type, void* method);
 typedef void (*t_CameraManager_SetCamera)(void* self, int gameCameraType, void* follow, int unitType, void* method);
-typedef void (*t_VehicleSeat_InitializeHUD)(void* self, void* method);
 typedef void (*t_Airplane_FixedUpdate)(void* self, void* method);
 typedef void (*t_AircraftMio_SetAirCraftControllerType)(void* self, int type, void* method);
 typedef void (*t_Joystick_Start)(void* self, void* method);
 typedef void (*t_UltimateJoystick_DisableJoystick)(void* joystickName, void* method);
 typedef void (*t_GameObject_SetActive)(void* self, bool value, void* method);
 typedef void* (*t_Component_get_gameObject)(void* self, void* method);
-typedef void (*t_GeneralHUD_Start)(void* self, void* method);
-typedef void (*t_HUDParent_RefreshAll)(void* method);
+typedef void (*t_StageUI_refreshUI)(void* self, void* method);
 
 // Economy pointers
 typedef void (*t_InventoryWrapper_Awake)(void* self, void* method);
@@ -266,7 +273,6 @@ static t_RotatingSensor_Update orig_RotatingSensor_Update = nullptr;
 static t_CameraManager_Awake orig_CameraManager_Awake = nullptr;
 static t_CameraManager_SetCameraByType orig_CameraManager_SetCameraByType = nullptr;
 static t_CameraManager_SetCamera orig_CameraManager_SetCamera = nullptr;
-static t_VehicleSeat_InitializeHUD VehicleSeat_InitializeHUD = nullptr;
 static void* g_CameraManagerInstance = nullptr;
 static t_Airplane_FixedUpdate orig_Airplane_FixedUpdate = nullptr;
 static t_AircraftMio_SetAirCraftControllerType AircraftMio_SetAirCraftControllerType = nullptr;
@@ -274,8 +280,8 @@ static t_Joystick_Start orig_Joystick_Start = nullptr;
 static t_UltimateJoystick_DisableJoystick UltimateJoystick_DisableJoystick = nullptr;
 static t_GameObject_SetActive GameObject_SetActive = nullptr;
 static t_Component_get_gameObject Component_get_gameObject = nullptr;
-static t_GeneralHUD_Start GeneralHUD_Start = nullptr;
-static t_HUDParent_RefreshAll HUDParent_RefreshAll = nullptr;
+static t_StageUI_refreshUI StageUI_refreshUI = nullptr;
+static std::atomic<bool> g_ForceHudRefresh{false};
 
 static t_InventoryWrapper_Awake orig_InventoryWrapper_Awake = nullptr;
 static t_InventoryWrapper_AddCurrency orig_InventoryWrapper_AddCurrency = nullptr;
@@ -363,7 +369,6 @@ struct ScreenLeadTarget {
     int targetType;
     float targetSpeedKmh;
     int stabilizerMode;
-    char targetName[32];
 };
 
 #define MAX_TARGETS 128
@@ -523,8 +528,8 @@ static Vector3 FilterVelocityForTarget(void* target, const Vector3& rawVel, uint
         isGhost = *(bool*)((uintptr_t)target + 0xA0);
     }
 
-    // In Mode 1, 2, 4 we filter all network ghosts, and in Ultimate mode we filter any target
-    if (!isGhost && mode != LEAD_MODE_ULTIMATE) {
+    // Only filter network ghosts in multiplayer! Offline bot targets have zero network jitter.
+    if (!isGhost) {
         return rawVel;
     }
 
@@ -629,21 +634,19 @@ static void FilterScreenLeadPosition(void* target, float rawScreenX, float rawSc
 // -----------------------------------------------------------------------------
 // Neutralizes cumulative recoil impulse on the airframe when firing AC-130 cannons (20mm, 40mm, 105mm),
 // preventing airframe rolling/capsizing, autopilot drift, and camera detachment/inversion.
-static void* s_LastTurretInstance = nullptr;
-
 void hook_Turret_FixedUpdate(void* self) {
-    if (IsValidPtr(self)) {
-        s_LastTurretInstance = self;
-        void* aws = *(void**)((uintptr_t)self + 0x30); // WeaponSystem.parent
-        if (IsValidPtr(aws)) {
-            void* parentUnit = *(void**)((uintptr_t)aws + 0x20); // AWS.parent (IUnit)
-            if (IsValidPtr(parentUnit) && IUnit_GetUnitType) {
-                int uType = IUnit_GetUnitType(parentUnit);
-                if (uType == 3) { // Air unit (including AC-130 gunship)
-                    // Zero out physical recoil impulse on aircraft airframe to prevent rolling/capsizing
-                    *(float*)((uintptr_t)self + 0x148) = 0.0f; // _recoilImpulsePending = 0
-                    *(float*)((uintptr_t)self + 0x14C) = 0.0f; // _recoilTimeRemaining = 0
-                }
+    if (IsValidPtr(self) && IUnit_GetUnitType && IsValidPtr(g_CameraManagerInstance)) {
+        void* aws = *(void**)((uintptr_t)self + OFFSET_WEAPON_PARENT_AWS);
+        void* seat = IsUnityObjectAlive(aws) ? *(void**)((uintptr_t)aws + OFFSET_AWS_PARENT_SEAT) : nullptr;
+        void* seatSys = IsUnityObjectAlive(seat) ? *(void**)((uintptr_t)seat + OFFSET_SEAT_PARENT_SYS) : nullptr;
+        void* unit = IsUnityObjectAlive(seatSys) ? *(void**)((uintptr_t)seatSys + OFFSET_SEATSYS_PARENT_UNIT) : nullptr;
+        if (IsUnityObjectAlive(unit)) {
+            void* pSeat = *(void**)((uintptr_t)g_CameraManagerInstance + OFFSET_CAMMGR_SELECTEDSEAT);
+            void* pSys = IsUnityObjectAlive(pSeat) ? *(void**)((uintptr_t)pSeat + OFFSET_SEAT_PARENT_SYS) : nullptr;
+            void* pUnit = IsUnityObjectAlive(pSys) ? *(void**)((uintptr_t)pSys + OFFSET_SEATSYS_PARENT_UNIT) : nullptr;
+            if (unit == pUnit && IUnit_GetUnitType(unit) == 3) {
+                *(float*)((uintptr_t)self + OFFSET_TURRET_RECOIL_PENDING) = 0.0f;
+                *(float*)((uintptr_t)self + OFFSET_TURRET_RECOIL_TIME) = 0.0f;
             }
         }
     }
@@ -753,85 +756,40 @@ void ApplyCockpitCursorSteering(void* seat, int cameraType) {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Seat HUD Watchdog: Guarantee that active plane always has an instantiated GeneralHUD
-// -----------------------------------------------------------------------------
-static void* s_CachedHUDPrefab = nullptr;
+static void* s_HudRefreshSeat = nullptr;
+static uint64_t s_HudSeatSeenMs = 0;
+static uint64_t s_HudRefreshLastMs = 0;
+static int s_HudRefreshTries = 0;
 
-void EnsureSeatHUD(void* seat) {
+static void EnsureNativeHUD(bool force) {
+    if (!StageUI_refreshUI) return;
+    void* stageUI = GetStageUIInstance();
+    if (!stageUI) return;
+    void* seat = *(void**)((uintptr_t)stageUI + OFFSET_STAGEUI_PLAYERSEAT);
     if (!IsUnityObjectAlive(seat)) return;
 
-    void* currentHUD = *(void**)((uintptr_t)seat + 0x58); // VehicleSeat.generalHUD
-    void* prefab = *(void**)((uintptr_t)seat + 0x50); // VehicleSeat.generalHUDPrefab
-    if (IsUnityObjectAlive(prefab)) {
-        s_CachedHUDPrefab = prefab;
+    uint64_t now = getNowMs();
+    if (seat != s_HudRefreshSeat) {
+        s_HudRefreshSeat = seat;
+        s_HudSeatSeenMs = now;
+        s_HudRefreshLastMs = 0;
+        s_HudRefreshTries = 0;
     }
 
-    if (IsUnityObjectAlive(currentHUD)) {
-        void* cam = *(void**)((uintptr_t)currentHUD + OFFSET_HUD_MAINCAMERA);
-        if (!IsUnityObjectAlive(cam) && Camera_get_main) {
-            *(void**)((uintptr_t)currentHUD + OFFSET_HUD_MAINCAMERA) = Camera_get_main();
-        }
-        return; // Seat already has an alive HUD!
+    void* hud = *(void**)((uintptr_t)seat + OFFSET_SEAT_GENERALHUD);
+    if (!force) {
+        if (IsUnityObjectAlive(hud)) return;
+        if (now - s_HudSeatSeenMs < 400) return;
+        if (s_HudRefreshTries >= 2) return;
+        if (now - s_HudRefreshLastMs < 1500) return;
     }
 
-    LOGI("[C-RAM-HUD] EnsureSeatHUD: Seat %p has NO alive generalHUD! Initializing...", seat);
-
-    // 1. Try native VehicleSeat.InitializeHUD
-    if (VehicleSeat_InitializeHUD) {
-        VehicleSeat_InitializeHUD(seat, nullptr);
-        currentHUD = *(void**)((uintptr_t)seat + 0x58);
-        if (IsUnityObjectAlive(currentHUD)) {
-            LOGI("[C-RAM-HUD] EnsureSeatHUD: Native InitializeHUD succeeded! generalHUD=%p", currentHUD);
-            if (HUDParent_RefreshAll) HUDParent_RefreshAll(nullptr);
-            return;
-        }
-    }
-
-    // 2. Fallback: Instantiate directly from generalHUDPrefab (0x50) or cached prefab
-    if (!IsUnityObjectAlive(prefab)) {
-        prefab = s_CachedHUDPrefab;
-    }
-
-    if (IsUnityObjectAlive(prefab) && Object_Instantiate) {
-        LOGI("[C-RAM-HUD] EnsureSeatHUD: Instantiating generalHUD from prefab %p...", prefab);
-        void* mainCam = Camera_get_main ? Camera_get_main() : nullptr;
-
-        // Pre-configure prefab fields so that GeneralHUD.Start() doesn't throw NullReferenceException!
-        *(void**)((uintptr_t)prefab + OFFSET_HUD_PARENTSEAT) = seat;
-        if (IsUnityObjectAlive(mainCam)) {
-            *(void**)((uintptr_t)prefab + OFFSET_HUD_MAINCAMERA) = mainCam;
-        }
-
-        void* newHUD = Object_Instantiate(prefab, nullptr);
-
-        // Reset prefab field
-        *(void**)((uintptr_t)prefab + OFFSET_HUD_PARENTSEAT) = nullptr;
-
-        if (IsUnityObjectAlive(newHUD)) {
-            *(void**)((uintptr_t)seat + 0x58) = newHUD;
-            *(void**)((uintptr_t)newHUD + OFFSET_HUD_PARENTSEAT) = seat;
-            if (IsUnityObjectAlive(mainCam)) {
-                *(void**)((uintptr_t)newHUD + OFFSET_HUD_MAINCAMERA) = mainCam;
-            }
-            if (Component_get_gameObject && GameObject_SetActive) {
-                void* hudGO = Component_get_gameObject(newHUD, nullptr);
-                if (IsUnityObjectAlive(hudGO)) {
-                    GameObject_SetActive(hudGO, true, nullptr);
-                }
-            }
-            if (GeneralHUD_Start) {
-                GeneralHUD_Start(newHUD, nullptr);
-                LOGI("[C-RAM-HUD] EnsureSeatHUD: GeneralHUD.Start called on newHUD %p", newHUD);
-            }
-            if (HUDParent_RefreshAll) {
-                HUDParent_RefreshAll(nullptr);
-            }
-            LOGI("[C-RAM-HUD] EnsureSeatHUD: Cloned and fully configured GeneralHUD %p for seat %p!", newHUD, seat);
-        }
-    } else {
-        LOGW("[C-RAM-HUD] EnsureSeatHUD: prefab %p not alive or Object_Instantiate null!", prefab);
-    }
+    s_HudRefreshTries++;
+    s_HudRefreshLastMs = now;
+    LOGI("[C-RAM-HUD] Seat %p has no native GeneralHUD (hud=%p), calling StageUI.refreshUI (try %d, force=%d)", seat, hud, s_HudRefreshTries, force ? 1 : 0);
+    StageUI_refreshUI(stageUI, nullptr);
+    hud = *(void**)((uintptr_t)seat + OFFSET_SEAT_GENERALHUD);
+    LOGI("[C-RAM-HUD] After refreshUI: seat=%p generalHUD=%p alive=%d", seat, hud, IsUnityObjectAlive(hud) ? 1 : 0);
 }
 
 void hook_CameraManager_Awake(void* self, void* method) {
@@ -857,7 +815,6 @@ void hook_CameraManager_SetCameraByType(void* self, int type, void* method) {
         void* updatedSeat = *(void**)((uintptr_t)self + 0x1A0);
         if (IsUnityObjectAlive(updatedSeat)) seat = updatedSeat;
     }
-    EnsureSeatHUD(seat);
     ApplyCockpitCursorSteering(seat, type);
 }
 
@@ -872,7 +829,6 @@ void hook_CameraManager_SetCamera(void* self, int gameCameraType, void* follow, 
     if (!IsUnityObjectAlive(seatToEnsure) && IsValidPtr(self)) {
         seatToEnsure = *(void**)((uintptr_t)self + 0x1A0);
     }
-    EnsureSeatHUD(seatToEnsure);
     ApplyCockpitCursorSteering(seatToEnsure, gameCameraType);
 }
 
@@ -892,10 +848,6 @@ void hook_Airplane_FixedUpdate(void* self, void* method) {
                 if (curCam == 9) { // In Cockpit POV
                     *(bool*)((uintptr_t)self + OFFSET_AIRPLANE_CURSORSTEERING) = true;
                     *(int*)((uintptr_t)parentMio + OFFSET_MIO_CONTROLLERTYPE) = 3; // ArcadeCursor
-                }
-                if (IsValidPtr(g_CameraManagerInstance)) {
-                    void* curSeat = *(void**)((uintptr_t)g_CameraManagerInstance + 0x1A0);
-                    EnsureSeatHUD(curSeat);
                 }
             }
         }
@@ -1415,17 +1367,12 @@ void hook_EventSystem_Update(void* self) {
 
     g_ActivePlayerUnitType.store(playerUnitType);
 
-    // Periodic HUD Watchdog: Guarantee that active aircraft always has an alive GeneralHUD
-    static uint64_t lastHudWatchdogMs = 0;
+    static uint64_t lastHudCheckMs = 0;
     uint64_t nowEvMs = getNowMs();
-    if (nowEvMs - lastHudWatchdogMs > 250) {
-        lastHudWatchdogMs = nowEvMs;
-        if (IsValidPtr(g_CameraManagerInstance)) {
-            void* curSeat = *(void**)((uintptr_t)g_CameraManagerInstance + 0x1A0);
-            if (IsUnityObjectAlive(curSeat)) {
-                EnsureSeatHUD(curSeat);
-            }
-        }
+    bool forceHud = g_ForceHudRefresh.exchange(false);
+    if (forceHud || nowEvMs - lastHudCheckMs > 250) {
+        lastHudCheckMs = nowEvMs;
+        EnsureNativeHUD(forceHud);
     }
 
     // 5. StageUI: Clone native LandingGearButton into mobileArcadeAircraft for Arcade (Simplified) Airplane Mode
@@ -1570,7 +1517,7 @@ void* socket_server_thread(void*) {
                 s_LastCmdTime = nowMs;
 
                 if (strcasecmp(buf, "ping") == 0) {
-                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v6.0 Online\n");
+                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v7.1 Online\n");
                 } else if (strcasecmp(buf, "help") == 0) {
                     snprintf(reply, sizeof(reply),
                              "Commands:\n"
@@ -1580,7 +1527,9 @@ void* socket_server_thread(void*) {
                              "  lead [status|mode <0-4>|smooth <f>|clamp <G>|damp <f>|hook <0|1>|esp <0|1>]\n"
                              "  list\n"
                              "  mp\n"
-                             "  gear\n");
+                             "  gear\n"
+                             "  hud\n"
+                             "  hudfix\n");
                 } else if (strcasecmp(buf, "list") == 0) {
                     snprintf(reply, sizeof(reply),
                              "Units Available:\n"
@@ -1656,6 +1605,36 @@ void* socket_server_thread(void*) {
                     } else {
                         snprintf(reply, sizeof(reply), "ERROR: Usage: spawn <Unit> [noai] [dist <meters>] [alt <meters>]\n");
                     }
+                } else if (strcasecmp(buf, "hud") == 0) {
+                    void* stageUI = GetStageUIInstance();
+                    void* seat = stageUI ? *(void**)((uintptr_t)stageUI + OFFSET_STAGEUI_PLAYERSEAT) : nullptr;
+                    bool seatAlive = IsUnityObjectAlive(seat);
+                    void* hud = seatAlive ? *(void**)((uintptr_t)seat + OFFSET_SEAT_GENERALHUD) : nullptr;
+                    bool hudAlive = IsUnityObjectAlive(hud);
+                    void* hudSeat = hudAlive ? *(void**)((uintptr_t)hud + OFFSET_HUD_PARENTSEAT) : nullptr;
+                    void* hudCam = hudAlive ? *(void**)((uintptr_t)hud + OFFSET_HUD_MAINCAMERA) : nullptr;
+                    void* indParent = hudAlive ? *(void**)((uintptr_t)hud + 0x28) : nullptr;
+                    int enemies = -1, indicators = -1;
+                    if (hudAlive) {
+                        auto el = *(monoList<void*>**)((uintptr_t)hud + OFFSET_HUD_ALLENEMIES);
+                        if (IsValidPtr(el)) enemies = el->getSize();
+                        void* dict = *(void**)((uintptr_t)hud + OFFSET_HUD_UNITINDICATORS);
+                        if (IsValidPtr(dict)) indicators = *(int*)((uintptr_t)dict + 0x20) - *(int*)((uintptr_t)dict + 0x28);
+                    }
+                    void* uiCam = IsUnityObjectAlive(g_CameraManagerInstance) ? *(void**)((uintptr_t)g_CameraManagerInstance + 0x270) : nullptr;
+                    snprintf(reply, sizeof(reply),
+                             "HUD state:\n"
+                             "  stageUI=%p seat=%p alive=%d\n"
+                             "  generalHUD=%p alive=%d parentSeatOk=%d\n"
+                             "  mainCamera alive=%d  UICamera3D alive=%d  indicatorParent alive=%d\n"
+                             "  enemies=%d indicators=%d  refreshTries=%d\n",
+                             stageUI, seat, seatAlive ? 1 : 0,
+                             hud, hudAlive ? 1 : 0, (hudSeat == seat) ? 1 : 0,
+                             IsUnityObjectAlive(hudCam) ? 1 : 0, IsUnityObjectAlive(uiCam) ? 1 : 0, IsUnityObjectAlive(indParent) ? 1 : 0,
+                             enemies, indicators, s_HudRefreshTries);
+                } else if (strcasecmp(buf, "hudfix") == 0) {
+                    g_ForceHudRefresh.store(true);
+                    snprintf(reply, sizeof(reply), "OK: StageUI.refreshUI queued on main thread\n");
                 } else if (strcasecmp(buf, "mp") == 0) {
                     g_OpenMultiplayerRequested.store(true);
                     snprintf(reply, sizeof(reply), "OK: Multiplayer Triggered\n");
@@ -1775,7 +1754,6 @@ static bool CalculateLead(
     const Vector3& targetPos,
     const Vector3& targetVel,
     const Vector3& gunPos,
-    const Vector3& playerVel,
     float bulletSpeed,
     bool noGravity,
     Vector3& outLeadPos,
@@ -1784,110 +1762,99 @@ static bool CalculateLead(
 ) {
     Vector3 rel = targetPos - gunPos;
     outDistance = Vector3::Magnitude(rel);
-    if (outDistance < 2.0f || outDistance > 7000.0f || bulletSpeed <= 10.0f) {
+    if (outDistance < 2.0f || outDistance > 15000.0f || bulletSpeed <= 10.0f) {
         return false;
     }
 
-    // Relative target velocity in the shooter's moving frame of reference
-    Vector3 relVel = targetVel - playerVel;
-
-    float vSqr = Vector3::Dot(relVel, relVel);
-    float bSqr = bulletSpeed * bulletSpeed;
-    float a = vSqr - bSqr;
-    float b = 2.0f * Vector3::Dot(rel, relVel);
+    float a = Vector3::Dot(targetVel, targetVel) - bulletSpeed * bulletSpeed;
+    float b = 2.0f * Vector3::Dot(rel, targetVel);
     float c = Vector3::Dot(rel, rel);
-
     float t = -1.0f;
-    float D = b * b - 4.0f * a * c;
 
-    if (D >= 0.0f) {
-        float sqrtD = sqrtf(D);
-        float t1 = (-b - sqrtD) / (2.0f * a);
-        float t2 = (-b + sqrtD) / (2.0f * a);
-
-        if (t1 > 0.001f && t2 > 0.001f) {
-            t = fminf(t1, t2);
-        } else if (t1 > 0.001f) {
-            t = t1;
-        } else if (t2 > 0.001f) {
-            t = t2;
+    if (fabsf(a) > 1e-4f) {
+        float D = b * b - 4.0f * a * c;
+        if (D >= 0.0f) {
+            float sqrtD = sqrtf(D);
+            float t1 = (-b - sqrtD) / (2.0f * a);
+            float t2 = (-b + sqrtD) / (2.0f * a);
+            if (t1 > 0.001f && t2 > 0.001f) {
+                t = fminf(t1, t2);
+            } else if (t1 > 0.001f) {
+                t = t1;
+            } else if (t2 > 0.001f) {
+                t = t2;
+            }
         }
+    } else if (fabsf(b) > 1e-4f) {
+        float tl = -c / b;
+        if (tl > 0.001f) t = tl;
     }
 
     if (t <= 0.0f) {
         t = outDistance / bulletSpeed;
     }
+    if (t > 12.0f) {
+        t = 12.0f;
+    }
 
     outFlightTime = t;
-    outLeadPos = targetPos + relVel * t;
-
+    outLeadPos = targetPos + targetVel * t;
     if (!noGravity) {
         outLeadPos.Y += 0.5f * 9.0f * t * t;
     }
-
     return true;
 }
 
-// -----------------------------------------------------------------------------
-// Battle Hook (GeneralHUD.LateUpdate)
-// -----------------------------------------------------------------------------
+static void* ResolveHudCamera(void* hud) {
+    void* cam = *(void**)((uintptr_t)hud + OFFSET_HUD_MAINCAMERA);
+    if (IsUnityObjectAlive(cam)) return cam;
+    void* fix = nullptr;
+    if (IsUnityObjectAlive(g_CameraManagerInstance)) {
+        fix = *(void**)((uintptr_t)g_CameraManagerInstance + OFFSET_CAMMGR_MAINCAMERA);
+    }
+    if (!IsUnityObjectAlive(fix) && Camera_get_main) {
+        fix = Camera_get_main();
+    }
+    if (IsUnityObjectAlive(fix)) {
+        *(void**)((uintptr_t)hud + OFFSET_HUD_MAINCAMERA) = fix;
+        return fix;
+    }
+    return nullptr;
+}
+
 void hook_GeneralHUD_LateUpdate(void* self) {
-    if (!IsUnityObjectAlive(self) || !Camera_WorldToScreenPoint || !Camera_get_main) {
-        return;
+    if (IsUnityObjectAlive(self)) {
+        ResolveHudCamera(self);
     }
-
-    // Ensure HUD has a valid, alive Camera assigned BEFORE calling vanilla LateUpdate!
-    void* cam = *(void**)((uintptr_t)self + OFFSET_HUD_MAINCAMERA);
-    if (!IsUnityObjectAlive(cam)) {
-        cam = Camera_get_main();
-        if (IsUnityObjectAlive(cam)) {
-            *(void**)((uintptr_t)self + OFFSET_HUD_MAINCAMERA) = cam;
-        }
-    }
-    if (!IsUnityObjectAlive(cam)) {
-        return;
-    }
-
-    // Run vanilla LateUpdate unconditionally so internal Unity states are preserved!
     if (orig_GeneralHUD_LateUpdate) {
         orig_GeneralHUD_LateUpdate(self);
+    }
+    if (!IsUnityObjectAlive(self) || !Camera_WorldToScreenPoint) {
+        return;
+    }
+    void* cam = *(void**)((uintptr_t)self + OFFSET_HUD_MAINCAMERA);
+    if (!IsUnityObjectAlive(cam)) {
+        return;
     }
 
     uint64_t nowMs = getNowMs();
     g_LastHudUpdateMs.store(nowMs);
 
-    // Resolve current active seat from CameraManager if available
-    void* activeSeat = nullptr;
-    if (IsValidPtr(g_CameraManagerInstance)) {
-        activeSeat = *(void**)((uintptr_t)g_CameraManagerInstance + 0x1A0); // CameraManager.selectedSeat
-    }
-
     void* seat = *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT);
-    if (!IsUnityObjectAlive(seat) && IsUnityObjectAlive(activeSeat)) {
-        *(void**)((uintptr_t)self + OFFSET_HUD_PARENTSEAT) = activeSeat;
-        seat = activeSeat;
-    }
 
     Vector3 gunPos(0, 0, 0);
-    Vector3 playerVel(0, 0, 0);
     float bulletSpeed = 1050.0f;
     bool noGravity = false;
     bool foundTurret = false;
 
-    if (IsValidPtr(seat)) {
-        void* seatSys = *(void**)((uintptr_t)seat + 0x20); // VehicleSeat.parent (SeatSystem)
-        if (IsValidPtr(seatSys)) {
-            void* playerUnit = *(void**)((uintptr_t)seatSys + 0x20); // SeatSystem.parent (IUnit)
-            if (IsValidPtr(playerUnit) && PhysicsObject_get_Velocity) {
-                playerVel = PhysicsObject_get_Velocity(playerUnit);
-            }
-        }
-
+    if (IsUnityObjectAlive(seat)) {
         if (Component_get_transform && Transform_get_position) {
             void* seatTr = Component_get_transform(seat);
             if (IsValidPtr(seatTr)) {
                 g_PlayerVehiclePos = Transform_get_position(seatTr);
                 g_HasPlayerVehiclePos.store(true);
+                gunPos = g_PlayerVehiclePos;
+                foundTurret = true;
             }
         }
 
@@ -1899,7 +1866,6 @@ void hook_GeneralHUD_LateUpdate(void* self) {
             if (IsValidPtr(selectable) && IsValidPtr(selectable->items) && selectable->getSize() > 0) {
                 activeTurret = ((void**)selectable->items->vector)[0];
             }
-
             if (!IsValidPtr(activeTurret)) {
                 auto alwaysReady = *(monoList<void*>**)((uintptr_t)aws + OFFSET_AWS_ALWAYSREADY);
                 if (IsValidPtr(alwaysReady) && IsValidPtr(alwaysReady->items) && alwaysReady->getSize() > 0) {
@@ -1907,43 +1873,23 @@ void hook_GeneralHUD_LateUpdate(void* self) {
                 }
             }
 
-            if (IsValidPtr(activeTurret)) {
-                foundTurret = true;
+            if (IsUnityObjectAlive(activeTurret)) {
                 void* muzzle = *(void**)((uintptr_t)activeTurret + OFFSET_TURRET_MUZZLE);
-                if (IsValidPtr(muzzle) && Component_get_transform && Transform_get_position) {
+                if (IsUnityObjectAlive(muzzle) && Component_get_transform && Transform_get_position) {
                     void* muzzleTr = Component_get_transform(muzzle);
                     if (IsValidPtr(muzzleTr)) {
                         gunPos = Transform_get_position(muzzleTr);
+                        foundTurret = true;
                     }
                 }
-
                 void* ammoConfig = *(void**)((uintptr_t)activeTurret + OFFSET_TURRET_AMMOCONFIG);
                 if (IsValidPtr(ammoConfig)) {
                     float spd = *(float*)((uintptr_t)ammoConfig + OFFSET_AMMO_SPEED);
                     if (spd > 50.0f) bulletSpeed = spd;
                 }
-
                 noGravity = *(bool*)((uintptr_t)activeTurret + OFFSET_TURRET_NOGRAVITY);
             }
         }
-    }
-
-    // CIWS / Air Defense / Ground Turret fallback
-    if (!foundTurret && IsValidPtr(s_LastTurretInstance)) {
-        void* muzzle = *(void**)((uintptr_t)s_LastTurretInstance + OFFSET_TURRET_MUZZLE);
-        if (IsValidPtr(muzzle) && Component_get_transform && Transform_get_position) {
-            void* muzzleTr = Component_get_transform(muzzle);
-            if (IsValidPtr(muzzleTr)) {
-                gunPos = Transform_get_position(muzzleTr);
-                foundTurret = true;
-            }
-        }
-        void* ammoConfig = *(void**)((uintptr_t)s_LastTurretInstance + OFFSET_TURRET_AMMOCONFIG);
-        if (IsValidPtr(ammoConfig)) {
-            float spd = *(float*)((uintptr_t)ammoConfig + OFFSET_AMMO_SPEED);
-            if (spd > 50.0f) bulletSpeed = spd;
-        }
-        noGravity = *(bool*)((uintptr_t)s_LastTurretInstance + OFFSET_TURRET_NOGRAVITY);
     }
 
     if (!foundTurret && Component_get_transform && Transform_get_position) {
@@ -1955,123 +1901,71 @@ void hook_GeneralHUD_LateUpdate(void* self) {
 
     auto enemyList = *(monoList<void*>**)((uintptr_t)self + OFFSET_HUD_ALLENEMIES);
     int enemyCount = (IsValidPtr(enemyList) && IsValidPtr(enemyList->items)) ? enemyList->getSize() : 0;
-    if (enemyCount <= 0) {
-        // Fallback: check allDetectedUnits (0x130) if allEnemyUnits is empty
-        enemyList = *(monoList<void*>**)((uintptr_t)self + 0x130);
-        enemyCount = (IsValidPtr(enemyList) && IsValidPtr(enemyList->items)) ? enemyList->getSize() : 0;
-    }
 
     static uint64_t lastHudLogMs = 0;
-    if (nowMs - lastHudLogMs > 2000) {
+    if (nowMs - lastHudLogMs > 5000) {
         lastHudLogMs = nowMs;
-        LOGI("[C-RAM-HUD] HUD=%p, seat=%p, cam=%p, rawEnemies=%d",
-             self, seat, cam, enemyCount);
-    }
-
-    if (!IsValidPtr(enemyList) || !IsValidPtr(enemyList->items) || enemyCount <= 0 || enemyCount > 256) {
-        return;
+        LOGI("[C-RAM-HUD] HUD=%p seat=%p cam=%p enemies=%d", self, seat, cam, enemyCount);
     }
 
     int writeIdx = 1 - g_ActiveBufferIdx.load();
     int count = 0;
-    float screenHeight = (glHeight > 0) ? (float)glHeight : (float)ImGui::GetIO().DisplaySize.y;
-    if (screenHeight <= 0.0f) screenHeight = 1080.0f;
 
-    for (int i = 0; i < enemyCount && count < MAX_TARGETS; i++) {
-        void* target = ((void**)enemyList->items->vector)[i];
-        if (!IsValidPtr(target)) continue;
+    if (enemyCount > 0 && enemyCount <= 256) {
+        float screenHeight = (glHeight > 0) ? (float)glHeight : (float)ImGui::GetIO().DisplaySize.y;
+        if (screenHeight <= 0.0f) screenHeight = 1080.0f;
 
-        bool isAlive = *(bool*)((uintptr_t)target + OFFSET_UNIT_ISALIVE);
-        if (!isAlive) continue;
+        for (int i = 0; i < enemyCount && count < MAX_TARGETS; i++) {
+            void* target = ((void**)enemyList->items->vector)[i];
+            if (!IsUnityObjectAlive(target)) continue;
+            if (!*(bool*)((uintptr_t)target + OFFSET_UNIT_ISALIVE)) continue;
 
-        int targetType = 3;
-        if (IUnit_GetUnitType) {
-            targetType = IUnit_GetUnitType(target);
-            if (targetType != 3 && targetType != 6 && targetType != 7 && targetType != 5 && targetType != 1 && targetType != 2) {
+            int targetType = 3;
+            if (IUnit_GetUnitType) {
+                targetType = IUnit_GetUnitType(target);
+                if (targetType != 3 && targetType != 6 && targetType != 7 && targetType != 5 && targetType != 1 && targetType != 2) {
+                    continue;
+                }
+            }
+
+            void* tr = Component_get_transform ? Component_get_transform(target) : nullptr;
+            if (!IsValidPtr(tr) || !Transform_get_position) continue;
+            Vector3 targetPos = Transform_get_position(tr);
+
+            Vector3 targetVel(0, 0, 0);
+            if (PhysicsObject_get_Velocity) {
+                targetVel = FilterVelocityForTarget(target, PhysicsObject_get_Velocity(target), getNowMs());
+            }
+
+            Vector3 leadPos(0, 0, 0);
+            float flightTime = 0.0f;
+            float distance = 0.0f;
+            if (!CalculateLead(targetPos, targetVel, gunPos, bulletSpeed, noGravity, leadPos, flightTime, distance)) {
                 continue;
             }
-        }
 
-        void* tr = Component_get_transform ? Component_get_transform(target) : nullptr;
-        if (!IsValidPtr(tr) || !Transform_get_position) continue;
-        Vector3 targetPos = Transform_get_position(tr);
+            Vector3 leadScreen = Camera_WorldToScreenPoint(cam, leadPos);
+            if (leadScreen.Z <= 0.0f) continue;
+            Vector3 targetScreen = Camera_WorldToScreenPoint(cam, targetPos);
 
-        Vector3 targetVel(0, 0, 0);
-        uint64_t nowMsTarget = getNowMs();
-        if (PhysicsObject_get_Velocity) {
-            Vector3 rawVel = PhysicsObject_get_Velocity(target);
-            targetVel = FilterVelocityForTarget(target, rawVel, nowMsTarget);
-        }
-
-        Vector3 rel = targetPos - gunPos;
-        float distance = Vector3::Magnitude(rel);
-
-        Vector3 targetScreen = Camera_WorldToScreenPoint(cam, targetPos);
-        bool isTargetOnScreen = (targetScreen.Z > 0.0f);
-
-        Vector3 leadPos(0, 0, 0);
-        float flightTime = 0.0f;
-        float calcDist = distance;
-        bool hasLead = CalculateLead(targetPos, targetVel, gunPos, playerVel, bulletSpeed, noGravity, leadPos, flightTime, calcDist);
-
-        bool hasLeadOnScreen = false;
-        Vector3 leadScreen(0, 0, 0);
-        if (hasLead) {
-            leadScreen = Camera_WorldToScreenPoint(cam, leadPos);
-            if (leadScreen.Z > 0.0f) {
-                hasLeadOnScreen = true;
-            }
-        }
-
-        if (!isTargetOnScreen && !hasLeadOnScreen) {
-            continue;
-        }
-
-        ScreenLeadTarget& entry = g_TargetsBuffer[writeIdx][count];
-        entry.distance = distance;
-        entry.flightTime = flightTime;
-        entry.targetType = targetType;
-        entry.targetSpeedKmh = Vector3::Magnitude(targetVel) * 3.6f;
-        entry.stabilizerMode = g_LeadStabilizerMode.load();
-
-        entry.hasTarget = isTargetOnScreen;
-        if (isTargetOnScreen) {
-            entry.targetX = targetScreen.X;
-            entry.targetY = screenHeight - targetScreen.Y;
-        } else {
-            entry.targetX = 0;
-            entry.targetY = 0;
-        }
-
-        entry.hasLead = hasLeadOnScreen;
-        if (hasLeadOnScreen) {
+            ScreenLeadTarget& entry = g_TargetsBuffer[writeIdx][count];
+            entry.distance = distance;
+            entry.flightTime = flightTime;
+            entry.targetType = targetType;
+            entry.targetSpeedKmh = Vector3::Magnitude(targetVel) * 3.6f;
+            entry.stabilizerMode = g_LeadStabilizerMode.load();
+            entry.hasLead = true;
             entry.leadX = leadScreen.X;
             entry.leadY = screenHeight - leadScreen.Y;
-        } else {
-            entry.leadX = 0;
-            entry.leadY = 0;
+            entry.hasTarget = targetScreen.Z > 0.0f;
+            entry.targetX = entry.hasTarget ? targetScreen.X : 0.0f;
+            entry.targetY = entry.hasTarget ? screenHeight - targetScreen.Y : 0.0f;
+            count++;
         }
-
-        // Read target name (mpPlayerName or UnitName)
-        entry.targetName[0] = '\0';
-        void* mpNameObj = *(void**)((uintptr_t)target + 0x90);
-        ReadMonoString(mpNameObj, entry.targetName, sizeof(entry.targetName));
-        if (entry.targetName[0] == '\0') {
-            void* unitNameObj = *(void**)((uintptr_t)target + 0x88);
-            ReadMonoString(unitNameObj, entry.targetName, sizeof(entry.targetName));
-        }
-
-        count++;
     }
 
     g_TargetsCount[writeIdx] = count;
     g_ActiveBufferIdx.store(writeIdx);
-
-    static int lastLoggedCount = -1;
-    if (count != lastLoggedCount) {
-        lastLoggedCount = count;
-        LOGI("[C-RAM-HUD] Lead targets updated: count=%d (activeBuffer=%d)", count, writeIdx);
-    }
 }
 
 
@@ -2079,92 +1973,40 @@ void hook_GeneralHUD_LateUpdate(void* self) {
 // ESP Drawing Loop (Render Thread inside eglSwapBuffers)
 // -----------------------------------------------------------------------------
 void DrawMenu() {
+    if (!g_LeadEspEnabled.load()) return;
     ImDrawList* draw = ImGui::GetBackgroundDrawList();
     if (!draw) return;
 
-    if (!g_LeadEspEnabled.load()) return;
-
     uint64_t lastUpdate = g_LastHudUpdateMs.load();
-    if (lastUpdate == 0 || (getNowMs() - lastUpdate) > 500) {
-        return;
-    }
+    if (lastUpdate == 0 || (getNowMs() - lastUpdate) > 500) return;
 
     int readIdx = g_ActiveBufferIdx.load();
     int count = g_TargetsCount[readIdx];
     if (count <= 0) return;
 
-    const float leadCircleRadius = 14.0f;
+    const float radius = 14.0f;
     const ImU32 circleColor = IM_COL32(255, 45, 45, 240);
     const ImU32 centerColor = IM_COL32(255, 255, 255, 255);
     const ImU32 lineColor   = IM_COL32(255, 210, 50, 180);
     const ImU32 textColor   = IM_COL32(255, 255, 255, 240);
 
-    const float r = 14.0f; // Target diamond / square half-size
-    const ImU32 diamondColor = IM_COL32(40, 240, 80, 245); // Military HUD green
-    const ImU32 diamondFill  = IM_COL32(40, 240, 80, 35);  // Transparent HUD green
-
     for (int i = 0; i < count; i++) {
         const ScreenLeadTarget& tgt = g_TargetsBuffer[readIdx][i];
+        if (!tgt.hasLead) continue;
 
-        // 1. Target Indicator (Diamond for Air, Square for Ground)
+        ImVec2 lp(tgt.leadX, tgt.leadY);
         if (tgt.hasTarget) {
-            if (tgt.targetType == 3 || tgt.targetType == 6 || tgt.targetType == 7) {
-                // Air unit (Plane/Heli/Drone): Diamond (зеленый ромбик)
-                ImVec2 pts[4] = {
-                    ImVec2(tgt.targetX, tgt.targetY - r),
-                    ImVec2(tgt.targetX + r, tgt.targetY),
-                    ImVec2(tgt.targetX, tgt.targetY + r),
-                    ImVec2(tgt.targetX - r, tgt.targetY)
-                };
-                draw->AddConvexPolyFilled(pts, 4, diamondFill);
-                draw->AddPolyline(pts, 4, diamondColor, ImDrawFlags_Closed, 2.0f);
-            } else {
-                // Ground unit / Vehicle: Square (квадрат)
-                ImVec2 pMin(tgt.targetX - r, tgt.targetY - r);
-                ImVec2 pMax(tgt.targetX + r, tgt.targetY + r);
-                draw->AddRectFilled(pMin, pMax, diamondFill);
-                draw->AddRect(pMin, pMax, diamondColor, 0.0f, 0, 2.0f);
-            }
-
-            // Target Name and Distance Text below the indicator
-            char labelBuf[64];
-            if (tgt.targetName[0] != '\0') {
-                if (tgt.distance >= 1000.0f) {
-                    snprintf(labelBuf, sizeof(labelBuf), "%s\n%.1fkm", tgt.targetName, tgt.distance / 1000.0f);
-                } else {
-                    snprintf(labelBuf, sizeof(labelBuf), "%s\n%.0fm", tgt.targetName, tgt.distance);
-                }
-            } else {
-                if (tgt.distance >= 1000.0f) {
-                    snprintf(labelBuf, sizeof(labelBuf), "%.1fkm", tgt.distance / 1000.0f);
-                } else {
-                    snprintf(labelBuf, sizeof(labelBuf), "%.0fm", tgt.distance);
-                }
-            }
-            draw->AddText(ImVec2(tgt.targetX - r, tgt.targetY + r + 3.0f), diamondColor, labelBuf);
+            draw->AddLine(ImVec2(tgt.targetX, tgt.targetY), lp, lineColor, 1.5f);
         }
+        draw->AddCircle(lp, radius, circleColor, 24, 2.5f);
+        draw->AddCircleFilled(lp, 2.5f, centerColor);
+        float cross = radius * 0.5f;
+        draw->AddLine(ImVec2(lp.x - cross, lp.y), ImVec2(lp.x + cross, lp.y), circleColor, 1.5f);
+        draw->AddLine(ImVec2(lp.x, lp.y - cross), ImVec2(lp.x, lp.y + cross), circleColor, 1.5f);
 
-        // 2. Lead Point Reticle (Точка упреждения)
-        if (tgt.hasLead) {
-            ImVec2 leadPoint(tgt.leadX, tgt.leadY);
-
-            draw->AddCircle(leadPoint, leadCircleRadius, circleColor, 24, 2.5f);
-            draw->AddCircleFilled(leadPoint, 2.5f, centerColor);
-
-            float cross = leadCircleRadius * 0.5f;
-            draw->AddLine(ImVec2(leadPoint.x - cross, leadPoint.y), ImVec2(leadPoint.x + cross, leadPoint.y), circleColor, 1.5f);
-            draw->AddLine(ImVec2(leadPoint.x, leadPoint.y - cross), ImVec2(leadPoint.x, leadPoint.y + cross), circleColor, 1.5f);
-
-            // Lead distance / flight time text next to lead circle
-            char leadBuf[32];
-            snprintf(leadBuf, sizeof(leadBuf), "%.0fm (%.1fs)", tgt.distance, tgt.flightTime);
-            draw->AddText(ImVec2(leadPoint.x + leadCircleRadius + 5.0f, leadPoint.y - 8.0f), textColor, leadBuf);
-
-            // 3. Guidance line from target to lead
-            if (tgt.hasTarget) {
-                draw->AddLine(ImVec2(tgt.targetX, tgt.targetY), leadPoint, lineColor, 1.5f);
-            }
-        }
+        char leadBuf[32];
+        snprintf(leadBuf, sizeof(leadBuf), "%.0fm (%.1fs)", tgt.distance, tgt.flightTime);
+        draw->AddText(ImVec2(lp.x + radius + 5.0f, lp.y - 8.0f), textColor, leadBuf);
     }
 }
 
@@ -2311,9 +2153,7 @@ void* thread(void*) {
     UltimateJoystick_DisableJoystick = (t_UltimateJoystick_DisableJoystick)(g_Il2CppBase + RVA_ULTIMATEJOYSTICK_DISABLE);
     GameObject_SetActive = (t_GameObject_SetActive)(g_Il2CppBase + RVA_GAMEOBJECT_SETACTIVE);
     Component_get_gameObject = (t_Component_get_gameObject)(g_Il2CppBase + RVA_COMP_GET_GAMEOBJECT);
-    VehicleSeat_InitializeHUD = (t_VehicleSeat_InitializeHUD)(g_Il2CppBase + RVA_VEHICLESEAT_INITIALIZEHUD);
-    GeneralHUD_Start = (t_GeneralHUD_Start)(g_Il2CppBase + RVA_HUD_START);
-    HUDParent_RefreshAll = (t_HUDParent_RefreshAll)(g_Il2CppBase + RVA_HUDPARENT_REFRESHALL);
+    StageUI_refreshUI = (t_StageUI_refreshUI)(g_Il2CppBase + RVA_STAGEUI_REFRESHUI);
 
     // Economy pointers
     InventoryWrapper_AddCurrency = (t_InventoryWrapper_AddCurrency)(g_Il2CppBase + RVA_INVENTORY_ADDCURRENCY);
@@ -2419,7 +2259,7 @@ void* thread(void*) {
     pthread_t sock_t;
     pthread_create(&sock_t, nullptr, socket_server_thread, nullptr);
 
-    LOGI("C-RAM v6.6 Hooks Installed: Pure v5.5 HUD Lifecycle & Respawn Safety + Anti-Jitter Filters + AC-130 & Rocket Fixes Ready!");
+    LOGI("C-RAM v7.1 Hooks Installed: native HUD restore via StageUI.refreshUI, lead indicator only");
     pthread_exit(nullptr);
 }
 
