@@ -1,5 +1,5 @@
 //
-// C-RAM Mod v7.1
+// C-RAM Mod v7.2
 //
 
 #include <pthread.h>
@@ -28,6 +28,7 @@
 #include "../Include/Math/Vector3.hpp"
 #include "../Include/Math/Quaternion.hpp"
 #include "../Include/Logger.h"
+#include "../Include/Amraam.h"
 
 // -----------------------------------------------------------------------------
 // RVAs from script.json (Relative to libil2cpp.so base) - Verified for Update
@@ -76,6 +77,37 @@
 #define RVA_GAMEOBJECT_SETACTIVE        0x767AF68 // UnityEngine.GameObject.SetActive(bool value)
 #define RVA_COMP_GET_GAMEOBJECT         0x7675CAC // UnityEngine.Component.get_gameObject
 #define RVA_STAGEUI_REFRESHUI           0x3B77A74
+
+#define RVA_WEAPONCATALOG_GETMOUNTABLE  0x3BCB818
+#define RVA_WEAPONCATALOG_FINDMOUNTABLE 0x3BCBC40
+#define RVA_WEAPONCATALOG_OPTIONSFOR    0x3BCC3DC
+#define RVA_WEAPONLOADOUT_APPLYONE      0x3BCDA08
+#define RVA_WEAPONLOADOUT_REPLACEWEAPON 0x3BCE7B8
+#define RVA_OBJECT_INSTANTIATE_SIMPLE   0x7682084
+#define RVA_OBJECT_SET_NAME             0x7681940
+#define RVA_OBJECT_GET_NAME             0x76817F8
+#define RVA_OBJECT_SET_HIDEFLAGS        0x7682CA8
+#define RVA_GO_GETCOMPONENTSINCHILDREN  0x7676350
+#define RVA_MESH_CTOR                   0x763AD40
+#define RVA_MESH_SET_VERTICES           0x7642A70
+#define RVA_MESH_SET_NORMALS            0x7642B1C
+#define RVA_MESH_SET_UV                 0x7642C74
+#define RVA_MESH_SET_TRIANGLES          0x764644C
+#define RVA_MESH_RECALCBOUNDS           0x764A1F8
+#define RVA_MESHFILTER_GET_SHAREDMESH   0x76381F0
+#define RVA_MESHFILTER_SET_SHAREDMESH   0x76382C0
+#define RVA_RENDERER_GET_MATERIAL       0x76212B0
+#define RVA_MATERIAL_SET_MAINTEXTURE    0x7629054
+#define RVA_MATERIAL_SET_COLOR          0x7628F34
+#define RVA_MATERIAL_SETTEXTURE         0x76305D0
+#define RVA_TEXTURE2D_CTOR              0x7651C48
+#define RVA_TEXTURE2D_SETPIXELS32       0x76529A4
+#define RVA_TEXTURE2D_APPLY             0x765264C
+#define RVA_TEXTURE_SET_FILTERMODE      0x764C9BC
+#define RVA_TEXTURE_SET_WRAPMODE        0x764C374
+#define RVA_TRANSFORM_SET_LOCALPOSITION 0x768AF00
+#define RVA_TRANSFORM_SET_LOCALROTATION 0x768C87C
+#define RVA_TRANSFORM_SET_LOCALSCALE    0x768CF8C
 
 // Economy / Give Currency Hooks
 #define RVA_INVENTORY_AWAKE             0x38EAB78 // InventoryWrapper.Awake
@@ -790,6 +822,583 @@ static void EnsureNativeHUD(bool force) {
     StageUI_refreshUI(stageUI, nullptr);
     hud = *(void**)((uintptr_t)seat + OFFSET_SEAT_GENERALHUD);
     LOGI("[C-RAM-HUD] After refreshUI: seat=%p generalHUD=%p alive=%d", seat, hud, IsUnityObjectAlive(hud) ? 1 : 0);
+}
+
+struct AmV3 { float x, y, z; };
+struct AmQ4 { float x, y, z, w; };
+struct AmC4 { float r, g, b, a; };
+
+typedef void* (*t_il2cpp_object_new)(void* klass);
+typedef void* (*t_il2cpp_array_new)(void* elementClass, size_t length);
+typedef void* (*t_il2cpp_class_get_type)(void* klass);
+typedef void* (*t_il2cpp_type_get_object)(void* type);
+typedef void* (*t_il2cpp_object_get_class)(void* obj);
+typedef void* (*t_il2cpp_class_get_method_from_name)(void* klass, const char* name, int argsCount);
+typedef void* (*t_il2cpp_runtime_invoke)(void* method, void* obj, void** params, void** exc);
+typedef uint32_t (*t_il2cpp_gchandle_new)(void* obj, bool pinned);
+typedef void (*t_il2cpp_gc_wbarrier_set_field)(void* obj, void** targetAddress, void* object);
+
+static t_il2cpp_object_new am_object_new = nullptr;
+static t_il2cpp_array_new am_array_new = nullptr;
+static t_il2cpp_class_get_type am_class_get_type = nullptr;
+static t_il2cpp_type_get_object am_type_get_object = nullptr;
+static t_il2cpp_object_get_class am_object_get_class = nullptr;
+static t_il2cpp_class_get_method_from_name am_class_get_method = nullptr;
+static t_il2cpp_runtime_invoke am_runtime_invoke = nullptr;
+static t_il2cpp_gchandle_new am_gchandle_new = nullptr;
+static t_il2cpp_gc_wbarrier_set_field am_wbarrier = nullptr;
+
+typedef void* (*t_WeaponCatalog_get_Mountable)(void* method);
+typedef void* (*t_WeaponCatalog_FindMountable)(void* prefabName, void* method);
+typedef void* (*t_WeaponCatalog_OptionsFor)(void* loadout, void* hp, bool isHelicopter, void* method);
+typedef bool (*t_WeaponLoadout_ApplyOne)(void* self, void* hardpointId, void* weaponName, void* method);
+typedef void (*t_WeaponLoadout_ReplaceWeapon)(void* self, void* hp, void* optionPrefab, void* method);
+typedef void* (*t_Object_InstantiateSimple)(void* original, void* method);
+typedef void (*t_Object_set_name)(void* self, void* value, void* method);
+typedef void* (*t_Object_get_name)(void* self, void* method);
+typedef void (*t_Object_set_hideFlags)(void* self, int value, void* method);
+typedef void* (*t_GameObject_GetComponentsInChildren)(void* self, void* type, bool includeInactive, void* method);
+typedef void (*t_Mesh_ctor)(void* self, void* method);
+typedef void (*t_Mesh_setArray)(void* self, void* arr, void* method);
+typedef void (*t_Mesh_RecalculateBounds)(void* self, void* method);
+typedef void* (*t_MeshFilter_get_sharedMesh)(void* self, void* method);
+typedef void (*t_MeshFilter_set_sharedMesh)(void* self, void* mesh, void* method);
+typedef void* (*t_Renderer_get_material)(void* self, void* method);
+typedef void (*t_Material_set_mainTexture)(void* self, void* tex, void* method);
+typedef void (*t_Material_set_color)(void* self, AmC4 c, void* method);
+typedef void (*t_Material_SetTexture)(void* self, void* name, void* tex, void* method);
+typedef void (*t_Texture2D_ctor)(void* self, int w, int h, int fmt, bool mip, void* method);
+typedef void (*t_Texture2D_SetPixels32)(void* self, void* arr, void* method);
+typedef void (*t_Texture2D_Apply)(void* self, void* method);
+typedef void (*t_Texture_setInt)(void* self, int v, void* method);
+typedef void (*t_Transform_setV3)(void* self, AmV3 v, void* method);
+typedef void (*t_Transform_setQ4)(void* self, AmQ4 q, void* method);
+
+static t_WeaponCatalog_get_Mountable orig_WeaponCatalog_get_Mountable = nullptr;
+static t_WeaponCatalog_FindMountable WeaponCatalog_FindMountable = nullptr;
+static t_WeaponCatalog_OptionsFor orig_WeaponCatalog_OptionsFor = nullptr;
+static t_WeaponLoadout_ApplyOne orig_WeaponLoadout_ApplyOne = nullptr;
+static t_WeaponLoadout_ReplaceWeapon orig_WeaponLoadout_ReplaceWeapon = nullptr;
+static t_GameAssetCatalog_GetUnitPrefab orig_GameAssetCatalog_GetUnitPrefab = nullptr;
+static t_Object_InstantiateSimple Object_InstantiateSimple = nullptr;
+static t_Object_set_name Object_set_name = nullptr;
+static t_Object_get_name Object_get_name = nullptr;
+static t_Object_set_hideFlags Object_set_hideFlags = nullptr;
+static t_GameObject_GetComponentsInChildren GameObject_GetComponentsInChildren = nullptr;
+static t_Mesh_ctor Mesh_ctor = nullptr;
+static t_Mesh_setArray Mesh_set_vertices = nullptr;
+static t_Mesh_setArray Mesh_set_normals = nullptr;
+static t_Mesh_setArray Mesh_set_uv = nullptr;
+static t_Mesh_setArray Mesh_set_triangles = nullptr;
+static t_Mesh_RecalculateBounds Mesh_RecalculateBounds = nullptr;
+static t_MeshFilter_get_sharedMesh MeshFilter_get_sharedMesh = nullptr;
+static t_MeshFilter_set_sharedMesh MeshFilter_set_sharedMesh = nullptr;
+static t_Renderer_get_material Renderer_get_material = nullptr;
+static t_Material_set_mainTexture Material_set_mainTexture = nullptr;
+static t_Material_set_color Material_set_color = nullptr;
+static t_Material_SetTexture Material_SetTexture = nullptr;
+static t_Texture2D_ctor Texture2D_ctor = nullptr;
+static t_Texture2D_SetPixels32 Texture2D_SetPixels32 = nullptr;
+static t_Texture2D_Apply Texture2D_Apply = nullptr;
+static t_Texture_setInt Texture_set_filterMode = nullptr;
+static t_Texture_setInt Texture_set_wrapMode = nullptr;
+static t_Transform_setV3 Transform_set_localPosition = nullptr;
+static t_Transform_setQ4 Transform_set_localRotation = nullptr;
+static t_Transform_setV3 Transform_set_localScale = nullptr;
+
+static const char* kAmraamName = "AIM-120 AMRAAM";
+static const char* kAmraamHud = "AIM-120";
+static const char* kAim7Name = "AIM-7 Sparrow";
+
+static void* g_AmraamDef = nullptr;
+static void* g_AmraamMesh = nullptr;
+static void* g_AmraamTex = nullptr;
+static void* g_AmraamMissileData = nullptr;
+static bool g_AmraamRegistering = false;
+static bool g_AmraamBroken = false;
+static thread_local int g_AmraamMountDepth = 0;
+
+struct AmraamStations {
+    const char* vehiclePrefix;
+    const char* ids[10];
+};
+
+static const AmraamStations kAmraamStations[] = {
+    {"F-16", {"aa-1", "aa-2", "ag-1", "ag-2", "bomb-3", "bomb-4", nullptr}},
+    {"F-15", {"aa-1", "aa-2", "aa-7", "aa-8", "bomb-1", "bomb-3", nullptr}},
+    {"F-18", {"aa-2", "aa-3", "aa-4", "aa-5", "aa-6", "aa-7", "bomb-1", "bomb-2", "bomb-3", nullptr}},
+    {"F-35", {"aa-2", "aa-5", "bomb-1", "bomb-4", nullptr}},
+    {"F-14", {"ag-1", "ag-2", nullptr}},
+    {"F-4 Phantom", {"bomb-1", "bomb-4", "ag-1", "ag-2", "ag-3", "ag-4", nullptr}},
+    {"Eurofighter", {"ag-L", "ag-R", nullptr}},
+};
+
+static bool AmStrEq(void* monoStr, const char* s) {
+    if (!IsValidPtr(monoStr) || !s) return false;
+    int32_t len = *(int32_t*)((uintptr_t)monoStr + 0x10);
+    if (len != (int32_t)strlen(s)) return false;
+    const uint16_t* w = (const uint16_t*)((uintptr_t)monoStr + 0x14);
+    for (int i = 0; i < len; i++) {
+        if (w[i] != (uint16_t)(uint8_t)s[i]) return false;
+    }
+    return true;
+}
+
+static bool AmStrStarts(void* monoStr, const char* s) {
+    if (!IsValidPtr(monoStr) || !s) return false;
+    int32_t len = *(int32_t*)((uintptr_t)monoStr + 0x10);
+    int32_t n = (int32_t)strlen(s);
+    if (len < n) return false;
+    const uint16_t* w = (const uint16_t*)((uintptr_t)monoStr + 0x14);
+    for (int i = 0; i < n; i++) {
+        if (w[i] != (uint16_t)(uint8_t)s[i]) return false;
+    }
+    return true;
+}
+
+static void AmSetRef(void* obj, size_t offset, void* value) {
+    void** slot = (void**)((uintptr_t)obj + offset);
+    if (am_wbarrier) am_wbarrier(obj, slot, value);
+    else *slot = value;
+}
+
+static void* AmFindClass(const char* imageName, const char* ns, const char* name) {
+    if (!il2cpp_domain_get_fn || !il2cpp_domain_get_assemblies_fn || !il2cpp_assembly_get_image_fn ||
+        !il2cpp_image_get_name_fn || !il2cpp_class_from_name_fn) return nullptr;
+    void* domain = il2cpp_domain_get_fn();
+    if (!IsValidPtr(domain)) return nullptr;
+    size_t count = 0;
+    void** assemblies = il2cpp_domain_get_assemblies_fn(domain, &count);
+    if (!assemblies) return nullptr;
+    for (size_t i = 0; i < count; i++) {
+        if (!IsValidPtr(assemblies[i])) continue;
+        void* image = il2cpp_assembly_get_image_fn(assemblies[i]);
+        if (!IsValidPtr(image)) continue;
+        const char* n = il2cpp_image_get_name_fn(image);
+        if (n && strcmp(n, imageName) == 0) {
+            void* klass = il2cpp_class_from_name_fn(image, ns, name);
+            if (IsValidPtr(klass) && il2cpp_runtime_class_init_fn) il2cpp_runtime_class_init_fn(klass);
+            return klass;
+        }
+    }
+    return nullptr;
+}
+
+static void* AmTypeObject(void* klass) {
+    if (!IsValidPtr(klass) || !am_class_get_type || !am_type_get_object) return nullptr;
+    return am_type_get_object(am_class_get_type(klass));
+}
+
+static void* AmStaticObject(void* klass, const char* field) {
+    if (!IsValidPtr(klass) || !il2cpp_class_get_field_from_name_fn || !il2cpp_field_static_get_value_fn) return nullptr;
+    void* f = il2cpp_class_get_field_from_name_fn(klass, field);
+    if (!f) return nullptr;
+    void* v = nullptr;
+    il2cpp_field_static_get_value_fn(f, &v);
+    return v;
+}
+
+static void* AmInvoke(void* obj, const char* method, int argc, void** args) {
+    if (!IsValidPtr(obj) || !am_object_get_class || !am_class_get_method || !am_runtime_invoke) return nullptr;
+    void* klass = am_object_get_class(obj);
+    void* m = am_class_get_method(klass, method, argc);
+    if (!m) return nullptr;
+    void* exc = nullptr;
+    void* r = am_runtime_invoke(m, obj, args, &exc);
+    if (exc) {
+        LOGE("[C-RAM-AIM120] Exception in %s", method);
+        return nullptr;
+    }
+    return r;
+}
+
+static bool AmListContains(void* list, void* item) {
+    if (!IsValidPtr(list)) return false;
+    auto l = (monoList<void*>*)list;
+    if (!IsValidPtr(l->items)) return false;
+    int n = l->getSize();
+    for (int i = 0; i < n; i++) {
+        if (((void**)l->items->vector)[i] == item) return true;
+    }
+    return false;
+}
+
+static void AmListAdd(void* list, void* item) {
+    if (AmListContains(list, item)) return;
+    void* args[1] = {item};
+    AmInvoke(list, "Add", 1, args);
+}
+
+static void AmListRemove(void* list, void* item) {
+    while (AmListContains(list, item)) {
+        void* args[1] = {item};
+        AmInvoke(list, "Remove", 1, args);
+        if (AmListContains(list, item)) break;
+    }
+}
+
+static void AmDictSet(void* dict, void* key, void* value) {
+    if (!IsValidPtr(dict)) return;
+    void* args[2] = {key, value};
+    AmInvoke(dict, "set_Item", 2, args);
+}
+
+static bool IsMpMatchActive() {
+    static void* mpClass = nullptr;
+    if (!mpClass) mpClass = AmFindClass("Assembly-CSharp.dll", "", "MpMatchManager");
+    void* inst = AmStaticObject(mpClass, "Instance");
+    if (!IsUnityObjectAlive(inst)) return false;
+    return *(bool*)((uintptr_t)inst + 0x20) || *(bool*)((uintptr_t)inst + 0x21);
+}
+
+static void EnsureAmraamRegistered(void* mountable) {
+    if (g_AmraamRegistering || g_AmraamBroken || !IsValidPtr(mountable)) return;
+    static void* catalogClass = nullptr;
+    if (!catalogClass) catalogClass = AmFindClass("Assembly-CSharp.dll", "", "WeaponCatalog");
+
+    if (IsUnityObjectAlive(g_AmraamDef)) {
+        if (!AmListContains(mountable, g_AmraamDef)) {
+            AmListAdd(mountable, g_AmraamDef);
+            AmDictSet(AmStaticObject(catalogClass, "byPrefabName"), il2cpp_string_new_fn(kAmraamName), g_AmraamDef);
+        }
+        return;
+    }
+
+    if (!WeaponCatalog_FindMountable || !Object_InstantiateSimple || !il2cpp_string_new_fn || !am_runtime_invoke) {
+        g_AmraamBroken = true;
+        LOGE("[C-RAM-AIM120] Missing runtime API, AIM-120 disabled");
+        return;
+    }
+
+    g_AmraamRegistering = true;
+    void* aim7Def = WeaponCatalog_FindMountable(il2cpp_string_new_fn(kAim7Name), nullptr);
+    if (!IsUnityObjectAlive(aim7Def)) {
+        g_AmraamRegistering = false;
+        LOGW("[C-RAM-AIM120] AIM-7 definition not found yet");
+        return;
+    }
+
+    void* def = Object_InstantiateSimple(aim7Def, nullptr);
+    if (!IsUnityObjectAlive(def)) {
+        g_AmraamRegistering = false;
+        return;
+    }
+    if (am_gchandle_new) am_gchandle_new(def, false);
+    if (Object_set_hideFlags) Object_set_hideFlags(def, 32, nullptr);
+    void* nameStr = il2cpp_string_new_fn(kAmraamName);
+    if (Object_set_name) Object_set_name(def, nameStr, nullptr);
+    *(int*)((uintptr_t)def + 0x18) = 0;
+    *(int*)((uintptr_t)def + 0x1C) = 0;
+    *(int*)((uintptr_t)def + 0x20) = 1;
+    *(int*)((uintptr_t)def + 0x24) = 1;
+    *(int*)((uintptr_t)def + 0x28) = 1;
+    *(int*)((uintptr_t)def + 0x2C) = 1;
+    AmSetRef(def, 0x38, nameStr);
+    g_AmraamDef = def;
+
+    AmListAdd(mountable, def);
+    AmDictSet(AmStaticObject(catalogClass, "byPrefabName"), nameStr, def);
+
+    void* assetCatalogClass = AmFindClass("Assembly-CSharp.dll", "", "GameAssetCatalog");
+    void* assetCatalog = AmStaticObject(assetCatalogClass, "_instance");
+    if (IsUnityObjectAlive(assetCatalog)) {
+        AmListAdd(*(void**)((uintptr_t)assetCatalog + 0x30), def);
+        void* lookup = *(void**)((uintptr_t)assetCatalog + 0xC8);
+        if (IsValidPtr(lookup)) AmDictSet(lookup, nameStr, def);
+    }
+
+    g_AmraamRegistering = false;
+    LOGI("[C-RAM-AIM120] AIM-120 AMRAAM WeaponDefinition registered: %p (cloned from AIM-7 %p)", def, aim7Def);
+}
+
+static bool AmraamStationAllowed(void* loadout, void* hp) {
+    if (!IsUnityObjectAlive(loadout) || !IsValidPtr(hp) || !Component_get_gameObject || !Object_get_name) return false;
+    void* go = Component_get_gameObject(loadout, nullptr);
+    if (!IsUnityObjectAlive(go)) return false;
+    void* vehicleName = Object_get_name(go, nullptr);
+    void* hpId = *(void**)((uintptr_t)hp + 0x10);
+    static int logged = 0;
+    if (logged < 12) {
+        char vn[64], hn[32];
+        ReadMonoString(vehicleName, vn, sizeof(vn));
+        ReadMonoString(hpId, hn, sizeof(hn));
+        LOGI("[C-RAM-AIM120] OptionsFor vehicle='%s' station='%s'", vn, hn);
+        logged++;
+    }
+    for (const auto& st : kAmraamStations) {
+        if (!AmStrStarts(vehicleName, st.vehiclePrefix)) continue;
+        for (int i = 0; i < 10 && st.ids[i]; i++) {
+            if (AmStrEq(hpId, st.ids[i])) return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+static void* BuildAmraamMesh() {
+    if (IsUnityObjectAlive(g_AmraamMesh)) return g_AmraamMesh;
+    if (!am_object_new || !am_array_new || !Mesh_ctor || !Mesh_set_vertices || !Mesh_set_triangles) return nullptr;
+    void* meshClass = AmFindClass("UnityEngine.CoreModule.dll", "UnityEngine", "Mesh");
+    void* v3Class = AmFindClass("UnityEngine.CoreModule.dll", "UnityEngine", "Vector3");
+    void* v2Class = AmFindClass("UnityEngine.CoreModule.dll", "UnityEngine", "Vector2");
+    void* intClass = AmFindClass("mscorlib.dll", "System", "Int32");
+    if (!meshClass || !v3Class || !v2Class || !intClass) {
+        LOGE("[C-RAM-AIM120] Mesh classes not found");
+        return nullptr;
+    }
+
+    void* mesh = am_object_new(meshClass);
+    if (!IsValidPtr(mesh)) return nullptr;
+    Mesh_ctor(mesh, nullptr);
+    if (am_gchandle_new) am_gchandle_new(mesh, false);
+
+    void* verts = am_array_new(v3Class, AMRAAM_VCOUNT);
+    memcpy((char*)verts + 0x20, AMRAAM_POS, sizeof(float) * 3 * AMRAAM_VCOUNT);
+    void* norms = am_array_new(v3Class, AMRAAM_VCOUNT);
+    memcpy((char*)norms + 0x20, AMRAAM_NRM, sizeof(float) * 3 * AMRAAM_VCOUNT);
+    void* uvs = am_array_new(v2Class, AMRAAM_VCOUNT);
+    memcpy((char*)uvs + 0x20, AMRAAM_UV, sizeof(float) * 2 * AMRAAM_VCOUNT);
+    void* tris = am_array_new(intClass, AMRAAM_ICOUNT);
+    int32_t* td = (int32_t*)((char*)tris + 0x20);
+    for (int i = 0; i < AMRAAM_ICOUNT; i++) td[i] = AMRAAM_IDX[i];
+
+    Mesh_set_vertices(mesh, verts, nullptr);
+    if (Mesh_set_normals) Mesh_set_normals(mesh, norms, nullptr);
+    if (Mesh_set_uv) Mesh_set_uv(mesh, uvs, nullptr);
+    Mesh_set_triangles(mesh, tris, nullptr);
+    if (Mesh_RecalculateBounds) Mesh_RecalculateBounds(mesh, nullptr);
+    if (Object_set_name && il2cpp_string_new_fn) Object_set_name(mesh, il2cpp_string_new_fn(kAmraamName), nullptr);
+    if (Object_set_hideFlags) Object_set_hideFlags(mesh, 32, nullptr);
+    g_AmraamMesh = mesh;
+    LOGI("[C-RAM-AIM120] Mesh built: %d verts, %d tris", AMRAAM_VCOUNT, AMRAAM_ICOUNT / 3);
+    return mesh;
+}
+
+static void* BuildAmraamTexture() {
+    if (IsUnityObjectAlive(g_AmraamTex)) return g_AmraamTex;
+    if (!am_object_new || !am_array_new || !Texture2D_ctor || !Texture2D_SetPixels32 || !Texture2D_Apply) return nullptr;
+    void* texClass = AmFindClass("UnityEngine.CoreModule.dll", "UnityEngine", "Texture2D");
+    void* c32Class = AmFindClass("UnityEngine.CoreModule.dll", "UnityEngine", "Color32");
+    if (!texClass || !c32Class) return nullptr;
+    void* tex = am_object_new(texClass);
+    if (!IsValidPtr(tex)) return nullptr;
+    Texture2D_ctor(tex, AMRAAM_PAL_W, 1, 4, false, nullptr);
+    if (am_gchandle_new) am_gchandle_new(tex, false);
+    void* px = am_array_new(c32Class, AMRAAM_PAL_W);
+    memcpy((char*)px + 0x20, AMRAAM_PAL, 4 * AMRAAM_PAL_W);
+    Texture2D_SetPixels32(tex, px, nullptr);
+    if (Texture_set_filterMode) Texture_set_filterMode(tex, 0, nullptr);
+    if (Texture_set_wrapMode) Texture_set_wrapMode(tex, 1, nullptr);
+    Texture2D_Apply(tex, nullptr);
+    if (Object_set_hideFlags) Object_set_hideFlags(tex, 32, nullptr);
+    g_AmraamTex = tex;
+    return tex;
+}
+
+static monoArray<void*>* AmComponents(void* go, void* typeObj) {
+    if (!IsUnityObjectAlive(go) || !IsValidPtr(typeObj) || !GameObject_GetComponentsInChildren) return nullptr;
+    return (monoArray<void*>*)GameObject_GetComponentsInChildren(go, typeObj, true, nullptr);
+}
+
+static void ConvertMountedToAmraam(void* hp) {
+    void* root = *(void**)((uintptr_t)hp + 0x20);
+    if (!IsUnityObjectAlive(root)) return;
+
+    static void* tIFLY = nullptr;
+    static void* tLauncher = nullptr;
+    static void* tHolder = nullptr;
+    static void* tMeshFilter = nullptr;
+    static void* tMeshRenderer = nullptr;
+    if (!tIFLY) tIFLY = AmTypeObject(AmFindClass("Assembly-CSharp.dll", "", "MissileIFLY"));
+    if (!tLauncher) tLauncher = AmTypeObject(AmFindClass("Assembly-CSharp.dll", "", "MissileLauncher"));
+    if (!tHolder) tHolder = AmTypeObject(AmFindClass("Assembly-CSharp.dll", "", "GuidedMissileHolder"));
+    if (!tMeshFilter) tMeshFilter = AmTypeObject(AmFindClass("UnityEngine.CoreModule.dll", "UnityEngine", "MeshFilter"));
+    if (!tMeshRenderer) tMeshRenderer = AmTypeObject(AmFindClass("UnityEngine.CoreModule.dll", "UnityEngine", "MeshRenderer"));
+
+    char hpId[48];
+    ReadMonoString(*(void**)((uintptr_t)hp + 0x10), hpId, sizeof(hpId));
+    char newName[96];
+    snprintf(newName, sizeof(newName), "%s_%s", kAmraamName, hpId);
+    if (Object_set_name) Object_set_name(root, il2cpp_string_new_fn(newName), nullptr);
+
+    void* missileName = il2cpp_string_new_fn(kAmraamHud);
+    int nMissiles = 0, nMeshes = 0;
+
+    auto missiles = AmComponents(root, tIFLY);
+    if (IsValidPtr(missiles)) {
+        for (int i = 0; i < missiles->getLength(); i++) {
+            void* m = missiles->vector[i];
+            if (!IsUnityObjectAlive(m)) continue;
+            AmSetRef(m, 0x170, missileName);
+            *(float*)((uintptr_t)m + 0x184) = 4.0f;
+            *(float*)((uintptr_t)m + 0x1CC) = 0.4f;
+            *(float*)((uintptr_t)m + 0x1DC) = 0.5f;
+            *(int*)((uintptr_t)m + 0x1E4) = 6;
+            *(float*)((uintptr_t)m + 0x1E8) = 12.0f;
+            *(bool*)((uintptr_t)m + 0x1EC) = false;
+            *(bool*)((uintptr_t)m + 0x1ED) = false;
+            *(int*)((uintptr_t)m + 0x1F0) = 1;
+            *(float*)((uintptr_t)m + 0x250) = 100000.0f;
+            *(float*)((uintptr_t)m + 0x254) = 150.0f;
+            *(float*)((uintptr_t)m + 0x258) = 1360.0f;
+            *(float*)((uintptr_t)m + 0x264) = 5.0f;
+            nMissiles++;
+        }
+    }
+
+    auto launchers = AmComponents(root, tLauncher);
+    if (IsValidPtr(launchers)) {
+        for (int i = 0; i < launchers->getLength(); i++) {
+            void* l = launchers->vector[i];
+            if (!IsUnityObjectAlive(l)) continue;
+            *(float*)((uintptr_t)l + 0x6C) = 100000.0f;
+        }
+    }
+
+    auto holders = AmComponents(root, tHolder);
+    if (IsValidPtr(holders)) {
+        for (int i = 0; i < holders->getLength(); i++) {
+            void* h = holders->vector[i];
+            if (!IsUnityObjectAlive(h)) continue;
+            AmSetRef(h, 0x20, missileName);
+            void* data = *(void**)((uintptr_t)h + 0x40);
+            if (!IsUnityObjectAlive(g_AmraamMissileData) && IsUnityObjectAlive(data) && Object_InstantiateSimple) {
+                void* clone = Object_InstantiateSimple(data, nullptr);
+                if (IsUnityObjectAlive(clone)) {
+                    if (am_gchandle_new) am_gchandle_new(clone, false);
+                    if (Object_set_hideFlags) Object_set_hideFlags(clone, 32, nullptr);
+                    AmSetRef(clone, 0x18, missileName);
+                    g_AmraamMissileData = clone;
+                }
+            }
+            if (IsUnityObjectAlive(g_AmraamMissileData)) AmSetRef(h, 0x40, g_AmraamMissileData);
+        }
+    }
+
+    void* mesh = BuildAmraamMesh();
+    void* tex = BuildAmraamTexture();
+    auto filters = AmComponents(root, tMeshFilter);
+    auto renderers = AmComponents(root, tMeshRenderer);
+    if (mesh && IsValidPtr(filters) && MeshFilter_get_sharedMesh && MeshFilter_set_sharedMesh && Object_get_name) {
+        for (int i = 0; i < filters->getLength(); i++) {
+            void* mf = filters->vector[i];
+            if (!IsUnityObjectAlive(mf)) continue;
+            void* cur = MeshFilter_get_sharedMesh(mf, nullptr);
+            if (!IsUnityObjectAlive(cur)) continue;
+            if (!AmStrStarts(Object_get_name(cur, nullptr), "AIM-7")) continue;
+            MeshFilter_set_sharedMesh(mf, mesh, nullptr);
+            void* tr = Component_get_transform ? Component_get_transform(mf) : nullptr;
+            if (IsValidPtr(tr)) {
+                if (Transform_set_localPosition) Transform_set_localPosition(tr, AmV3{0.0f, 0.0f, 0.0f}, nullptr);
+                if (Transform_set_localRotation) Transform_set_localRotation(tr, AmQ4{0.0f, 0.0f, 0.0f, 1.0f}, nullptr);
+                if (Transform_set_localScale) Transform_set_localScale(tr, AmV3{1.0f, 1.0f, 1.0f}, nullptr);
+            }
+            void* mfGo = Component_get_gameObject(mf, nullptr);
+            if (IsValidPtr(renderers) && Renderer_get_material) {
+                for (int k = 0; k < renderers->getLength(); k++) {
+                    void* r = renderers->vector[k];
+                    if (!IsUnityObjectAlive(r) || Component_get_gameObject(r, nullptr) != mfGo) continue;
+                    void* mat = Renderer_get_material(r, nullptr);
+                    if (!IsUnityObjectAlive(mat)) continue;
+                    if (tex && Material_set_mainTexture) Material_set_mainTexture(mat, tex, nullptr);
+                    if (Material_SetTexture) Material_SetTexture(mat, il2cpp_string_new_fn("_BumpMap"), nullptr, nullptr);
+                    if (Material_set_color) Material_set_color(mat, AmC4{1.0f, 1.0f, 1.0f, 1.0f}, nullptr);
+                }
+            }
+            nMeshes++;
+        }
+    }
+
+    LOGI("[C-RAM-AIM120] Mounted AIM-120 on %s: missiles=%d meshes=%d", hpId, nMissiles, nMeshes);
+}
+
+void* hook_WeaponCatalog_get_Mountable(void* method) {
+    void* list = orig_WeaponCatalog_get_Mountable ? orig_WeaponCatalog_get_Mountable(method) : nullptr;
+    if (IsValidPtr(list)) EnsureAmraamRegistered(list);
+    return list;
+}
+
+void* hook_GameAssetCatalog_GetUnitPrefab(void* idOrName, void* method) {
+    if (AmStrEq(idOrName, kAmraamName) && il2cpp_string_new_fn) {
+        return orig_GameAssetCatalog_GetUnitPrefab(il2cpp_string_new_fn(kAim7Name), method);
+    }
+    return orig_GameAssetCatalog_GetUnitPrefab(idOrName, method);
+}
+
+void* hook_WeaponCatalog_OptionsFor(void* loadout, void* hp, bool isHelicopter, void* method) {
+    void* list = orig_WeaponCatalog_OptionsFor(loadout, hp, isHelicopter, method);
+    if (!IsValidPtr(list) || !IsUnityObjectAlive(g_AmraamDef)) return list;
+    AmListRemove(list, g_AmraamDef);
+    if (isHelicopter || IsMpMatchActive()) return list;
+    if (AmraamStationAllowed(loadout, hp)) AmListAdd(list, g_AmraamDef);
+    return list;
+}
+
+bool hook_WeaponLoadout_ApplyOne(void* self, void* hardpointId, void* weaponName, void* method) {
+    if (AmStrEq(weaponName, kAmraamName)) {
+        if (IsMpMatchActive() && il2cpp_string_new_fn) {
+            LOGI("[C-RAM-AIM120] Multiplayer match active, AIM-120 replaced by AIM-7");
+            return orig_WeaponLoadout_ApplyOne(self, hardpointId, il2cpp_string_new_fn(kAim7Name), method);
+        }
+        g_AmraamMountDepth++;
+        bool r = orig_WeaponLoadout_ApplyOne(self, hardpointId, weaponName, method);
+        g_AmraamMountDepth--;
+        return r;
+    }
+    return orig_WeaponLoadout_ApplyOne(self, hardpointId, weaponName, method);
+}
+
+void hook_WeaponLoadout_ReplaceWeapon(void* self, void* hp, void* optionPrefab, void* method) {
+    orig_WeaponLoadout_ReplaceWeapon(self, hp, optionPrefab, method);
+    if (g_AmraamMountDepth > 0 && IsValidPtr(hp)) {
+        ConvertMountedToAmraam(hp);
+    }
+}
+
+static void InitAmraam(uintptr_t base, void* hIl2Cpp) {
+    am_object_new = (t_il2cpp_object_new)dlsym(hIl2Cpp, "il2cpp_object_new");
+    am_array_new = (t_il2cpp_array_new)dlsym(hIl2Cpp, "il2cpp_array_new");
+    am_class_get_type = (t_il2cpp_class_get_type)dlsym(hIl2Cpp, "il2cpp_class_get_type");
+    am_type_get_object = (t_il2cpp_type_get_object)dlsym(hIl2Cpp, "il2cpp_type_get_object");
+    am_object_get_class = (t_il2cpp_object_get_class)dlsym(hIl2Cpp, "il2cpp_object_get_class");
+    am_class_get_method = (t_il2cpp_class_get_method_from_name)dlsym(hIl2Cpp, "il2cpp_class_get_method_from_name");
+    am_runtime_invoke = (t_il2cpp_runtime_invoke)dlsym(hIl2Cpp, "il2cpp_runtime_invoke");
+    am_gchandle_new = (t_il2cpp_gchandle_new)dlsym(hIl2Cpp, "il2cpp_gchandle_new");
+    am_wbarrier = (t_il2cpp_gc_wbarrier_set_field)dlsym(hIl2Cpp, "il2cpp_gc_wbarrier_set_field");
+
+    WeaponCatalog_FindMountable = (t_WeaponCatalog_FindMountable)(base + RVA_WEAPONCATALOG_FINDMOUNTABLE);
+    Object_InstantiateSimple = (t_Object_InstantiateSimple)(base + RVA_OBJECT_INSTANTIATE_SIMPLE);
+    Object_set_name = (t_Object_set_name)(base + RVA_OBJECT_SET_NAME);
+    Object_get_name = (t_Object_get_name)(base + RVA_OBJECT_GET_NAME);
+    Object_set_hideFlags = (t_Object_set_hideFlags)(base + RVA_OBJECT_SET_HIDEFLAGS);
+    GameObject_GetComponentsInChildren = (t_GameObject_GetComponentsInChildren)(base + RVA_GO_GETCOMPONENTSINCHILDREN);
+    Mesh_ctor = (t_Mesh_ctor)(base + RVA_MESH_CTOR);
+    Mesh_set_vertices = (t_Mesh_setArray)(base + RVA_MESH_SET_VERTICES);
+    Mesh_set_normals = (t_Mesh_setArray)(base + RVA_MESH_SET_NORMALS);
+    Mesh_set_uv = (t_Mesh_setArray)(base + RVA_MESH_SET_UV);
+    Mesh_set_triangles = (t_Mesh_setArray)(base + RVA_MESH_SET_TRIANGLES);
+    Mesh_RecalculateBounds = (t_Mesh_RecalculateBounds)(base + RVA_MESH_RECALCBOUNDS);
+    MeshFilter_get_sharedMesh = (t_MeshFilter_get_sharedMesh)(base + RVA_MESHFILTER_GET_SHAREDMESH);
+    MeshFilter_set_sharedMesh = (t_MeshFilter_set_sharedMesh)(base + RVA_MESHFILTER_SET_SHAREDMESH);
+    Renderer_get_material = (t_Renderer_get_material)(base + RVA_RENDERER_GET_MATERIAL);
+    Material_set_mainTexture = (t_Material_set_mainTexture)(base + RVA_MATERIAL_SET_MAINTEXTURE);
+    Material_set_color = (t_Material_set_color)(base + RVA_MATERIAL_SET_COLOR);
+    Material_SetTexture = (t_Material_SetTexture)(base + RVA_MATERIAL_SETTEXTURE);
+    Texture2D_ctor = (t_Texture2D_ctor)(base + RVA_TEXTURE2D_CTOR);
+    Texture2D_SetPixels32 = (t_Texture2D_SetPixels32)(base + RVA_TEXTURE2D_SETPIXELS32);
+    Texture2D_Apply = (t_Texture2D_Apply)(base + RVA_TEXTURE2D_APPLY);
+    Texture_set_filterMode = (t_Texture_setInt)(base + RVA_TEXTURE_SET_FILTERMODE);
+    Texture_set_wrapMode = (t_Texture_setInt)(base + RVA_TEXTURE_SET_WRAPMODE);
+    Transform_set_localPosition = (t_Transform_setV3)(base + RVA_TRANSFORM_SET_LOCALPOSITION);
+    Transform_set_localRotation = (t_Transform_setQ4)(base + RVA_TRANSFORM_SET_LOCALROTATION);
+    Transform_set_localScale = (t_Transform_setV3)(base + RVA_TRANSFORM_SET_LOCALSCALE);
+
+    DobbyHook((void*)(base + RVA_WEAPONCATALOG_GETMOUNTABLE), (void*)hook_WeaponCatalog_get_Mountable, (void**)&orig_WeaponCatalog_get_Mountable);
+    DobbyHook((void*)(base + RVA_ASSET_CATALOG_GET_PREFAB), (void*)hook_GameAssetCatalog_GetUnitPrefab, (void**)&orig_GameAssetCatalog_GetUnitPrefab);
+    DobbyHook((void*)(base + RVA_WEAPONCATALOG_OPTIONSFOR), (void*)hook_WeaponCatalog_OptionsFor, (void**)&orig_WeaponCatalog_OptionsFor);
+    DobbyHook((void*)(base + RVA_WEAPONLOADOUT_APPLYONE), (void*)hook_WeaponLoadout_ApplyOne, (void**)&orig_WeaponLoadout_ApplyOne);
+    DobbyHook((void*)(base + RVA_WEAPONLOADOUT_REPLACEWEAPON), (void*)hook_WeaponLoadout_ReplaceWeapon, (void**)&orig_WeaponLoadout_ReplaceWeapon);
+    LOGI("[C-RAM-AIM120] Hooks installed");
 }
 
 void hook_CameraManager_Awake(void* self, void* method) {
@@ -1517,7 +2126,7 @@ void* socket_server_thread(void*) {
                 s_LastCmdTime = nowMs;
 
                 if (strcasecmp(buf, "ping") == 0) {
-                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v7.1 Online\n");
+                    snprintf(reply, sizeof(reply), "PONG: C-RAM Mod v7.2 Online\n");
                 } else if (strcasecmp(buf, "help") == 0) {
                     snprintf(reply, sizeof(reply),
                              "Commands:\n"
@@ -1529,6 +2138,7 @@ void* socket_server_thread(void*) {
                              "  mp\n"
                              "  gear\n"
                              "  hud\n"
+                             "  aim120\n"
                              "  hudfix\n");
                 } else if (strcasecmp(buf, "list") == 0) {
                     snprintf(reply, sizeof(reply),
@@ -1632,6 +2242,12 @@ void* socket_server_thread(void*) {
                              hud, hudAlive ? 1 : 0, (hudSeat == seat) ? 1 : 0,
                              IsUnityObjectAlive(hudCam) ? 1 : 0, IsUnityObjectAlive(uiCam) ? 1 : 0, IsUnityObjectAlive(indParent) ? 1 : 0,
                              enemies, indicators, s_HudRefreshTries);
+                } else if (strcasecmp(buf, "aim120") == 0) {
+                    snprintf(reply, sizeof(reply),
+                             "AIM-120 state:\n  def=%p alive=%d\n  mesh=%p tex=%p missileData=%p\n  mpMatchActive=%d broken=%d\n",
+                             g_AmraamDef, IsUnityObjectAlive(g_AmraamDef) ? 1 : 0,
+                             g_AmraamMesh, g_AmraamTex, g_AmraamMissileData,
+                             IsMpMatchActive() ? 1 : 0, g_AmraamBroken ? 1 : 0);
                 } else if (strcasecmp(buf, "hudfix") == 0) {
                     g_ForceHudRefresh.store(true);
                     snprintf(reply, sizeof(reply), "OK: StageUI.refreshUI queued on main thread\n");
@@ -1923,7 +2539,7 @@ void hook_GeneralHUD_LateUpdate(void* self) {
             int targetType = 3;
             if (IUnit_GetUnitType) {
                 targetType = IUnit_GetUnitType(target);
-                if (targetType != 3 && targetType != 6 && targetType != 7 && targetType != 5 && targetType != 1 && targetType != 2) {
+                if (targetType != 3 && targetType != 5 && targetType != 6 && targetType != 7) {
                     continue;
                 }
             }
@@ -2154,6 +2770,7 @@ void* thread(void*) {
     GameObject_SetActive = (t_GameObject_SetActive)(g_Il2CppBase + RVA_GAMEOBJECT_SETACTIVE);
     Component_get_gameObject = (t_Component_get_gameObject)(g_Il2CppBase + RVA_COMP_GET_GAMEOBJECT);
     StageUI_refreshUI = (t_StageUI_refreshUI)(g_Il2CppBase + RVA_STAGEUI_REFRESHUI);
+    InitAmraam(g_Il2CppBase, hIl2Cpp);
 
     // Economy pointers
     InventoryWrapper_AddCurrency = (t_InventoryWrapper_AddCurrency)(g_Il2CppBase + RVA_INVENTORY_ADDCURRENCY);
@@ -2259,7 +2876,7 @@ void* thread(void*) {
     pthread_t sock_t;
     pthread_create(&sock_t, nullptr, socket_server_thread, nullptr);
 
-    LOGI("C-RAM v7.1 Hooks Installed: native HUD restore via StageUI.refreshUI, lead indicator only");
+    LOGI("C-RAM v7.2 Hooks Installed: native HUD restore, air-only lead, AIM-120 AMRAAM");
     pthread_exit(nullptr);
 }
 
