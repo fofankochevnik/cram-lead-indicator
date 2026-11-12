@@ -1,5 +1,5 @@
 //
-// C-RAM Mod v7.4
+// C-RAM Mod v7.4.1
 //
 
 #include <pthread.h>
@@ -1518,12 +1518,11 @@ static bool MsU16Contains(const uint16_t* s, int32_t len, const char* needle) {
     return false;
 }
 
-void hook_EGJS_ExecuteGameplayMission(void* self, void* jsCode, bool callInit, void* method) {
+static void* MsPatchMissionJs(void* jsCode, const char* via) {
     if (!IsValidPtr(jsCode) || !ms_string_new_utf16 || IsMpMatchActive()) {
         g_MissionKind.store(MK_NONE);
         MsResetCaches();
-        orig_EGJS_ExecuteGameplayMission(self, jsCode, callInit, method);
-        return;
+        return jsCode;
     }
     int32_t len = *(int32_t*)((uintptr_t)jsCode + 0x10);
     const uint16_t* chars = (const uint16_t*)((uintptr_t)jsCode + 0x14);
@@ -1538,16 +1537,38 @@ void hook_EGJS_ExecuteGameplayMission(void* self, void* jsCode, bool callInit, v
     g_MissionKind.store(kind);
     MsResetCaches();
     if (!patch) {
-        orig_EGJS_ExecuteGameplayMission(self, jsCode, callInit, method);
-        return;
+        char head[121];
+        int n = 0;
+        int32_t start = 0;
+        for (int32_t i = 0; i + 15 < len && i < 20000; i++) {
+            if (chars[i] == 'M' && chars[i + 1] == 'i' && chars[i + 2] == 's' && chars[i + 3] == 's' && chars[i + 4] == 'i' && chars[i + 5] == 'o' && chars[i + 6] == 'n' && chars[i + 7] == ' ' && chars[i + 8] == 'S' && i > 60) { start = i - 60; break; }
+        }
+        for (int32_t i = start; i < len && n < 120; i++) {
+            uint16_t c = chars[i];
+            head[n++] = (c >= 32 && c < 127) ? (char)c : ' ';
+        }
+        head[n] = 0;
+        LOGI("[C-RAM-MISSION] %s: no patch, len=%d text='%s'", via, len, head);
+        return jsCode;
     }
     size_t plen = strlen(patch);
     std::vector<uint16_t> buf((size_t)len + plen);
     memcpy(buf.data(), chars, (size_t)len * sizeof(uint16_t));
     for (size_t i = 0; i < plen; i++) buf[(size_t)len + i] = (uint16_t)(uint8_t)patch[i];
     void* patched = ms_string_new_utf16(buf.data(), (int32_t)buf.size());
-    LOGI("[C-RAM-MISSION] kind=%d patched script %d -> %d chars", kind, len, (int)buf.size());
-    orig_EGJS_ExecuteGameplayMission(self, IsValidPtr(patched) ? patched : jsCode, callInit, method);
+    LOGI("[C-RAM-MISSION] %s: kind=%d patched script %d -> %d chars", via, kind, len, (int)buf.size());
+    return IsValidPtr(patched) ? patched : jsCode;
+}
+
+void hook_EGJS_ExecuteGameplayMission(void* self, void* jsCode, bool callInit, void* method) {
+    orig_EGJS_ExecuteGameplayMission(self, MsPatchMissionJs(jsCode, "ExecuteGameplayMission"), callInit, method);
+}
+
+typedef void* (*t_EGJS_ParseMapName)(void* self, void* jsCode, void* method);
+static t_EGJS_ParseMapName orig_EGJS_ParseMapName = nullptr;
+
+void* hook_EGJS_ParseMapName(void* self, void* jsCode, void* method) {
+    return orig_EGJS_ParseMapName(self, MsPatchMissionJs(jsCode, "ParseMapName"), method);
 }
 
 static float MsRand01() { return (float)rand() / (float)RAND_MAX; }
@@ -2035,6 +2056,7 @@ static void InitMissions(uintptr_t base, void* hIl2Cpp) {
     AWS_AllTurretLookAt = (t_AWS_AllTurretLookAt)(base + RVA_AWS_ALLTURRETLOOKAT);
     AWS_TryTurretsFire = (t_AWS_TryTurretsFire)(base + RVA_AWS_TRYTURRETSFIRE);
     DobbyHook((void*)(base + RVA_EGJS_EXECGAMEPLAY), (void*)hook_EGJS_ExecuteGameplayMission, (void**)&orig_EGJS_ExecuteGameplayMission);
+    DobbyHook((void*)(base + 0x3920EE0), (void*)hook_EGJS_ParseMapName, (void**)&orig_EGJS_ParseMapName);
     DobbyHook((void*)(base + RVA_FAF_LATEUPDATE), (void*)hook_FlightAIFighter_LateUpdate, (void**)&orig_FlightAIFighter_LateUpdate);
     DobbyHook((void*)(base + RVA_HAF_LATEUPDATE), (void*)hook_HeliAIFighter_LateUpdate, (void**)&orig_HeliAIFighter_LateUpdate);
     DobbyHook((void*)(base + RVA_TDM_RESOLVEEXPLOSION), (void*)hook_TDM_ResolveExplosion, (void**)&orig_TDM_ResolveExplosion);
