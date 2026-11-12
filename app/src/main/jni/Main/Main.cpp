@@ -1,5 +1,5 @@
 //
-// C-RAM Mod v7.2
+// C-RAM Mod v7.4
 //
 
 #include <pthread.h>
@@ -1401,6 +1401,650 @@ static void InitAmraam(uintptr_t base, void* hIl2Cpp) {
     LOGI("[C-RAM-AIM120] Hooks installed");
 }
 
+#define RVA_EGJS_EXECGAMEPLAY           0x3920A8C
+#define RVA_FAF_LATEUPDATE              0x39BFE44
+#define RVA_HAF_LATEUPDATE              0x39CC500
+#define RVA_IUNIT_TRYFLARE              0x3B456A4
+#define RVA_AIRCRAFTMIO_SETTHROTTLE     0x3B24780
+#define RVA_TDM_RESOLVEEXPLOSION        0x3E8B688
+#define RVA_AWS_ALLTURRETLOOKAT         0x3B84788
+#define RVA_AWS_TRYTURRETSFIRE          0x3B84444
+
+enum MissionKind { MK_NONE = 0, MK_A2A = 1, MK_A2G = 2, MK_G2A = 3 };
+static std::atomic<int> g_MissionKind(MK_NONE);
+static std::atomic<void*> g_PlayerUnitPtr(nullptr);
+
+typedef void* (*t_il2cpp_string_new_utf16)(const uint16_t* text, int32_t len);
+typedef void (*t_EGJS_ExecuteGameplayMission)(void* self, void* jsCode, bool callInit, void* method);
+typedef void (*t_AIFighter_LateUpdate)(void* self, void* method);
+typedef void (*t_IUnit_TryFlare)(void* self, void* method);
+typedef void (*t_AircraftMio_set_Throttle)(void* self, float value, void* method);
+typedef float (*t_TDM_ResolveExplosion)(void* self, void* explosive, void* shooter, bool applyEffects, void* method);
+typedef void (*t_AWS_AllTurretLookAt)(void* self, Vector3 pos, bool lerp, void* method);
+typedef int (*t_AWS_TryTurretsFire)(void* self, Vector3 pos, bool lerp, void* method);
+
+static t_il2cpp_string_new_utf16 ms_string_new_utf16 = nullptr;
+static t_EGJS_ExecuteGameplayMission orig_EGJS_ExecuteGameplayMission = nullptr;
+static t_AIFighter_LateUpdate orig_FlightAIFighter_LateUpdate = nullptr;
+static t_AIFighter_LateUpdate orig_HeliAIFighter_LateUpdate = nullptr;
+static t_IUnit_TryFlare IUnit_TryFlare = nullptr;
+static t_AircraftMio_set_Throttle AircraftMio_set_Throttle = nullptr;
+static t_TDM_ResolveExplosion orig_TDM_ResolveExplosion = nullptr;
+static t_AWS_AllTurretLookAt AWS_AllTurretLookAt = nullptr;
+static t_AWS_TryTurretsFire AWS_TryTurretsFire = nullptr;
+
+static const char* kJsAir2Air = R"JS(
+;(function(){
+airEnemyPool.length = 0;
+["f-4-phantom","f-14-tomcat","f-15","f-16","f-35a","fa-18-hornet","j-8","j-20-chengdu","mig-29","mirage-2000","su-25","su-27","su-30mkk","su-57","a-10"].forEach(function(u){ airEnemyPool.push(u); });
+})();
+const __cramA2ASpawn = SpawnUnits;
+SpawnUnits = function() {
+    if (Math.random() >= 0.10) { return __cramA2ASpawn(); }
+    const vip = Math.random() < 0.5 ? "ac-130" : "b-2";
+    const sp = mission.getMidAirSpawnPoint();
+    const hdg = Math.random() * 360;
+    const r = hdg * Math.PI / 180;
+    const dx = Math.sin(r);
+    const dz = Math.cos(r);
+    const alt = 13000;
+    mission.movePlayer(sp.x - dx * 20000, alt, sp.z - dz * 20000, hdg);
+    mission.spawnUnit(vip, sp.x, alt, sp.z, hdg, TEAM_BLUE, false, 1.0, 1.0);
+};
+)JS";
+
+static const char* kJsGround2Air = R"JS(
+;(function(){
+airEnemyPool.length = 0;
+["f-4-phantom","f-14-tomcat","f-15","f-16","f-35a","fa-18-hornet","j-8","j-20-chengdu","mig-29","mirage-2000","su-25","su-27","su-30mkk","su-57","a-10","ac-130","b-2"].forEach(function(u){ airEnemyPool.push(u); });
+})();
+)JS";
+
+static const char* kJsGround2AirBoss = R"JS(
+;(function(){
+airBossPool.length = 0;
+["f-4-phantom","f-14-tomcat","f-15","f-16","f-35a","fa-18-hornet","j-8","j-20-chengdu","mig-29","mirage-2000","su-25","su-27","su-30mkk","su-57","a-10","ac-130","b-2"].forEach(function(u){ airBossPool.push(u); });
+})();
+)JS";
+
+static const char* kJsAir2Ground = R"JS(
+;(function(){
+[
+    { name: "buk-m1",         weight: 1 },
+    { name: "patriot",        weight: 1 },
+    { name: "2k22-tunguska",  weight: 3 },
+    { name: "pgz-04",         weight: 3 },
+    { name: "type-625",       weight: 3 },
+    { name: "m163-vads",      weight: 4 },
+    { name: "type-87",        weight: 4 },
+    { name: "m42-duster",     weight: 4 },
+    { name: "zu-23-2-landed", weight: 4 },
+    { name: "t-72",           weight: 2 },
+    { name: "t-90a",          weight: 2 },
+    { name: "type-99",        weight: 2 },
+    { name: "ztq-15",         weight: 2 },
+    { name: "m1-abrams",      weight: 2 }
+].forEach(function(u){ groundEnemyPool.push(u); });
+["apc", "kamaz", "toyota-pickup"].forEach(function(u){ groundEasyPool.push(u); });
+})();
+const __cramA2GSpawn = SpawnUnits;
+SpawnUnits = function() {
+    __cramA2GSpawn();
+    const n = mission.getGroundSpawnPointCount();
+    if (n <= 0) { return; }
+    const heliPool = ["mi-24", "mi-28", "ka-52", "ah-64", "ah-1"];
+    const cnt = randomRange(1, 3);
+    const idx = shuffleIndices(n);
+    for (let i = 0; i < cnt && i < idx.length; i++) {
+        const sp = mission.getGroundSpawnPoint(idx[i]);
+        const rot = mission.getGroundSpawnPointRotY(idx[i]);
+        const h = randomPick(heliPool);
+        const y = Math.max(sp.y, mission.getTerrainHeight(sp.x, sp.z)) + 120;
+        mission.spawnUnit(h, sp.x, y, sp.z, rot, TEAM_GROUND, false, 1.0, 1.0);
+    }
+};
+)JS";
+
+static void MsResetCaches();
+static void MsSyncJetMissilePatch();
+
+static bool MsU16Contains(const uint16_t* s, int32_t len, const char* needle) {
+    int32_t n = (int32_t)strlen(needle);
+    for (int32_t i = 0; i + n <= len; i++) {
+        int32_t k = 0;
+        while (k < n && s[i + k] == (uint16_t)(uint8_t)needle[k]) k++;
+        if (k == n) return true;
+    }
+    return false;
+}
+
+void hook_EGJS_ExecuteGameplayMission(void* self, void* jsCode, bool callInit, void* method) {
+    if (!IsValidPtr(jsCode) || !ms_string_new_utf16 || IsMpMatchActive()) {
+        g_MissionKind.store(MK_NONE);
+        MsResetCaches();
+        orig_EGJS_ExecuteGameplayMission(self, jsCode, callInit, method);
+        return;
+    }
+    int32_t len = *(int32_t*)((uintptr_t)jsCode + 0x10);
+    const uint16_t* chars = (const uint16_t*)((uintptr_t)jsCode + 0x14);
+    const char* patch = nullptr;
+    int kind = MK_NONE;
+    if (len > 0 && len < 4000000) {
+        if (MsU16Contains(chars, len, "// Air2AirBattle Mission Script")) { patch = kJsAir2Air; kind = MK_A2A; }
+        else if (MsU16Contains(chars, len, "// Classic_Air2Ground Mission Script")) { patch = kJsAir2Ground; kind = MK_A2G; }
+        else if (MsU16Contains(chars, len, "// Classic_Ground2Air_Boss Mission Script")) { patch = kJsGround2AirBoss; kind = MK_G2A; }
+        else if (MsU16Contains(chars, len, "// Classic_Ground2Air Mission Script")) { patch = kJsGround2Air; kind = MK_G2A; }
+    }
+    g_MissionKind.store(kind);
+    MsResetCaches();
+    if (!patch) {
+        orig_EGJS_ExecuteGameplayMission(self, jsCode, callInit, method);
+        return;
+    }
+    size_t plen = strlen(patch);
+    std::vector<uint16_t> buf((size_t)len + plen);
+    memcpy(buf.data(), chars, (size_t)len * sizeof(uint16_t));
+    for (size_t i = 0; i < plen; i++) buf[(size_t)len + i] = (uint16_t)(uint8_t)patch[i];
+    void* patched = ms_string_new_utf16(buf.data(), (int32_t)buf.size());
+    LOGI("[C-RAM-MISSION] kind=%d patched script %d -> %d chars", kind, len, (int)buf.size());
+    orig_EGJS_ExecuteGameplayMission(self, IsValidPtr(patched) ? patched : jsCode, callInit, method);
+}
+
+static float MsRand01() { return (float)rand() / (float)RAND_MAX; }
+static float MsRange(float a, float b) { return a + (b - a) * MsRand01(); }
+
+static int MsUnitTeam(void* unit) { return IsValidPtr(unit) ? *(int*)((uintptr_t)unit + 0x80) : -1; }
+static bool MsUnitAlive(void* unit) { return IsUnityObjectAlive(unit) && *(bool*)((uintptr_t)unit + OFFSET_UNIT_ISALIVE); }
+
+static bool MsUnitNameStarts(void* unit, const char* prefix) {
+    if (!Component_get_gameObject || !Object_get_name) return false;
+    void* go = Component_get_gameObject(unit, nullptr);
+    if (!IsUnityObjectAlive(go)) return false;
+    return AmStrStarts(Object_get_name(go, nullptr), prefix);
+}
+
+static bool MsPlayerPos(Vector3& pos, Vector3& vel) {
+    void* pu = g_PlayerUnitPtr.load();
+    if (!MsUnitAlive(pu) || !Component_get_transform || !Transform_get_position) return false;
+    void* tr = Component_get_transform(pu);
+    if (!IsValidPtr(tr)) return false;
+    pos = Transform_get_position(tr);
+    vel = PhysicsObject_get_Velocity ? PhysicsObject_get_Velocity(pu) : Vector3(0, 0, 0);
+    return true;
+}
+
+struct VipState {
+    void* fighter;
+    Vector3 home;
+    Vector3 dir;
+    float nextJink;
+    Vector3 jink;
+    int notchSide;
+};
+static std::vector<VipState> g_Vips;
+static std::vector<void*> g_NotVip;
+
+static VipState* MsGetVip(void* fighter, void* unit) {
+    for (auto& v : g_Vips) if (v.fighter == fighter) return &v;
+    for (void* p : g_NotVip) if (p == fighter) return nullptr;
+    bool vip = MsUnitTeam(unit) == 4 && (MsUnitNameStarts(unit, "AC-130") || MsUnitNameStarts(unit, "B-2"));
+    if (!vip) {
+        if (g_NotVip.size() > 256) g_NotVip.clear();
+        g_NotVip.push_back(fighter);
+        return nullptr;
+    }
+    void* tr = Component_get_transform(unit);
+    VipState s{};
+    s.fighter = fighter;
+    s.home = Transform_get_position(tr);
+    Vector3 f = Transform_get_forward(tr, nullptr);
+    f.Y = 0;
+    s.dir = Vector3::Magnitude(f) > 0.01f ? Vector3::Normalized(f) : Vector3(0, 0, 1);
+    s.nextJink = 0;
+    s.notchSide = 1;
+    if (g_Vips.size() > 32) g_Vips.clear();
+    g_Vips.push_back(s);
+    LOGI("[C-RAM-VIP] VIP registered fighter=%p", fighter);
+    return &g_Vips.back();
+}
+
+void hook_FlightAIFighter_LateUpdate(void* self, void* method) {
+    MsSyncJetMissilePatch();
+    if (g_MissionKind.load() != MK_A2A || !IsUnityObjectAlive(self)) {
+        orig_FlightAIFighter_LateUpdate(self, method);
+        return;
+    }
+    void* unit = *(void**)((uintptr_t)self + 0x90);
+    if (!MsUnitAlive(unit)) {
+        orig_FlightAIFighter_LateUpdate(self, method);
+        return;
+    }
+    VipState* vs = MsGetVip(self, unit);
+    if (!vs) {
+        orig_FlightAIFighter_LateUpdate(self, method);
+        return;
+    }
+    void* ctrl = *(void**)((uintptr_t)self + 0x58);
+    if (!IsUnityObjectAlive(ctrl)) return;
+    void* target = *(void**)((uintptr_t)ctrl + 0x30);
+    void* mio = *(void**)((uintptr_t)ctrl + 0x38);
+    void* tr = Component_get_transform(unit);
+    if (!IsValidPtr(tr) || !IsUnityObjectAlive(target)) return;
+
+    Vector3 my = Transform_get_position(tr);
+    Vector3 fwd = Transform_get_forward(tr, nullptr);
+    Vector3 flat(fwd.X, 0, fwd.Z);
+    flat = Vector3::Magnitude(flat) > 0.01f ? Vector3::Normalized(flat) : vs->dir;
+    Vector3 right(flat.Z, 0, -flat.X);
+    float now = (float)(getNowMs() % 100000000ULL) / 1000.0f;
+
+    Vector3 pp, pv;
+    bool havePlayer = MsPlayerPos(pp, pv);
+    float dist = havePlayer ? Vector3::Distance(pp, my) : 1e9f;
+
+    bool inbound = false;
+    void* sensor = *(void**)((uintptr_t)unit + 0xF8);
+    if (IsUnityObjectAlive(sensor)) inbound = *(bool*)((uintptr_t)sensor + 0xA0);
+
+    bool threat = inbound || dist < 7000.0f;
+    Vector3 aim;
+    if (!threat) {
+        Vector3 fromHome = my - vs->home;
+        fromHome.Y = 0;
+        if (Vector3::Magnitude(fromHome) > 30000.0f) vs->dir = Vector3::Normalized(Vector3(-fromHome.X, 0, -fromHome.Z));
+        aim = my + vs->dir * 4000.0f;
+        aim.Y = 13000.0f;
+    } else {
+        if (now >= vs->nextJink || vs->nextJink - now > 10.0f) {
+            float side = MsRand01() < 0.5f ? -1.0f : 1.0f;
+            vs->jink = right * (side * MsRange(1800.0f, 3200.0f)) + Vector3(0, MsRange(-1200.0f, 900.0f), 0);
+            vs->nextJink = now + MsRange(1.2f, 2.4f);
+            vs->notchSide = -vs->notchSide;
+        }
+        if (inbound && havePlayer) {
+            Vector3 los = my - pp;
+            los.Y = 0;
+            los = Vector3::Magnitude(los) > 1.0f ? Vector3::Normalized(los) : flat;
+            Vector3 beam(los.Z * (float)vs->notchSide, 0, -los.X * (float)vs->notchSide);
+            aim = my + beam * 3000.0f + Vector3(0, -600.0f, 0);
+        } else {
+            aim = my + flat * 1500.0f + vs->jink;
+        }
+        if (aim.Y < 7000.0f) aim.Y = 7000.0f;
+        if (aim.Y > 14500.0f) aim.Y = 14500.0f;
+        if (IUnit_TryFlare) IUnit_TryFlare(unit, nullptr);
+    }
+    *(bool*)((uintptr_t)ctrl + 0x20) = threat;
+    *(int*)((uintptr_t)ctrl + 0x48) = 0;
+    Transform_set_position(target, aim, nullptr);
+    if (IsUnityObjectAlive(mio) && AircraftMio_set_Throttle) AircraftMio_set_Throttle(mio, 1.0f, nullptr);
+}
+
+struct GuardState {
+    void* fighter;
+    Vector3 anchor;
+    Vector3 drift;
+    float nextDrift;
+    float nextAtgm;
+};
+static std::vector<GuardState> g_Guards;
+static std::vector<void*> g_NotGuard;
+
+static GuardState* MsGetGuard(void* fighter, void* unit) {
+    for (auto& g : g_Guards) if (g.fighter == fighter) return &g;
+    for (void* p : g_NotGuard) if (p == fighter) return nullptr;
+    if (MsUnitTeam(unit) != 1) {
+        if (g_NotGuard.size() > 256) g_NotGuard.clear();
+        g_NotGuard.push_back(fighter);
+        return nullptr;
+    }
+    GuardState s{};
+    s.fighter = fighter;
+    s.anchor = Transform_get_position(Component_get_transform(unit));
+    s.drift = Vector3(0, 0, 0);
+    s.nextDrift = 0;
+    s.nextAtgm = (float)(getNowMs() % 100000000ULL) / 1000.0f + 25.0f + 30.0f * ((float)rand() / (float)RAND_MAX);
+    if (g_Guards.size() > 32) g_Guards.clear();
+    g_Guards.push_back(s);
+    LOGI("[C-RAM-GUARD] guard heli registered fighter=%p", fighter);
+    return &g_Guards.back();
+}
+
+#define RVA_MISSILE_LAUNCH              0x3ECAA2C
+#define RVA_MISSILE_TRACKPOINT          0x3ECDF44
+#define RVA_MLAUNCHER_LAUNCH            0x3ED6A5C
+#define RVA_AIGROUND_UPDATE             0x3B2114C
+#define RVA_JET_MSL_FIRSTDELAY          0x39C5BDC
+#define RVA_JET_MSL_COOLDOWN            0x39C5FC8
+
+typedef void (*t_MissileIFLY_launch)(void* self, void* method);
+typedef Vector3 (*t_MissileIFLY_TrackPoint)(void* self, void* method);
+typedef bool (*t_MissileLauncher_launch)(void* self, void* aws, void* method);
+typedef void (*t_AiGroundUnit_Update)(void* self, void* method);
+
+static t_MissileIFLY_launch orig_MissileIFLY_launch = nullptr;
+static t_MissileIFLY_TrackPoint orig_MissileIFLY_TrackPoint = nullptr;
+static t_MissileLauncher_launch MissileLauncher_launch = nullptr;
+static t_AiGroundUnit_Update orig_AiGroundUnit_Update = nullptr;
+
+struct AamTune {
+    const char* name;
+    bool ir;
+    float man;
+    int gimbal;
+    float decoy;
+    float notch;
+    float pMan;
+    int pGimbal;
+    float pProx;
+    float pDecoy;
+};
+
+static const AamTune kAamTunes[] = {
+    {"AIM-9",       true,  0.6f, 50, 0.95f,  20.0f, 1.0f, 60, 8.0f,  0.95f},
+    {"R-73",        true,  0.6f, 50, 0.965f, 20.0f, 1.2f, 75, 8.0f,  0.965f},
+    {"IRIS-T",      true,  0.6f, 50, 0.95f,  20.0f, 1.3f, 80, 8.0f,  0.95f},
+    {"PL-10",       true,  0.6f, 50, 0.99f,  20.0f, 1.3f, 80, 8.0f,  0.99f},
+    {"MICA",        true,  0.6f, 50, 0.99f,  20.0f, 1.1f, 70, 8.0f,  0.99f},
+    {"9M39 Igla-V", true,  0.4f, 50, 0.96f,  20.0f, 0.6f, 50, 4.0f,  0.96f},
+    {"AIM-7",       false, 0.4f, 50, 0.0f,   25.0f, 0.6f, 50, 12.0f, 0.5f},
+    {"R-27",        false, 0.4f, 50, 0.0f,   22.0f, 0.6f, 50, 12.0f, 0.5f},
+    {"PL-11",       false, 0.4f, 50, 0.5f,   24.0f, 0.6f, 50, 12.0f, 0.5f},
+    {"R-77",        false, 0.4f, 50, 0.5f,   12.0f, 0.8f, 50, 12.0f, 0.5f},
+    {"PL-15",       false, 0.4f, 50, 0.5f,   12.0f, 0.8f, 50, 12.0f, 0.5f},
+    {"Meteor",      false, 0.4f, 50, 0.5f,   12.0f, 0.9f, 50, 12.0f, 0.5f},
+    {"AIM-120",     false, 0.4f, 50, 0.5f,   12.0f, 0.8f, 50, 12.0f, 0.5f},
+};
+
+static void* MsAwsOwnerUnit(void* aws) {
+    if (!IsUnityObjectAlive(aws)) return nullptr;
+    void* seat = *(void**)((uintptr_t)aws + 0x20);
+    if (!IsUnityObjectAlive(seat)) return nullptr;
+    void* sys = *(void**)((uintptr_t)seat + OFFSET_SEAT_PARENT_SYS);
+    if (!IsUnityObjectAlive(sys)) return nullptr;
+    return *(void**)((uintptr_t)sys + OFFSET_SEATSYS_PARENT_UNIT);
+}
+
+static void* MsMissileOwnerUnit(void* missile) {
+    void* aws = *(void**)((uintptr_t)missile + 0x38);
+    if (!IsUnityObjectAlive(aws)) {
+        void* launcher = *(void**)((uintptr_t)missile + 0x150);
+        if (IsUnityObjectAlive(launcher)) aws = *(void**)((uintptr_t)launcher + 0x28);
+    }
+    return MsAwsOwnerUnit(aws);
+}
+
+static void MsApplyAamTune(void* m) {
+    void* name = *(void**)((uintptr_t)m + 0x170);
+    const AamTune* t = nullptr;
+    for (const auto& a : kAamTunes) if (AmStrEq(name, a.name)) { t = &a; break; }
+    if (!t) return;
+    void* owner = MsMissileOwnerUnit(m);
+    void* player = g_PlayerUnitPtr.load();
+    bool isPlayer = owner && owner == player;
+    float man, decoy, notch, prox;
+    int gimbal;
+    if (isPlayer) {
+        man = t->pMan; gimbal = t->pGimbal; prox = t->pProx; decoy = t->pDecoy; notch = t->notch;
+    } else {
+        man = t->man * 0.8f; gimbal = t->gimbal; prox = 0.0f;
+        decoy = t->ir ? fmaxf(0.0f, t->decoy - 0.10f) : t->decoy;
+        notch = t->ir ? t->notch : t->notch + 10.0f;
+    }
+    *(float*)((uintptr_t)m + 0x1CC) = man;
+    *(int*)((uintptr_t)m + 0x1D0) = gimbal;
+    *(float*)((uintptr_t)m + 0x1D8) = prox;
+    *(float*)((uintptr_t)m + 0x240) = prox * prox;
+    *(float*)((uintptr_t)m + 0x1DC) = decoy;
+    *(float*)((uintptr_t)m + 0x1E8) = notch;
+    static int logged = 0;
+    if (logged < 40) {
+        LOGI("[C-RAM-AAM] %s %s man=%.2f gimbal=%d prox=%.0f decoy=%.2f notch=%.0f", t->name, isPlayer ? "PLAYER" : "BOT", man, gimbal, prox, decoy, notch);
+        logged++;
+    }
+}
+
+void hook_MissileIFLY_launch(void* self, void* method) {
+    if (IsUnityObjectAlive(self) && !IsMpMatchActive()) MsApplyAamTune(self);
+    orig_MissileIFLY_launch(self, method);
+}
+
+struct AtgmTrack {
+    void* missile;
+    Vector3 offset;
+    float until;
+    int origMode;
+};
+static std::vector<AtgmTrack> g_AtgmTracks;
+
+static float MsNow() { return (float)(getNowMs() % 100000000ULL) / 1000.0f; }
+
+static void* MsPlayerTransform() {
+    void* pu = g_PlayerUnitPtr.load();
+    if (!MsUnitAlive(pu) || !Component_get_transform) return nullptr;
+    return Component_get_transform(pu);
+}
+
+Vector3 hook_MissileIFLY_TrackPoint(void* self, void* method) {
+    for (auto& t : g_AtgmTracks) {
+        if (t.missile != self) continue;
+        Vector3 pp, pv;
+        if (MsPlayerPos(pp, pv)) return pp + t.offset;
+        break;
+    }
+    return orig_MissileIFLY_TrackPoint(self, method);
+}
+
+static void MsRefreshAtgmTracks() {
+    float now = MsNow();
+    void* ptr = MsPlayerTransform();
+    for (size_t i = 0; i < g_AtgmTracks.size();) {
+        AtgmTrack& t = g_AtgmTracks[i];
+        bool alive = IsUnityObjectAlive(t.missile);
+        bool done = !alive || now > t.until || now + 120.0f < t.until || *(bool*)((uintptr_t)t.missile + 0x15A);
+        if (done) {
+            if (alive) {
+                *(int*)((uintptr_t)t.missile + 0x1F0) = 2;
+                *(int*)((uintptr_t)t.missile + 0x178) = t.origMode;
+            }
+            g_AtgmTracks.erase(g_AtgmTracks.begin() + i);
+            continue;
+        }
+        if (IsValidPtr(ptr)) {
+            AmSetRef(t.missile, 0x160, ptr);
+            AmSetRef(t.missile, 0x168, ptr);
+        }
+        *(bool*)((uintptr_t)t.missile + 0x15C) = true;
+        i++;
+    }
+}
+
+static bool MsTryHeliAtgm(void* heliUnit) {
+    void* ptr = MsPlayerTransform();
+    if (!IsValidPtr(ptr) || !MissileLauncher_launch || !Component_get_gameObject) return false;
+    static void* tLauncher = nullptr;
+    if (!tLauncher) tLauncher = AmTypeObject(AmFindClass("Assembly-CSharp.dll", "", "MissileLauncher"));
+    void* go = Component_get_gameObject(heliUnit, nullptr);
+    auto launchers = AmComponents(go, tLauncher);
+    if (!IsValidPtr(launchers)) return false;
+    for (int i = 0; i < launchers->getLength(); i++) {
+        void* l = launchers->vector[i];
+        if (!IsUnityObjectAlive(l)) continue;
+        void* m = *(void**)((uintptr_t)l + 0x38);
+        void* aws = *(void**)((uintptr_t)l + 0x28);
+        if (!IsUnityObjectAlive(m) || !IsUnityObjectAlive(aws)) continue;
+        if (*(int*)((uintptr_t)m + 0x1F0) != 2) continue;
+        int mode = *(int*)((uintptr_t)m + 0x178);
+        if (mode != 1 && mode != 2) continue;
+        if (!*(bool*)((uintptr_t)m + 0x158) || *(bool*)((uintptr_t)m + 0x159) || *(bool*)((uintptr_t)m + 0x15A)) continue;
+        *(int*)((uintptr_t)m + 0x1F0) = 0;
+        *(int*)((uintptr_t)m + 0x178) = 2;
+        *(bool*)((uintptr_t)m + 0x15C) = true;
+        AmSetRef(m, 0x160, ptr);
+        AmSetRef(m, 0x168, ptr);
+        AtgmTrack t{};
+        t.missile = m;
+        t.origMode = mode;
+        t.until = MsNow() + 35.0f;
+        if (MsRand01() < 0.65f) {
+            float a = MsRange(0.0f, 6.2831853f);
+            float r = MsRange(3.0f, 6.0f);
+            t.offset = Vector3(cosf(a) * r, MsRange(-r, r) * 0.6f, sinf(a) * r);
+        } else {
+            t.offset = Vector3(0, 0, 0);
+        }
+        g_AtgmTracks.push_back(t);
+        bool ok = MissileLauncher_launch(l, aws, nullptr);
+        if (!ok) {
+            *(int*)((uintptr_t)m + 0x1F0) = 2;
+            *(int*)((uintptr_t)m + 0x178) = mode;
+            g_AtgmTracks.pop_back();
+            continue;
+        }
+        char nm[48];
+        ReadMonoString(*(void**)((uintptr_t)m + 0x170), nm, sizeof(nm));
+        LOGI("[C-RAM-ATGM-LOCK] heli launched %s at player, miss offset %.1f m", nm, Vector3::Magnitude(t.offset));
+        return true;
+    }
+    return false;
+}
+
+static std::vector<std::pair<void*, float>> g_AgBaseRate;
+
+void hook_AiGroundUnit_Update(void* self, void* method) {
+    if (IsUnityObjectAlive(self) && IUnit_GetUnitType && !IsMpMatchActive()) {
+        float* rate = (float*)((uintptr_t)self + 0x7C);
+        float base = -1.0f;
+        for (auto& p : g_AgBaseRate) if (p.first == self) { base = p.second; break; }
+        if (base < 0.0f) {
+            base = *rate;
+            if (g_AgBaseRate.size() > 512) g_AgBaseRate.clear();
+            g_AgBaseRate.push_back({self, base});
+        }
+        void* target = *(void**)((uintptr_t)self + 0x38);
+        bool heli = MsUnitAlive(target) && IUnit_GetUnitType(target) == 6;
+        *rate = heli ? fmaxf(base, 0.75f) : base;
+    }
+    orig_AiGroundUnit_Update(self, method);
+}
+
+static int g_JetPatchState = -1;
+static float g_JetPatchCheck = 0;
+
+static void MsSyncJetMissilePatch() {
+    float now = MsNow();
+    if (g_JetPatchState >= 0 && now >= g_JetPatchCheck && now - g_JetPatchCheck < 2.0f) return;
+    g_JetPatchCheck = now + 2.0f;
+    int want = IsMpMatchActive() ? 0 : 1;
+    if (want == g_JetPatchState) return;
+    PatchDword(g_Il2CppBase + RVA_JET_MSL_FIRSTDELAY, want ? 0x1E249001u : 0x1E269001u);
+    PatchDword(g_Il2CppBase + RVA_JET_MSL_COOLDOWN, want ? 0x52A83408u : 0x52A84408u);
+    g_JetPatchState = want;
+    LOGI("[C-RAM-AAM] jet missile timing %s", want ? "x2 (10s/20s)" : "vanilla (20s/40s)");
+}
+
+static void MsResetCaches() {
+    g_AtgmTracks.clear();
+    g_AgBaseRate.clear();
+    g_Vips.clear();
+    g_NotVip.clear();
+    g_Guards.clear();
+    g_NotGuard.clear();
+}
+
+void hook_HeliAIFighter_LateUpdate(void* self, void* method) {
+    orig_HeliAIFighter_LateUpdate(self, method);
+    if (!g_AtgmTracks.empty()) MsRefreshAtgmTracks();
+    if (g_MissionKind.load() != MK_A2G || !IsUnityObjectAlive(self)) return;
+    void* seat = *(void**)((uintptr_t)self + 0x70);
+    if (!IsUnityObjectAlive(seat)) return;
+    void* sys = *(void**)((uintptr_t)seat + OFFSET_SEAT_PARENT_SYS);
+    if (!IsUnityObjectAlive(sys)) return;
+    void* unit = *(void**)((uintptr_t)sys + OFFSET_SEATSYS_PARENT_UNIT);
+    if (!MsUnitAlive(unit)) return;
+    GuardState* gs = MsGetGuard(self, unit);
+    if (!gs) return;
+
+    void* ctrl = *(void**)((uintptr_t)self + 0x60);
+    if (!IsUnityObjectAlive(ctrl)) return;
+    void* target = *(void**)((uintptr_t)ctrl + 0x20);
+    if (!IsUnityObjectAlive(target)) return;
+    void* tr = Component_get_transform(unit);
+    if (!IsValidPtr(tr)) return;
+    Vector3 my = Transform_get_position(tr);
+    float now = (float)(getNowMs() % 100000000ULL) / 1000.0f;
+    if (now >= gs->nextDrift || gs->nextDrift - now > 60.0f) {
+        float a = MsRange(0.0f, 6.2831853f);
+        float r = MsRange(0.0f, 500.0f);
+        gs->drift = Vector3(cosf(a) * r, MsRange(-30.0f, 60.0f), sinf(a) * r);
+        gs->nextDrift = now + MsRange(12.0f, 25.0f);
+    }
+    Transform_set_position(target, gs->anchor + gs->drift, nullptr);
+    *(bool*)((uintptr_t)ctrl + 0x5E) = true;
+
+    Vector3 pp, pv;
+    if (!MsPlayerPos(pp, pv)) return;
+    float dist = Vector3::Distance(pp, my);
+    if (now >= gs->nextAtgm || gs->nextAtgm - now > 200.0f) {
+        if (dist > 1500.0f && dist < 6000.0f) {
+            MsTryHeliAtgm(unit);
+            gs->nextAtgm = now + MsRange(45.0f, 80.0f);
+        } else {
+            gs->nextAtgm = now + 3.0f;
+        }
+    }
+    if (dist > 2000.0f) return;
+    void* aws = *(void**)((uintptr_t)self + 0xE8);
+    if (!IsUnityObjectAlive(aws) || !AWS_AllTurretLookAt) return;
+    const float bulletSpeed = 900.0f;
+    Vector3 lead = pp;
+    for (int i = 0; i < 3; i++) {
+        float t = Vector3::Distance(lead, my) / bulletSpeed;
+        lead = pp + pv * t + Vector3(0, 4.9f * t * t, 0);
+    }
+    AWS_AllTurretLookAt(aws, lead, true, nullptr);
+    if (dist < 1500.0f && AWS_TryTurretsFire) AWS_TryTurretsFire(aws, lead, true, nullptr);
+}
+
+float hook_TDM_ResolveExplosion(void* self, void* explosive, void* shooter, bool applyEffects, void* method) {
+    int before = IsValidPtr(self) ? *(int*)((uintptr_t)self + 0xF0) : 0;
+    float dmg = orig_TDM_ResolveExplosion(self, explosive, shooter, applyEffects, method);
+    if (!applyEffects || !IsValidPtr(self) || !IsValidPtr(explosive) || IsMpMatchActive()) return dmg;
+    void* wh = *(void**)((uintptr_t)explosive + 0x58);
+    if (!IsValidPtr(wh)) return dmg;
+    int kind = *(int*)((uintptr_t)wh + 0x18);
+    float pen = *(float*)((uintptr_t)wh + 0x1C);
+    float kg = *(float*)((uintptr_t)wh + 0x20);
+    if (kind != 3 || pen < 400.0f || kg < 1.4f) return dmg;
+    int after = *(int*)((uintptr_t)self + 0xF0);
+    if (after <= before) return dmg;
+    void* unit = *(void**)((uintptr_t)self + 0x28);
+    if (!IsValidPtr(unit)) return dmg;
+    float maxHp = *(float*)((uintptr_t)unit + 0xA8);
+    if (maxHp > 0 && dmg < maxHp * 1.5f) {
+        LOGI("[C-RAM-ATGM] penetration pen=%.0f kg=%.2f dmg %.2f -> %.2f", pen, kg, dmg, maxHp * 1.5f);
+        dmg = maxHp * 1.5f;
+    }
+    return dmg;
+}
+
+static void InitMissions(uintptr_t base, void* hIl2Cpp) {
+    ms_string_new_utf16 = (t_il2cpp_string_new_utf16)dlsym(hIl2Cpp, "il2cpp_string_new_utf16");
+    IUnit_TryFlare = (t_IUnit_TryFlare)(base + RVA_IUNIT_TRYFLARE);
+    AircraftMio_set_Throttle = (t_AircraftMio_set_Throttle)(base + RVA_AIRCRAFTMIO_SETTHROTTLE);
+    AWS_AllTurretLookAt = (t_AWS_AllTurretLookAt)(base + RVA_AWS_ALLTURRETLOOKAT);
+    AWS_TryTurretsFire = (t_AWS_TryTurretsFire)(base + RVA_AWS_TRYTURRETSFIRE);
+    DobbyHook((void*)(base + RVA_EGJS_EXECGAMEPLAY), (void*)hook_EGJS_ExecuteGameplayMission, (void**)&orig_EGJS_ExecuteGameplayMission);
+    DobbyHook((void*)(base + RVA_FAF_LATEUPDATE), (void*)hook_FlightAIFighter_LateUpdate, (void**)&orig_FlightAIFighter_LateUpdate);
+    DobbyHook((void*)(base + RVA_HAF_LATEUPDATE), (void*)hook_HeliAIFighter_LateUpdate, (void**)&orig_HeliAIFighter_LateUpdate);
+    DobbyHook((void*)(base + RVA_TDM_RESOLVEEXPLOSION), (void*)hook_TDM_ResolveExplosion, (void**)&orig_TDM_ResolveExplosion);
+    MissileLauncher_launch = (t_MissileLauncher_launch)(base + RVA_MLAUNCHER_LAUNCH);
+    DobbyHook((void*)(base + RVA_MISSILE_LAUNCH), (void*)hook_MissileIFLY_launch, (void**)&orig_MissileIFLY_launch);
+    DobbyHook((void*)(base + RVA_MISSILE_TRACKPOINT), (void*)hook_MissileIFLY_TrackPoint, (void**)&orig_MissileIFLY_TrackPoint);
+    DobbyHook((void*)(base + RVA_AIGROUND_UPDATE), (void*)hook_AiGroundUnit_Update, (void**)&orig_AiGroundUnit_Update);
+    LOGI("[C-RAM-MISSION] hooks installed utf16=%p", (void*)ms_string_new_utf16);
+}
+
 void hook_CameraManager_Awake(void* self, void* method) {
     g_CameraManagerInstance = self;
     LOGI("[C-RAM-CAM] CameraManager::Awake captured! Instance: %p", self);
@@ -2469,6 +3113,9 @@ void hook_GeneralHUD_LateUpdate(void* self) {
             if (IsValidPtr(seatTr)) {
                 g_PlayerVehiclePos = Transform_get_position(seatTr);
                 g_HasPlayerVehiclePos.store(true);
+                void* pSys = *(void**)((uintptr_t)seat + OFFSET_SEAT_PARENT_SYS);
+                void* pUnit = IsUnityObjectAlive(pSys) ? *(void**)((uintptr_t)pSys + OFFSET_SEATSYS_PARENT_UNIT) : nullptr;
+                if (IsUnityObjectAlive(pUnit)) g_PlayerUnitPtr.store(pUnit);
                 gunPos = g_PlayerVehiclePos;
                 foundTurret = true;
             }
@@ -2771,6 +3418,7 @@ void* thread(void*) {
     Component_get_gameObject = (t_Component_get_gameObject)(g_Il2CppBase + RVA_COMP_GET_GAMEOBJECT);
     StageUI_refreshUI = (t_StageUI_refreshUI)(g_Il2CppBase + RVA_STAGEUI_REFRESHUI);
     InitAmraam(g_Il2CppBase, hIl2Cpp);
+    InitMissions(g_Il2CppBase, hIl2Cpp);
 
     // Economy pointers
     InventoryWrapper_AddCurrency = (t_InventoryWrapper_AddCurrency)(g_Il2CppBase + RVA_INVENTORY_ADDCURRENCY);
