@@ -1,5 +1,5 @@
 //
-// C-RAM Mod v7.5.1
+// C-RAM Mod v7.5.2
 //
 
 #include <pthread.h>
@@ -1949,7 +1949,7 @@ static bool MsTryHeliAtgm(void* heliUnit, bool diag) {
         if (*(int*)((uintptr_t)m + 0x1F0) != 2) continue;
         int mode = *(int*)((uintptr_t)m + 0x178);
         if (mode != 1 && mode != 2) continue;
-        if (!*(bool*)((uintptr_t)m + 0x158) || *(bool*)((uintptr_t)m + 0x159) || *(bool*)((uintptr_t)m + 0x15A)) continue;
+        if (*(bool*)((uintptr_t)m + 0x159) || *(bool*)((uintptr_t)m + 0x15A) || *(bool*)((uintptr_t)l + 0x91)) continue;
         *(int*)((uintptr_t)m + 0x1F0) = 0;
         *(int*)((uintptr_t)m + 0x178) = 2;
         *(bool*)((uintptr_t)m + 0x15C) = true;
@@ -1979,6 +1979,11 @@ static bool MsTryHeliAtgm(void* heliUnit, bool diag) {
         ReadMonoString(*(void**)((uintptr_t)m + 0x170), nm, sizeof(nm));
         LOGI("[C-RAM-ATGM-LOCK] heli launched %s at player, miss offset %.1f m", nm, Vector3::Magnitude(t.offset));
         return true;
+    }
+    static int noneLogged = 0;
+    if (noneLogged < 20) {
+        LOGI("[C-RAM-ATGM-LOCK] no ATGM available to launch");
+        noneLogged++;
     }
     return false;
 }
