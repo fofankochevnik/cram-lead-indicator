@@ -1,5 +1,5 @@
 //
-// C-RAM Mod v7.5
+// C-RAM Mod v7.5.1
 //
 
 #include <pthread.h>
@@ -1918,11 +1918,11 @@ static bool MsTryHeliAtgm(void* heliUnit, bool diag) {
     void* ptr = MsPlayerTransform();
     if (!IsValidPtr(ptr) || !MissileLauncher_launch || !Component_get_gameObject) return false;
     static void* tLauncher = nullptr;
-    if (!tLauncher) tLauncher = AmTypeObject(AmFindClass("Assembly-CSharp.dll", "", "MissileLauncher"));
+    if (!tLauncher) tLauncher = AmTypeObject(AmFindClass("Assembly-CSharp.dll", "MGAssets", "MissileLauncher"));
     void* go = Component_get_gameObject(heliUnit, nullptr);
     auto launchers = AmComponents(go, tLauncher);
     if (!IsValidPtr(launchers)) {
-        if (diag) LOGI("[C-RAM-ATGM-LOCK] no MissileLauncher components on heli");
+        if (diag) LOGI("[C-RAM-ATGM-LOCK] no MissileLauncher components on heli (type=%p)", tLauncher);
         return false;
     }
     if (diag) {
