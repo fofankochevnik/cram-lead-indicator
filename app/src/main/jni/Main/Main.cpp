@@ -1,5 +1,5 @@
 //
-// C-RAM Mod v7.4.1
+// C-RAM Mod v7.5
 //
 
 #include <pthread.h>
@@ -1707,6 +1707,11 @@ struct GuardState {
     Vector3 drift;
     float nextDrift;
     float nextAtgm;
+    Vector3 aimErr;
+    float nextAimErr;
+    float blockedSince;
+    float nextMissileNudge;
+    bool atgmDiag;
 };
 static std::vector<GuardState> g_Guards;
 static std::vector<void*> g_NotGuard;
@@ -1838,6 +1843,35 @@ struct AtgmTrack {
 };
 static std::vector<AtgmTrack> g_AtgmTracks;
 
+static bool MsTurretListAligned(void* list, Vector3 aim, float cosLimit, bool& any) {
+    if (!IsValidPtr(list)) return false;
+    auto l = (monoList<void*>*)list;
+    if (!IsValidPtr(l->items)) return false;
+    int n = l->getSize();
+    for (int i = 0; i < n && i < 16; i++) {
+        void* t = ((void**)l->items->vector)[i];
+        if (!IsUnityObjectAlive(t)) continue;
+        void* muzzle = *(void**)((uintptr_t)t + 0xD8);
+        if (!IsUnityObjectAlive(muzzle)) continue;
+        any = true;
+        Vector3 mp = Transform_get_position(muzzle);
+        Vector3 f = Transform_get_forward(muzzle, nullptr);
+        Vector3 d = aim - mp;
+        float len = Vector3::Magnitude(d);
+        if (len < 1.0f) continue;
+        if (Vector3::Dot(f, d / len) >= cosLimit) return true;
+    }
+    return false;
+}
+
+static bool MsGunAligned(void* aws, Vector3 aim, float degrees) {
+    float c = cosf(degrees * 0.0174533f);
+    bool any = false;
+    if (MsTurretListAligned(*(void**)((uintptr_t)aws + 0x28), aim, c, any)) return true;
+    if (MsTurretListAligned(*(void**)((uintptr_t)aws + 0x98), aim, c, any)) return true;
+    return false;
+}
+
 static float MsNow() { return (float)(getNowMs() % 100000000ULL) / 1000.0f; }
 
 static void* MsPlayerTransform() {
@@ -1880,14 +1914,32 @@ static void MsRefreshAtgmTracks() {
     }
 }
 
-static bool MsTryHeliAtgm(void* heliUnit) {
+static bool MsTryHeliAtgm(void* heliUnit, bool diag) {
     void* ptr = MsPlayerTransform();
     if (!IsValidPtr(ptr) || !MissileLauncher_launch || !Component_get_gameObject) return false;
     static void* tLauncher = nullptr;
     if (!tLauncher) tLauncher = AmTypeObject(AmFindClass("Assembly-CSharp.dll", "", "MissileLauncher"));
     void* go = Component_get_gameObject(heliUnit, nullptr);
     auto launchers = AmComponents(go, tLauncher);
-    if (!IsValidPtr(launchers)) return false;
+    if (!IsValidPtr(launchers)) {
+        if (diag) LOGI("[C-RAM-ATGM-LOCK] no MissileLauncher components on heli");
+        return false;
+    }
+    if (diag) {
+        for (int i = 0; i < launchers->getLength() && i < 24; i++) {
+            void* l = launchers->vector[i];
+            if (!IsUnityObjectAlive(l)) continue;
+            void* mm = *(void**)((uintptr_t)l + 0x38);
+            char nm[48] = "-";
+            if (IsUnityObjectAlive(mm)) ReadMonoString(*(void**)((uintptr_t)mm + 0x170), nm, sizeof(nm));
+            LOGI("[C-RAM-ATGM-LOCK] launcher %d missile=%s cls=%d mode=%d ready=%d on=%d aws=%p", i, nm,
+                 IsUnityObjectAlive(mm) ? *(int*)((uintptr_t)mm + 0x1F0) : -1,
+                 IsUnityObjectAlive(mm) ? *(int*)((uintptr_t)mm + 0x178) : -1,
+                 IsUnityObjectAlive(mm) ? (int)*(bool*)((uintptr_t)mm + 0x158) : -1,
+                 IsUnityObjectAlive(mm) ? (int)*(bool*)((uintptr_t)mm + 0x159) : -1,
+                 *(void**)((uintptr_t)l + 0x28));
+        }
+    }
     for (int i = 0; i < launchers->getLength(); i++) {
         void* l = launchers->vector[i];
         if (!IsUnityObjectAlive(l)) continue;
@@ -1917,6 +1969,7 @@ static bool MsTryHeliAtgm(void* heliUnit) {
         g_AtgmTracks.push_back(t);
         bool ok = MissileLauncher_launch(l, aws, nullptr);
         if (!ok) {
+            LOGI("[C-RAM-ATGM-LOCK] MissileLauncher.launch returned false");
             *(int*)((uintptr_t)m + 0x1F0) = 2;
             *(int*)((uintptr_t)m + 0x178) = mode;
             g_AtgmTracks.pop_back();
@@ -1932,7 +1985,73 @@ static bool MsTryHeliAtgm(void* heliUnit) {
 
 static std::vector<std::pair<void*, float>> g_AgBaseRate;
 
+static const char* kCiwsPrefabs[] = {
+    "AK630M-2-Duet", "CIWS-II", "Flak38_20mm", "Goalkeeper", "Kashtan", "MillenniumGun", "OTOMelara76mm",
+    "Pantsir", "PhalanxHD", "SEA-RAM", "ShahedLauncher", "Smash30mm", "Strela-10", "Type1130", "Zu-23-2-Mounted"
+};
+
+struct PendingCiws {
+    void* unit;
+    float at;
+};
+static std::vector<PendingCiws> g_PendingCiws;
+
+typedef void* (*t_MissionContext_spawnUnit)(void* self, void* unitId, double x, double y, double z, double rotY, int team, bool isPlayer, double hp, double speed, void* weapon, int loadout, void* method);
+static t_MissionContext_spawnUnit orig_MissionContext_spawnUnit = nullptr;
+typedef void (*t_GroundUnit_SetCIWS)(void* self, void* turret, void* method);
+static t_GroundUnit_SetCIWS GroundUnit_SetCIWS = nullptr;
+
+void* hook_MissionContext_spawnUnit(void* self, void* unitId, double x, double y, double z, double rotY, int team, bool isPlayer, double hp, double speed, void* weapon, int loadout, void* method) {
+    void* u = orig_MissionContext_spawnUnit(self, unitId, x, y, z, rotY, team, isPlayer, hp, speed, weapon, loadout, method);
+    if (!isPlayer && g_MissionKind.load() != MK_NONE && IsUnityObjectAlive(u) && !IsMpMatchActive()) {
+        if (g_PendingCiws.size() < 64) g_PendingCiws.push_back({u, MsNow() + 0.5f});
+    }
+    return u;
+}
+
+static void MsAttachRandomCiws(void* unit) {
+    if (!GameAssetCatalog_GetUnitPrefab || !Object_Instantiate_Parent || !GroundUnit_SetCIWS || !il2cpp_string_new_fn) return;
+    void* slot = *(void**)((uintptr_t)unit + 0x198);
+    if (!IsUnityObjectAlive(slot)) return;
+    const char* name = kCiwsPrefabs[rand() % (int)(sizeof(kCiwsPrefabs) / sizeof(kCiwsPrefabs[0]))];
+    void* prefab = GameAssetCatalog_GetUnitPrefab(il2cpp_string_new_fn(name), nullptr);
+    if (!IsUnityObjectAlive(prefab)) {
+        LOGI("[C-RAM-CIWS] prefab '%s' not found", name);
+        return;
+    }
+    void* go = Object_Instantiate_Parent(prefab, slot, false, nullptr);
+    if (!IsUnityObjectAlive(go)) return;
+    static void* tTurret = nullptr;
+    if (!tTurret) tTurret = AmTypeObject(AmFindClass("Assembly-CSharp.dll", "", "Turret"));
+    auto turrets = AmComponents(go, tTurret);
+    if (!IsValidPtr(turrets) || turrets->getLength() <= 0) {
+        LOGI("[C-RAM-CIWS] '%s' has no Turret", name);
+        return;
+    }
+    void* turret = turrets->vector[0];
+    AmSetRef(turret, 0x40, prefab);
+    GroundUnit_SetCIWS(unit, turret, nullptr);
+    LOGI("[C-RAM-CIWS] mounted '%s' on unit %p", name, unit);
+}
+
+static void MsProcessPendingCiws() {
+    if (g_PendingCiws.empty()) return;
+    float now = MsNow();
+    for (size_t i = 0; i < g_PendingCiws.size();) {
+        PendingCiws& p = g_PendingCiws[i];
+        if (now < p.at && p.at - now < 10.0f) { i++; continue; }
+        void* u = p.unit;
+        g_PendingCiws.erase(g_PendingCiws.begin() + i);
+        if (!MsUnitAlive(u) || !IUnit_GetUnitType || IUnit_GetUnitType(u) != 1) continue;
+        if (!*(bool*)((uintptr_t)u + 0x197)) continue;
+        if (IsUnityObjectAlive(*(void**)((uintptr_t)u + 0x1A8))) continue;
+        if (MsRand01() >= 0.5f) continue;
+        MsAttachRandomCiws(u);
+    }
+}
+
 void hook_AiGroundUnit_Update(void* self, void* method) {
+    MsProcessPendingCiws();
     if (IsUnityObjectAlive(self) && IUnit_GetUnitType && !IsMpMatchActive()) {
         float* rate = (float*)((uintptr_t)self + 0x7C);
         float base = -1.0f;
@@ -1967,6 +2086,7 @@ static void MsSyncJetMissilePatch() {
 static void MsResetCaches() {
     g_AtgmTracks.clear();
     g_AgBaseRate.clear();
+    g_PendingCiws.clear();
     g_Vips.clear();
     g_NotVip.clear();
     g_Guards.clear();
@@ -2006,25 +2126,57 @@ void hook_HeliAIFighter_LateUpdate(void* self, void* method) {
     Vector3 pp, pv;
     if (!MsPlayerPos(pp, pv)) return;
     float dist = Vector3::Distance(pp, my);
+    void* aws = *(void**)((uintptr_t)self + 0xE8);
+    bool gunCanReach = false;
+    if (dist <= 2000.0f && IsUnityObjectAlive(aws) && AWS_AllTurretLookAt) {
+        if (now >= gs->nextAimErr || gs->nextAimErr - now > 30.0f) {
+            float a = MsRange(0.0f, 6.2831853f);
+            float r = MsRange(4.0f, 9.0f);
+            gs->aimErr = Vector3(cosf(a) * r, MsRange(-r, r) * 0.7f, sinf(a) * r);
+            gs->nextAimErr = now + MsRange(1.2f, 2.0f);
+        }
+        const float bulletSpeed = 900.0f;
+        Vector3 lead = pp;
+        for (int i = 0; i < 3; i++) {
+            float t = Vector3::Distance(lead, my) / bulletSpeed;
+            lead = pp + pv * (t * 0.7f) + Vector3(0, 4.9f * t * t, 0);
+        }
+        lead = lead + gs->aimErr;
+        AWS_AllTurretLookAt(aws, lead, true, nullptr);
+        gunCanReach = MsGunAligned(aws, lead, 3.0f);
+        if (gunCanReach && dist < 1500.0f && AWS_TryTurretsFire) AWS_TryTurretsFire(aws, lead, true, nullptr);
+    }
+    if (dist <= 6000.0f && !gunCanReach) {
+        if (gs->blockedSince <= 0.0f || gs->blockedSince > now) gs->blockedSince = now;
+    } else {
+        gs->blockedSince = 0.0f;
+    }
+    bool blocked = gs->blockedSince > 0.0f && now - gs->blockedSince > 1.5f;
+    if (blocked && (now >= gs->nextMissileNudge || gs->nextMissileNudge - now > 60.0f)) {
+        float* cd = (float*)((uintptr_t)self + 0xF0);
+        if (*cd > 0.0f) *cd = 0.0f;
+        gs->nextMissileNudge = now + 10.0f;
+        if (gs->nextAtgm - now > 6.0f) gs->nextAtgm = now + MsRange(3.0f, 6.0f);
+    }
     if (now >= gs->nextAtgm || gs->nextAtgm - now > 200.0f) {
-        if (dist > 1500.0f && dist < 6000.0f) {
-            MsTryHeliAtgm(unit);
-            gs->nextAtgm = now + MsRange(45.0f, 80.0f);
+        if (dist > 800.0f && dist < 7000.0f) {
+            bool ok = MsTryHeliAtgm(unit, !gs->atgmDiag);
+            gs->atgmDiag = true;
+            gs->nextAtgm = now + (ok ? MsRange(15.0f, 25.0f) : 5.0f);
         } else {
             gs->nextAtgm = now + 3.0f;
         }
     }
-    if (dist > 2000.0f) return;
-    void* aws = *(void**)((uintptr_t)self + 0xE8);
-    if (!IsUnityObjectAlive(aws) || !AWS_AllTurretLookAt) return;
-    const float bulletSpeed = 900.0f;
-    Vector3 lead = pp;
-    for (int i = 0; i < 3; i++) {
-        float t = Vector3::Distance(lead, my) / bulletSpeed;
-        lead = pp + pv * t + Vector3(0, 4.9f * t * t, 0);
+}
+
+typedef void (*t_HeliAI_FireGunBurst)(void* self, void* method);
+static t_HeliAI_FireGunBurst orig_HeliAI_FireGunBurst = nullptr;
+
+void hook_HeliAI_FireGunBurst(void* self, void* method) {
+    if (g_MissionKind.load() == MK_A2G) {
+        for (auto& g : g_Guards) if (g.fighter == self) return;
     }
-    AWS_AllTurretLookAt(aws, lead, true, nullptr);
-    if (dist < 1500.0f && AWS_TryTurretsFire) AWS_TryTurretsFire(aws, lead, true, nullptr);
+    orig_HeliAI_FireGunBurst(self, method);
 }
 
 float hook_TDM_ResolveExplosion(void* self, void* explosive, void* shooter, bool applyEffects, void* method) {
@@ -2064,6 +2216,9 @@ static void InitMissions(uintptr_t base, void* hIl2Cpp) {
     DobbyHook((void*)(base + RVA_MISSILE_LAUNCH), (void*)hook_MissileIFLY_launch, (void**)&orig_MissileIFLY_launch);
     DobbyHook((void*)(base + RVA_MISSILE_TRACKPOINT), (void*)hook_MissileIFLY_TrackPoint, (void**)&orig_MissileIFLY_TrackPoint);
     DobbyHook((void*)(base + RVA_AIGROUND_UPDATE), (void*)hook_AiGroundUnit_Update, (void**)&orig_AiGroundUnit_Update);
+    DobbyHook((void*)(base + 0x39CD61C), (void*)hook_HeliAI_FireGunBurst, (void**)&orig_HeliAI_FireGunBurst);
+    GroundUnit_SetCIWS = (t_GroundUnit_SetCIWS)(base + 0x3B32A68);
+    DobbyHook((void*)(base + 0x3928908), (void*)hook_MissionContext_spawnUnit, (void**)&orig_MissionContext_spawnUnit);
     LOGI("[C-RAM-MISSION] hooks installed utf16=%p", (void*)ms_string_new_utf16);
 }
 
